@@ -1895,7 +1895,7 @@ fn validate(
         .get("--agent")
         .is_some_and(|agent| compi_protocol::chat::ChatHarness::parse(agent).is_none())
     {
-        return Err(CliError::usage("--agent must be omp or claude"));
+        return Err(chat::unknown_agent());
     }
     if command == "pane" && action == Some("capture") {
         if options
@@ -2268,13 +2268,14 @@ mod tests {
             &["--pane", "pane-1", "chat"],
             &["chat", "--agent", "claude"],
             &["chat", "--agent", "omp"],
+            &["chat", "--agent", "codex"],
         ] {
             assert!(validated(accepted).is_ok(), "{accepted:?}");
         }
         for rejected in [
             &["chat", "hello"][..],
             &["chat", "--down"],
-            &["chat", "--agent", "codex"],
+            &["chat", "--agent", "nonesuch"],
             &["chat", "--agent"],
         ] {
             assert_eq!(validated(rejected).unwrap_err().exit, 2, "{rejected:?}");

@@ -46,6 +46,7 @@ use super::{
     ui_text_color, ui_text_color_for,
 };
 use crate::theme::ThemeColors;
+use compi_protocol::chat::{AgentMark, ChatHarness};
 use gpui::{
     Anchor, AnyElement, AnyView, App, AssetSource, ClickEvent, Context, DismissEvent, Div,
     ElementId, Entity, FocusHandle, Focusable as _, FontWeight, Global, IntoElement, KeyDownEvent,
@@ -122,31 +123,54 @@ gpui_kit_assets::icon_assets!(
     ]
 );
 
-/// Harnesses' own marks, drawn in their colours with `img`.
-pub(super) const OMP_MARK: &str = "brands/omp.svg";
-/// Claude Code's mark: the Claude model mark, in Claude's orange.
-pub(super) const CLAUDE_MARK: &str = "brands/claude.svg";
+/// Agents' brand marks (`AgentMark::Brand`), drawn in their own colours with `img`.
+const BRAND_MARKS: &[(&str, &[u8])] = &[(
+    "brands/omp.svg",
+    include_bytes!("../../assets/brands/omp.svg"),
+)];
+
+/// Where the agent's mark is in the application's assets: its brand mark
+/// (`brands/<file>.svg`), or `agents/<program>.svg` for an agent drawn with a model mark,
+/// which `Assets` serves in the agent's colour.
+pub(super) fn agent_mark_path(harness: ChatHarness) -> String {
+    match harness.entry().mark {
+        AgentMark::Brand(file) => format!("brands/{file}.svg"),
+        AgentMark::Model { .. } => format!("agents/{}.svg", harness.program()),
+    }
+}
+
+/// The agent's model mark in its colour: the mark draws in `currentColor`, which `img`
+/// has none of.
+fn tinted_agent_mark(harness: ChatHarness) -> Option<Cow<'static, [u8]>> {
+    let AgentMark::Model { colour, .. } = harness.entry().mark else {
+        return None;
+    };
+    let svg = super::model_icons::for_harness(harness).and_then(super::model_icons::file)?;
+    let svg = std::str::from_utf8(svg).ok()?;
+    Some(Cow::Owned(
+        svg.replacen("currentColor", colour, 1).into_bytes(),
+    ))
+}
 
 /// The application's assets: GPUI Kit's default icons, the extra Lucide icons Compi
-/// uses (`ExtraIcons`), every Lucide icon for project icons, harness marks and language
+/// uses (`ExtraIcons`), every Lucide icon for project icons, agent marks and language
 /// icons.
 pub(super) struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
-        if path == OMP_MARK {
-            return Ok(Some(Cow::Borrowed(include_bytes!(
-                "../../assets/brands/omp.svg"
-            ))));
+        if path.starts_with("brands/") {
+            return Ok(BRAND_MARKS
+                .iter()
+                .find(|(known, _)| *known == path)
+                .map(|(_, bytes)| Cow::Borrowed(*bytes)));
         }
-        if path == CLAUDE_MARK {
-            // The model mark draws in `currentColor`, which `img` has none of.
-            let mark = include_str!("../../assets/models/claude.svg").replacen(
-                "currentColor",
-                "#D97757",
-                1,
-            );
-            return Ok(Some(Cow::Owned(mark.into_bytes())));
+        if let Some(harness) = path
+            .strip_prefix("agents/")
+            .and_then(|file| file.strip_suffix(".svg"))
+            .and_then(ChatHarness::parse)
+        {
+            return Ok(tinted_agent_mark(harness));
         }
         if let Some(bytes) = super::language_icons::file(path)
             .or_else(|| super::model_icons::file(path))
@@ -1992,6 +2016,19 @@ pub(super) fn menu_label_row(label: impl Into<SharedString>, cx: &App) -> Div {
 mod tests {
     use super::*;
     use crate::theme::ThemePreset;
+
+    #[test]
+    fn every_agents_mark_loads_in_its_colours() {
+        for harness in ChatHarness::ALL {
+            let path = agent_mark_path(harness);
+            let mark = Assets.load(&path).unwrap();
+            let mark = mark.unwrap_or_else(|| panic!("{} has no mark at {path}", harness.name()));
+            let svg = std::str::from_utf8(&mark).unwrap();
+            if let AgentMark::Model { colour, .. } = harness.entry().mark {
+                assert!(svg.contains(colour), "{path} is not in {colour}");
+            }
+        }
+    }
 
     #[test]
     fn control_text_meets_aa_on_every_bundled_theme() {

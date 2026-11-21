@@ -689,13 +689,17 @@ impl CompiApp {
     }
 
     /// The terminal whose prompt the group configures: the focused one, else the one
-    /// Settings was opened from. On Windows without one, the shell Settings chose.
+    /// Settings was opened from. On Windows without one, the shell a new tab starts.
     fn focused_prompt_location(&self) -> (Option<PromptPlace>, Option<String>) {
         let windows = cfg!(windows) && !self.target.is_remote();
         let chosen = || {
             (windows
                 && self.config.launch.as_ref().is_ok_and(|launch| {
-                    launch.profile.windows_shell == compi_protocol::WindowsShell::PowerShell
+                    launch
+                        .profile
+                        .windows_shell
+                        .for_directory(launch.profile.working_directory.as_deref())
+                        == compi_protocol::WindowsShell::PowerShell
                 }))
             .then_some(PromptPlace::Windows)
         };

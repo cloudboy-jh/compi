@@ -793,6 +793,15 @@ fn prepare_mutation(
                 if let Some(previous) = &info.launch.profile {
                     context.profile.windows_shell = previous.windows_shell;
                 }
+                // An automatic shell is settled here, so the surface says which it runs.
+                if cfg!(windows) {
+                    context.profile.windows_shell = context.profile.windows_shell.for_directory(
+                        info.launch
+                            .working_directory
+                            .as_deref()
+                            .or(context.profile.working_directory.as_deref()),
+                    );
+                }
                 info.launch.profile = Some(Box::new(context.profile.clone()));
             }
             if let Some(surface) = candidate

@@ -13,7 +13,7 @@
 mod store;
 
 use super::launch::Arg;
-use super::{Chat, Driver, Inner, Prompt, head, new_agent, now_ms, settle, short_line, tail};
+use super::{Chat, Driver, Inner, Prompt, Wire, head, new_agent, now_ms, settle, short_line, tail};
 use compi_protocol::chat::{
     ChatAgentStep, ChatAnswer, ChatAnswers, ChatChoice, ChatCommand, ChatDiff, ChatEntry,
     ChatEvent, ChatField, ChatHarness, ChatOption, ChatPermission, ChatPermissionOption,
@@ -107,19 +107,42 @@ impl Claude {
     }
 }
 
+/// Claude Code's driver, as the chat core calls it.
+pub(super) const WIRE: Wire = Wire {
+    configured_approval: |_| None,
+    launch_args,
+    start,
+    handle,
+    session_with_first_prompt: true,
+    prompt,
+    steer: None,
+    cancel,
+    interrupt,
+    answer,
+    answer_question,
+    set_option,
+    list_sessions: |chat, inner| list_sessions(chat, inner),
+    fill_sessions: |_, _| {},
+    switch_session: None,
+    cancel_asks,
+    forget_asks,
+    fail_pending,
+    forget_transcript: |inner| inner.claude().forget_transcript(),
+};
+
 impl Inner {
     /// The Claude Code driver's state; only a Claude Code chat has one.
     fn claude(&mut self) -> &mut Claude {
         match &mut self.driver {
             Driver::Claude(claude) => claude,
-            Driver::Acp(_) => unreachable!("a Claude Code chat speaks Claude Code's stream"),
+            _ => unreachable!("a Claude Code chat speaks Claude Code's stream"),
         }
     }
 
     fn claude_state(&self) -> &Claude {
         match &self.driver {
             Driver::Claude(claude) => claude,
-            Driver::Acp(_) => unreachable!("a Claude Code chat speaks Claude Code's stream"),
+            _ => unreachable!("a Claude Code chat speaks Claude Code's stream"),
         }
     }
 }
@@ -214,14 +237,16 @@ struct Task {
     agent: String,
 }
 
-/// Claude Code's arguments: its stream, the approval mode when there is one, and the
-/// session: a saved one is resumed; a new one, which Claude Code names with its first
-/// prompt, starts on the user's thinking level.
-pub(super) fn launch_args(inner: &mut Inner, approval_mode: Option<&'static str>) -> Vec<Arg> {
+/// Claude Code's arguments: its stream, the approval mode when there is one, the chat's
+/// note at the end of its system prompt, and the session: a saved one is resumed; a new
+/// one, which Claude Code names with its first prompt, starts on the user's thinking
+/// level.
+fn launch_args(inner: &mut Inner, approval_mode: Option<&'static str>) -> Vec<Arg> {
     let mut args: Vec<Arg> = STREAM_ARGS.map(Arg::word).into();
     if let Some(mode) = approval_mode {
         args.extend([Arg::word("--permission-mode"), Arg::word(mode)]);
     }
+    args.push(Arg::Note("--append-system-prompt"));
     let session = inner.state.session.clone();
     let picks = inner.picks.clone();
     let claude = inner.claude();

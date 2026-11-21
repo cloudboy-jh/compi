@@ -14,6 +14,14 @@ use compi_protocol::{
 };
 use serde_json::json;
 
+/// `--agent` names no agent.
+pub(super) fn unknown_agent() -> CliError {
+    CliError::usage(format!(
+        "--agent must be {}",
+        crate::chat::agent_list(|agent| agent.program.to_owned())
+    ))
+}
+
 pub(super) fn run(
     client: &mut DaemonClient,
     state: &WorkspaceSnapshot,
@@ -39,8 +47,7 @@ pub(super) fn run(
         )
     })?;
     let agent = match options.values.get("--agent") {
-        Some(program) => ChatHarness::parse(program)
-            .ok_or_else(|| CliError::usage("--agent must be omp or claude"))?,
+        Some(program) => ChatHarness::parse(program).ok_or_else(unknown_agent)?,
         // The chat shows in the caller's tab, so it is in that tab's project.
         None => config.new_thread_agent(tab.project.as_ref()),
     };

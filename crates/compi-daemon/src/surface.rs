@@ -23,7 +23,7 @@ use std::io::{Read, Write};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -179,6 +179,95 @@ impl fmt::Display for SurfaceError {
 
 impl std::error::Error for SurfaceError {}
 
+/// What the runtime worker acts on: the workspace's effects, and launches resolved on
+/// threads of their own.
+enum EffectJob {
+    Effect(WorkspaceEffect),
+    Resolved(Box<ResolvedLaunch>),
+    /// The workspace's effect queue ended.
+    Closed,
+}
+
+struct ResolvedLaunch {
+    info: Box<SurfaceInfo>,
+    context: Option<Box<compi_protocol::LaunchContext>>,
+    launch: Result<LaunchDescription>,
+    startup_started: Option<Instant>,
+}
+
+/// Starts the shell a resolved launch describes, or reports why it cannot start.
+fn spawn_resolved(
+    resolved: ResolvedLaunch,
+    surfaces: &Mutex<HashMap<SurfaceId, Arc<Surface>>>,
+    actor: &WorkspaceActor,
+    program_status: &Arc<ProgramStatusHub>,
+    instance: Option<&str>,
+) {
+    let ResolvedLaunch {
+        info,
+        context,
+        launch,
+        startup_started,
+    } = resolved;
+    let stage = |stage: &str| {
+        if let Some(started) = startup_started {
+            compi_protocol::perf::log_surface_startup_stage(
+                &info.id,
+                &info.process_lifetime_id,
+                stage,
+                started.elapsed(),
+            );
+        }
+    };
+    let launch = match launch {
+        Ok(launch) => launch,
+        Err(error) => {
+            stage("resolve_failed");
+            actor.observe(RuntimeObservation::Failed {
+                surface_id: info.id,
+                process_lifetime_id: info.process_lifetime_id,
+                error: error.to_string(),
+            });
+            return;
+        }
+    };
+    stage("launch_resolved");
+    let surface_id = info.id.clone();
+    let lifetime = info.process_lifetime_id.clone();
+    match Surface::spawn(
+        *info,
+        launch,
+        context.as_deref(),
+        actor.clone(),
+        program_status.clone(),
+        instance,
+        startup_started,
+    ) {
+        Ok(surface) => {
+            if let Ok(mut registry) = surfaces.lock()
+                && let Some(previous) = registry.insert(surface_id, surface)
+            {
+                previous.join();
+            }
+        }
+        Err(error) => {
+            if let Some(started) = startup_started {
+                compi_protocol::perf::log_surface_startup_stage(
+                    &surface_id,
+                    &lifetime,
+                    "spawn_failed",
+                    started.elapsed(),
+                );
+            }
+            actor.observe(RuntimeObservation::Failed {
+                surface_id,
+                process_lifetime_id: lifetime,
+                error: error.to_string(),
+            });
+        }
+    }
+}
+
 impl SurfaceManager {
     pub fn new() -> Self {
         let (actor, effects) = WorkspaceActor::memory();
@@ -203,23 +292,66 @@ impl SurfaceManager {
         let worker_instance = instance.map(str::to_owned);
         let program_status = Arc::new(ProgramStatusHub::default());
         let worker_program_status = program_status.clone();
+        // Launches resolve on threads of their own, so one waiting for WSL to start keeps
+        // no other shell waiting; a surface's later effects wait for its launch.
+        let (jobs, worker_jobs) = mpsc::channel();
+        let forwarded = jobs.clone();
+        thread::spawn(move || {
+            for effect in effects {
+                if forwarded.send(EffectJob::Effect(effect)).is_err() {
+                    return;
+                }
+            }
+            let _ = forwarded.send(EffectJob::Closed);
+        });
         thread::spawn(move || {
             let mut pending_effects = VecDeque::new();
-            while let Some(effect) = pending_effects.pop_front().or_else(|| effects.recv().ok()) {
+            let mut resolving = HashMap::<SurfaceId, VecDeque<WorkspaceEffect>>::new();
+            loop {
+                let job = match pending_effects.pop_front() {
+                    Some(effect) => EffectJob::Effect(effect),
+                    None => match worker_jobs.recv() {
+                        Ok(EffectJob::Closed) | Err(_) => return,
+                        Ok(job) => job,
+                    },
+                };
                 let Ok(stopped) = worker_stopping.lock() else {
                     return;
                 };
                 if *stopped {
                     continue;
                 }
+                let effect = match job {
+                    EffectJob::Effect(effect) => effect,
+                    EffectJob::Resolved(resolved) => {
+                        let held = resolving.remove(&resolved.info.id).unwrap_or_default();
+                        spawn_resolved(
+                            *resolved,
+                            &worker_surfaces,
+                            &worker_actor,
+                            &worker_program_status,
+                            worker_instance.as_deref(),
+                        );
+                        for effect in held.into_iter().rev() {
+                            pending_effects.push_front(effect);
+                        }
+                        continue;
+                    }
+                    EffectJob::Closed => return,
+                };
+                let surface_id = match &effect {
+                    WorkspaceEffect::Batch(_) => None,
+                    WorkspaceEffect::Launch(info, _) => Some(&info.id),
+                    WorkspaceEffect::End { surface_id, .. } => Some(surface_id),
+                };
+                if let Some(held) = surface_id.and_then(|id| resolving.get_mut(id)) {
+                    held.push_back(effect);
+                    continue;
+                }
                 match effect {
                     WorkspaceEffect::Batch(batch) => {
-                        if pending_effects.is_empty() {
-                            pending_effects = batch.into();
-                        } else {
-                            for effect in batch.into_iter().rev() {
-                                pending_effects.push_front(effect);
-                            }
+                        for effect in batch.into_iter().rev() {
+                            pending_effects.push_front(effect);
                         }
                     }
                     WorkspaceEffect::Launch(info, context) => {
@@ -237,69 +369,17 @@ impl SurfaceManager {
                         {
                             previous.retire();
                         }
-                        let launch = match launch::resolve_profile(&info.launch, context.as_deref())
-                        {
-                            Ok(launch) => launch,
-                            Err(error) => {
-                                if let Some(started) = startup_started {
-                                    compi_protocol::perf::log_surface_startup_stage(
-                                        &info.id,
-                                        &info.process_lifetime_id,
-                                        "resolve_failed",
-                                        started.elapsed(),
-                                    );
-                                }
-                                worker_actor.observe(RuntimeObservation::Failed {
-                                    surface_id: info.id,
-                                    process_lifetime_id: info.process_lifetime_id,
-                                    error: error.to_string(),
-                                });
-                                continue;
-                            }
-                        };
-                        if let Some(started) = startup_started {
-                            compi_protocol::perf::log_surface_startup_stage(
-                                &info.id,
-                                &info.process_lifetime_id,
-                                "launch_resolved",
-                                started.elapsed(),
-                            );
-                        }
-                        let surface_id = info.id.clone();
-                        let lifetime = info.process_lifetime_id.clone();
-                        match Surface::spawn(
-                            *info,
-                            launch,
-                            context.as_deref(),
-                            worker_actor.clone(),
-                            worker_program_status.clone(),
-                            worker_instance.as_deref(),
-                            startup_started,
-                        ) {
-                            Ok(surface) => {
-                                if let Ok(mut registry) = worker_surfaces.lock()
-                                    && let Some(previous) =
-                                        registry.insert(surface_id.clone(), surface)
-                                {
-                                    previous.join();
-                                }
-                            }
-                            Err(error) => {
-                                if let Some(started) = startup_started {
-                                    compi_protocol::perf::log_surface_startup_stage(
-                                        &surface_id,
-                                        &lifetime,
-                                        "spawn_failed",
-                                        started.elapsed(),
-                                    );
-                                }
-                                worker_actor.observe(RuntimeObservation::Failed {
-                                    surface_id,
-                                    process_lifetime_id: lifetime,
-                                    error: error.to_string(),
-                                });
-                            }
-                        }
+                        resolving.insert(info.id.clone(), VecDeque::new());
+                        let jobs = jobs.clone();
+                        thread::spawn(move || {
+                            let launch = launch::resolve_profile(&info.launch, context.as_deref());
+                            let _ = jobs.send(EffectJob::Resolved(Box::new(ResolvedLaunch {
+                                info,
+                                context,
+                                launch,
+                                startup_started,
+                            })));
+                        });
                     }
                     WorkspaceEffect::End {
                         surface_id,
@@ -749,6 +829,17 @@ impl Surface {
                     )
                 };
                 if let Some(directory) = directory {
+                    // The integrated prompt reports the folder: the shell is ready.
+                    if reported_directory.is_none()
+                        && let Some(started) = startup_started
+                    {
+                        compi_protocol::perf::log_surface_startup_stage(
+                            &output_surface.id,
+                            &output_surface.process_lifetime_id,
+                            "first_directory",
+                            started.elapsed(),
+                        );
+                    }
                     reported_directory = Some(directory.clone());
                     output_surface.actor.observe(RuntimeObservation::Directory {
                         surface_id: output_surface.id.clone(),

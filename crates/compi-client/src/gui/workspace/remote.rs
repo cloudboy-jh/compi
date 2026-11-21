@@ -256,13 +256,14 @@ impl CompiApp {
     }
 
     /// Whether a terminal opened for a folder of `environment` runs PowerShell: a host
-    /// folder of a local Windows daemon, with PowerShell chosen in Settings.
+    /// folder of a local Windows daemon, with PowerShell chosen in Settings or picked
+    /// automatically, as it is for a Windows folder.
     fn new_shell_is_powershell(&self, environment: &ContentEnvironment) -> bool {
         cfg!(windows)
             && !self.target.is_remote()
             && *environment == ContentEnvironment::Host
             && self.config.launch.as_ref().is_ok_and(|launch| {
-                launch.profile.windows_shell == compi_protocol::WindowsShell::PowerShell
+                launch.profile.windows_shell != compi_protocol::WindowsShell::Wsl
             })
     }
 

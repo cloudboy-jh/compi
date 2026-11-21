@@ -303,13 +303,24 @@ pub(super) struct Row {
 
 impl Row {
     /// Whether every term of `query` is in the title, description, keywords or
-    /// group, ignoring case.
+    /// group, ignoring case; a Chat row's also name every agent.
     fn matches(&self, query: &str) -> bool {
+        static AGENT_WORDS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            ChatHarness::ALL
+                .map(|agent| format!("{} {}", agent.program(), agent.name()))
+                .join(" ")
+        });
+        let agents = if self.section == SettingsSection::Chat {
+            AGENT_WORDS.as_str()
+        } else {
+            ""
+        };
         let fields = [
             self.title,
             self.description,
             self.keywords,
             self.group.unwrap_or(""),
+            agents,
         ];
         query
             .split_whitespace()
@@ -869,21 +880,6 @@ static ROWS: &[Row] = &[
         ),
     ),
     // Terminal.
-    shown_when(
-        |_| cfg!(windows),
-        grouped(
-            "Shell",
-            row(
-                "shell",
-                SettingsSection::Terminal,
-                "Default shell",
-                "What new tabs and splits start: Windows PowerShell or WSL.",
-                "powershell wsl linux bash windows default distribution",
-                |_| vec![SettingsAction::Select(Popup::Shell)],
-                |app, row, cx| app.render_shell_row(row, cx),
-            ),
-        ),
-    ),
     grouped(
         "Shell",
         row(
@@ -1034,6 +1030,21 @@ static ROWS: &[Row] = &[
             |app, row, cx| app.render_prompt_group(row, cx),
         ),
     ),
+    shown_when(
+        |_| cfg!(windows),
+        grouped(
+            "Advanced",
+            row(
+                "shell",
+                SettingsSection::Terminal,
+                "Shell",
+                "What new tabs and splits start: picked for their folder, Windows PowerShell or WSL.",
+                "powershell wsl linux bash windows default distribution automatic",
+                |_| vec![SettingsAction::Select(Popup::Shell)],
+                |app, row, cx| app.render_shell_row(row, cx),
+            ),
+        ),
+    ),
     // Chat.
     grouped(
         "Agent",
@@ -1042,7 +1053,7 @@ static ROWS: &[Row] = &[
             SettingsSection::Chat,
             "Default agent",
             "Every new thread starts with it.",
-            "default agent harness omp claude code new thread chat",
+            "default agent harness new thread chat",
             |_| vec![SettingsAction::ChatAgent],
             |app, row, cx| app.render_chat_agent_row(row, cx),
         ),
@@ -1054,7 +1065,7 @@ static ROWS: &[Row] = &[
             SettingsSection::Chat,
             "Approvals",
             "How the agent asks before it runs tools. Applies to new chats and chats that start again.",
-            "approval permission ask allow edits everything yolo tools agent omp claude",
+            "approval permission ask allow edits everything yolo tools agent",
             |_| vec![SettingsAction::Select(Popup::ChatApproval)],
             |app, row, cx| app.render_chat_approval_row(row, cx),
         ),
@@ -1066,7 +1077,7 @@ static ROWS: &[Row] = &[
             SettingsSection::Chat,
             "Text size",
             "Agent chats, with their cards and composer, in every window.",
-            "zoom scale bigger smaller larger font agent omp",
+            "zoom scale bigger smaller larger font agent",
             |_| {
                 vec![
                     SettingsAction::ChatTextSize(Command::ZoomOut),
@@ -1091,7 +1102,7 @@ static ROWS: &[Row] = &[
             SettingsSection::Chat,
             "Enter while the agent works",
             "Whether Enter steers the running turn or queues the message for after it.",
-            "steer queue send key ctrl cmd turn message composer agent omp",
+            "steer queue send key ctrl cmd turn message composer agent",
             |_| vec![SettingsAction::ChatEnter],
             |app, row, cx| app.render_chat_enter_row(row, cx),
         ),
@@ -1115,7 +1126,7 @@ static ROWS: &[Row] = &[
             SettingsSection::Chat,
             "Opening a chat",
             "Where New chat and compi chat open a chat from a terminal: in place of its shell or beside it.",
-            "split pane beside in place shell view palette agent omp claude",
+            "split pane beside in place shell view palette agent",
             |_| vec![SettingsAction::ChatOpen],
             |app, row, cx| app.render_chat_open_row(row, cx),
         ),
@@ -1566,7 +1577,7 @@ fn section_summary(section: SettingsSection) -> &'static str {
             "Fonts, pane layout, tab details, closing, focus and program status."
         }
         SettingsSection::Notifications => "When and where Compi tells you a program needs you.",
-        SettingsSection::Terminal => "Shell, starting folder, font, dev servers and prompt.",
+        SettingsSection::Terminal => "Starting folder, font, dev servers, prompt and shell.",
         SettingsSection::Chat => "How agent chats look and behave.",
         SettingsSection::Projects => {
             "Each project's name, icon and pin, and what its new threads start with."
@@ -3887,10 +3898,16 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// Shell (Windows): what new tabs and splits start, Windows PowerShell or WSL. Saved
-    /// to the configuration and given to every window; running shells keep theirs.
+    /// Shell (Windows): what new tabs and splits start, picked for their folder, Windows
+    /// PowerShell or WSL. Saved to the configuration and given to every window; running
+    /// shells keep theirs.
     fn render_shell_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        const SHELLS: [(WindowsShell, &str, &str); 2] = [
+        const SHELLS: [(WindowsShell, &str, &str); 3] = [
+            (
+                WindowsShell::Automatic,
+                "Automatic",
+                "WSL in a Linux folder, else PowerShell",
+            ),
             (
                 WindowsShell::PowerShell,
                 "PowerShell",
@@ -3940,6 +3957,9 @@ impl CompiApp {
             .child(self.settings_focus_anchor(focused, cx))
             .into_any_element();
         let detail = match current {
+            Some(WindowsShell::Automatic) => {
+                "New tabs and splits in a Linux folder start WSL; elsewhere Windows PowerShell, which starts without waiting for WSL. Open tabs keep their shell."
+            }
             Some(WindowsShell::PowerShell) => {
                 "New tabs and splits start Windows PowerShell. Open tabs keep their shell."
             }
@@ -3960,7 +3980,7 @@ impl CompiApp {
         share_launch_change(cx, move |launch| launch.profile.windows_shell = shell);
     }
 
-    /// Approvals: a dropdown of how a chat's OMP asks before it runs tools.
+    /// Approvals: a dropdown of how a chat's agent asks before it runs tools.
     fn render_chat_approval_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         let popup = Popup::ChatApproval;
         let action = SettingsAction::Select(popup);
@@ -4017,7 +4037,7 @@ impl CompiApp {
         share_config_change(cx, move |config| config.chat_approval = approval);
     }
 
-    /// Enter while OMP works: Steer or Queue, as a switch.
+    /// Enter while the agent works: Steer or Queue, as a switch.
     fn render_chat_enter_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         let current = self.config.chat_enter;
         let detail = match current {
@@ -6048,6 +6068,12 @@ mod tests {
             ["show-fps", RESOURCES_ROW, DIAGNOSTICS_ROW]
         );
         assert!(ids("network").contains(&MONITOR_ROW));
+        // Every agent's program and name find Default agent.
+        for agent in ChatHarness::ALL {
+            for word in [agent.program(), agent.name()] {
+                assert!(settings(word).contains(&"chat-agent"), "{word}");
+            }
+        }
         // A group name finds its rows; so does the group's old name.
         let tab_details = [
             "metadata-directory",
@@ -6255,9 +6281,11 @@ mod tests {
             groups(SettingsSection::Notifications),
             ["Delivery", "Events", "Sound"]
         );
+        // The shell choice is Windows only.
         assert_eq!(
             groups(SettingsSection::Terminal),
-            ["Shell", "Font", "Dev servers", "Prompt"]
+            ["Shell", "Font", "Dev servers", "Prompt", "Advanced"]
+                [..if cfg!(windows) { 5 } else { 4 }]
         );
         assert_eq!(
             groups(SettingsSection::Chat),

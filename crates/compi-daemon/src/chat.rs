@@ -1,8 +1,9 @@
-//! Native agent chats: the daemon runs each chat's harness like a shell and talks to it
-//! over its standard input and output, one JSON message per line, through the harness's
-//! driver: OMP speaks the Agent Client Protocol (`acp`), Claude Code its headless JSON
-//! stream (`claude`). The transcript lives here; windows watch a chat (`WatchChat`) and
-//! get its state, then every change.
+//! Native agent chats: the daemon runs each chat's agent like a shell and talks to it
+//! over its standard input and output, one JSON message per line, through the agent's
+//! driver (`Wire`): OMP speaks the Agent Client Protocol (`acp`), Claude Code its
+//! headless JSON stream (`claude`), Codex its app server's JSON-RPC (`codex`). One
+//! launcher starts every agent where the chat is (`launch`). The transcript lives here;
+//! windows watch a chat (`WatchChat`) and get its state, then every change.
 //!
 //! A chat is keyed by its pane's chat ID and lives as long as a pane or view holds it:
 //! once none does, its turn and harness stop (`ChatHub::retain`). Compi saves its
@@ -31,12 +32,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod acp;
 mod claude;
+mod codex;
 mod launch;
 mod saved;
 mod threads;
 
 use acp::Acp;
 use claude::Claude;
+use codex::Codex;
+use launch::{Arg, Prepared};
 use threads::{ThreadRecord, ThreadStore};
 
 /// Standard error kept to explain an exit.
@@ -51,7 +55,7 @@ const WATCH_STATE_BYTES: usize = 6 * 1024 * 1024;
 /// The longest line a sub-agent's activity keeps, in characters.
 const AGENT_ACTIVITY_CHARS: usize = 160;
 #[cfg(windows)]
-const WSL_EXE: &str = r"C:\Windows\System32\wsl.exe";
+pub(crate) const WSL_EXE: &str = r"C:\Windows\System32\wsl.exe";
 
 /// Every chat this daemon runs.
 #[derive(Default)]
@@ -186,12 +190,10 @@ impl ChatHub {
             Ok(result) => result?,
             Err(_) => return Err("the harness did not list its sessions in time".into()),
         };
-        // RFC 3339 times in UTC, as both harnesses' listings give them, sort as text.
+        // RFC 3339 times in UTC, as every agent's listing gives them, sort as text.
         sessions.sort_by(|a, b| b.updated.cmp(&a.updated));
-        // Claude Code's listing comes from its files, previews and all; OMP's from ACP.
-        if chat.content.harness == ChatHarness::Omp {
-            saved::fill(&chat.content, &mut sessions);
-        }
+        let fill = lock(&chat.inner).driver.wire().fill_sessions;
+        fill(&chat.content, &mut sessions);
         Ok(sessions)
     }
 
@@ -419,6 +421,35 @@ fn now_ms() -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
+/// `time` in RFC 3339, in UTC, to the second.
+fn rfc3339(time: SystemTime) -> String {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    // Howard Hinnant's days-to-civil, for days since 1970-01-01.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
 struct Chat {
     content: ChatContent,
     /// The daemon's instance, as `COMPI_INSTANCE` names it.
@@ -491,12 +522,14 @@ struct FinishedAgentWave {
 }
 
 /// The wire code of the chat's harness and what it keeps of it, chosen by
-/// `ChatContent::harness`.
+/// `ChatContent::harness`. Adding an agent adds its variant here and its `Wire`.
 enum Driver {
     /// OMP: the Agent Client Protocol.
     Acp(Box<Acp>),
     /// Claude Code: its headless JSON stream.
     Claude(Box<Claude>),
+    /// Codex: its app server's JSON-RPC.
+    Codex(Box<Codex>),
 }
 
 impl Default for Driver {
@@ -510,9 +543,80 @@ impl Driver {
         match harness {
             ChatHarness::Omp => Self::default(),
             ChatHarness::Claude => Self::Claude(Box::default()),
+            ChatHarness::Codex => Self::Codex(Box::default()),
+        }
+    }
+
+    /// What the core asks of this driver.
+    fn wire(&self) -> &'static Wire {
+        match self {
+            Self::Acp(_) => &acp::WIRE,
+            Self::Claude(_) => &claude::WIRE,
+            Self::Codex(_) => &codex::WIRE,
         }
     }
 }
+
+/// A sessions listing's answer, which a window waits for.
+type SessionsReply = mpsc::Receiver<Result<Vec<ChatSessionInfo>, String>>;
+
+/// Everything the chat core asks of a driver, the same for every agent: each driver
+/// module has one (`WIRE`). The core keeps the transcript, the queue, the thread, the
+/// status and the process; a driver turns its agent's messages into `ChatEvent`s
+/// through the core's `Inner` calls and Compi's requests into its agent's messages.
+struct Wire {
+    /// The agent's own approval mode, for an agent that does not read its setting by
+    /// itself (OMP's `tools.approvalMode`), looked up before it starts on a thread of
+    /// its own, no lock held; `None` when it reads its own.
+    configured_approval: fn(&ChatContent) -> Option<&'static str>,
+    /// The program's arguments, with the approval mode Compi chose, when it chose one.
+    launch_args: fn(&mut Inner, Option<&'static str>) -> Vec<Arg>,
+    /// Starts talking to the program once it runs.
+    start: fn(&mut Inner),
+    /// One message the program wrote.
+    handle: fn(&Arc<Chat>, &mut Inner, Value),
+    /// The agent opens its session with the first prompt (Claude Code), rather than
+    /// before any (`ChatState::session` set once it has).
+    session_with_first_prompt: bool,
+    /// Starts a turn on `prompt`, which the transcript already shows.
+    prompt: fn(&mut Inner, &Prompt),
+    /// Whether a prompt can go into the running turn now, and how it goes (OMP's
+    /// steering); `None` for an agent that takes prompts only as turns of their own:
+    /// they queue.
+    steer: Option<(CanSteerFn, SteerFn)>,
+    /// Stops the running turn: its open permission and question go unanswered.
+    cancel: fn(&mut Inner),
+    /// Asks the program to stop the running turn, nothing else.
+    interrupt: fn(&mut Inner),
+    /// Answers the permission `state.permission` shows, and shows the next one waiting.
+    answer: fn(&mut Inner, Option<String>) -> Result<(), String>,
+    /// Answers the question `state.question` shows, and shows the next one waiting.
+    answer_question: fn(&mut Inner, Option<ChatAnswers>) -> Result<(), String>,
+    /// Sets the session's setting to one of its choices.
+    set_option: fn(&Arc<Chat>, &mut Inner, String, String) -> Result<(), String>,
+    /// The agent's sessions in the chat's folder.
+    list_sessions: fn(&Chat, &mut Inner) -> Result<SessionsReply, String>,
+    /// Adds what the agent's files tell of each listed session (first prompt, last
+    /// reply) when its listing lacks it.
+    fill_sessions: fn(&ChatContent, &mut [ChatSessionInfo]),
+    /// Opens a session, or a new one, in the running program, for an agent that can
+    /// switch sessions (OMP); one that can't starts again on it.
+    switch_session: Option<fn(&Chat, &mut Inner, Option<String>)>,
+    /// Tells the program nobody will answer its open permission or question.
+    cancel_asks: fn(&mut Inner),
+    /// Forgets the open permission and question, which the program no longer waits on.
+    forget_asks: fn(&mut Inner),
+    /// Windows waiting on the program hear it is gone; nothing it was asked is out any
+    /// more.
+    fail_pending: fn(&mut Inner),
+    /// The transcript was replaced: entries the driver points at are gone.
+    forget_transcript: fn(&mut Inner),
+}
+
+/// Hands a prompt to the running turn (`Wire::steer`), naming the harness in errors.
+type SteerFn = fn(&mut Inner, &str, Prompt) -> Result<(), String>;
+/// Whether a prompt can go into the running turn now (`Wire::steer`).
+type CanSteerFn = fn(&Inner) -> bool;
 
 #[derive(Default)]
 struct Inner {
@@ -573,6 +677,12 @@ struct Inner {
     skip_replay: bool,
     /// The chat's environment and folder; a turn's end marks its project's files changed.
     folder: Option<(ContentEnvironment, String)>,
+    /// The running program, as its launch reports it: a Windows one, and the chat's
+    /// folder as it names it. Until it says, the chat's folder.
+    started: Option<launch::Started>,
+    /// What the running program is told at start: the Linux program's note and the
+    /// Windows program's (WSL chats).
+    notes: (Option<String>, Option<String>),
 }
 
 /// When a thread began, and when its transcript last changed.
@@ -671,92 +781,71 @@ impl Chat {
         }
     }
 
-    /// Starts the harness as the chat's approval says. Compi's shell bridge is installed
-    /// where it runs, a WSL chat's note is worked out, and OMP's own setting, which
-    /// `omp acp` does not read, is looked up first, on a thread of its own, no lock
-    /// held; the status stays `Starting` meanwhile.
+    /// Starts the harness as the chat's approval says. What it needs first is done on a
+    /// thread of its own, no lock held, the status `Starting` meanwhile: where its
+    /// programs are, Compi's shell bridge and agent shell, the notes (`launch::prepare`),
+    /// and, at the same time, the agent's own approval setting when it does not read it
+    /// itself (OMP).
     fn spawn(self: &Arc<Self>, inner: &mut Inner) {
         inner.generation += 1;
         inner.initialized = false;
         let generation = inner.generation;
-        let harness = self.content.harness;
-        let chosen = match harness {
-            ChatHarness::Omp => inner.approval.omp_mode(),
-            ChatHarness::Claude => inner.approval.claude_mode(),
-        };
+        let chosen = self.content.harness.approval_mode(inner.approval);
+        let configured = inner.driver.wire().configured_approval;
         let chat = self.clone();
         let preparing = thread::Builder::new()
             .name("compi-chat-start".into())
             .spawn(move || {
-                // OMP's note's extension is a bridge file, so no bridge, no note.
-                let note = install_bridge(&chat.content)
-                    .then(|| agent_note(&chat.content))
-                    .flatten();
-                let mode = match harness {
-                    ChatHarness::Omp => chosen.or_else(|| acp::configured_approval(&chat.content)),
-                    // Claude Code reads its own setting.
-                    ChatHarness::Claude => {
-                        // Where a Windows `claude` is, asked of WSL now rather than
-                        // under the lock.
-                        #[cfg(windows)]
-                        if let ContentEnvironment::Wsl { distribution } = &chat.content.environment
-                        {
-                            launch::windows_home(distribution);
-                        }
-                        chosen
-                    }
-                };
+                let (prepared, mode) = thread::scope(|scope| {
+                    let lookup = chosen
+                        .is_none()
+                        .then(|| scope.spawn(|| configured(&chat.content)));
+                    let prepared = launch::prepare(&chat.content);
+                    let mode = chosen.or_else(|| lookup?.join().ok().flatten());
+                    (prepared, mode)
+                });
                 let mut inner = chat.lock();
                 if !inner.closed && inner.generation == generation {
-                    chat.launch(&mut inner, generation, mode, note);
+                    chat.launch(&mut inner, generation, mode, &prepared);
                 }
             });
         if preparing.is_err() {
-            self.launch(inner, generation, chosen, None);
+            self.launch(inner, generation, chosen, &launch::programs(&self.content));
         }
     }
 
-    /// Runs the harness, with `approval_mode` when there is one, and asks it to
-    /// initialize; the rest follows its answers. It gets the shell context a terminal in
-    /// its folder gets, so `compi` there acts on this workspace, and `note`, when there
-    /// is one, at the end of its system prompt.
+    /// Runs the harness, with `approval_mode` when there is one, and starts talking to
+    /// it; the rest follows its answers. It gets the shell context a terminal in its
+    /// folder gets, so `compi` there acts on this workspace, and its note, when there is
+    /// one, at the end of its system prompt.
     fn launch(
         self: &Arc<Self>,
         inner: &mut Inner,
         generation: u64,
         approval_mode: Option<&'static str>,
-        note: Option<String>,
+        prepared: &Prepared,
     ) {
         inner.emit(ChatEvent::ApprovalMode {
             mode: approval_mode.map(str::to_owned),
         });
-        let args = match inner.driver {
-            Driver::Acp(_) => acp::launch_args(approval_mode, note.is_some()),
-            Driver::Claude(_) => claude::launch_args(inner, approval_mode),
-        };
-        let wsl = matches!(self.content.environment, ContentEnvironment::Wsl { .. });
+        let wire = inner.driver.wire();
+        let mut args = (wire.launch_args)(inner, approval_mode);
+        // A bridge file only where the bridge is.
+        if !prepared.bridge {
+            args.retain(|arg| !matches!(arg, Arg::Bridge { .. }));
+        }
+        inner.notes = (prepared.linux_note.clone(), prepared.windows_note.clone());
+        inner.started = None;
+        let wsl = prepared.runs_in_wsl(&self.content);
         let mut child = match crate::shell_integration::cli_environment(
             inner.surface.as_ref().map(SurfaceId::as_str),
             self.instance.as_deref(),
             wsl,
         )
-        .map(|mut environment| {
-            environment.extend(note.map(|note| ("COMPI_AGENT_NOTE", note)));
-            // A Windows `claude` in a WSL chat is told where the project is and that its
-            // commands belong in WSL; the launch script passes it to that one only.
-            if let (Driver::Claude(_), ContentEnvironment::Wsl { distribution }) =
-                (&inner.driver, &self.content.environment)
-            {
-                environment.push((
-                    "COMPI_AGENT_WINDOWS_NOTE",
-                    windows_agent_note(distribution, &self.content.folder),
-                ));
-            }
-            environment
-        })
         .map_err(|error| format!("Couldn't prepare Compi's shell context: {error}"))
-        .and_then(|environment| launch::command(&self.content, &environment, &args))
-        .and_then(|mut command| {
+        .and_then(|environment| launch::command(&self.content, &environment, &args, prepared))
+        .and_then(|(mut command, started)| {
+            inner.started = started;
             command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -797,10 +886,7 @@ impl Chat {
             #[cfg(windows)]
             _job: job,
         });
-        match inner.driver {
-            Driver::Acp(_) => acp::start(inner),
-            Driver::Claude(_) => claude::start(inner),
-        }
+        (wire.start)(inner);
     }
 
     fn spawn_error(&self, error: &std::io::Error) -> String {
@@ -825,6 +911,14 @@ impl Chat {
             if line.is_empty() {
                 continue;
             }
+            if let Some(started) = launch::started(line) {
+                let mut inner = self.lock();
+                if inner.closed || inner.generation != generation {
+                    return;
+                }
+                inner.started = Some(started);
+                continue;
+            }
             let Ok(message) = serde_json::from_str::<Value>(line) else {
                 push_tail(&tail, line);
                 continue;
@@ -833,10 +927,7 @@ impl Chat {
             if inner.closed || inner.generation != generation {
                 return;
             }
-            match inner.driver {
-                Driver::Acp(_) => self.handle(&mut inner, message),
-                Driver::Claude(_) => claude::handle(&self, &mut inner, message),
-            }
+            (inner.driver.wire().handle)(&self, &mut inner, message);
         }
         let mut inner = self.lock();
         if inner.closed || inner.generation != generation {
@@ -890,13 +981,15 @@ impl Chat {
         let harness = self.content.harness.name();
         let mut inner = self.lock();
         let steer = delivery == ChatDelivery::Steer;
-        let steer_now = match inner.driver {
-            Driver::Acp(_) => acp::can_steer(&inner),
-            // Claude Code takes a prompt only as a turn of its own: steering queues.
-            Driver::Claude(_) => false,
-        };
-        if steer && inner.state.working() && steer_now {
-            acp::steer(&mut inner, harness, prompt)?;
+        // An agent that takes prompts only as turns of their own queues a steer.
+        let steer_now = inner
+            .driver
+            .wire()
+            .steer
+            .filter(|(can, _)| can(&inner))
+            .map(|(_, send)| send);
+        if let Some(send) = steer_now.filter(|_| steer && inner.state.working()) {
+            send(&mut inner, harness, prompt)?;
         } else if delivery == ChatDelivery::Prompt
             || (steer && matches!(inner.state.status, ChatStatus::Ready))
         {
@@ -931,10 +1024,7 @@ impl Chat {
         if !inner.state.working() {
             return;
         }
-        match inner.driver {
-            Driver::Acp(_) => acp::cancel(&mut inner),
-            Driver::Claude(_) => claude::cancel(&mut inner),
-        }
+        (inner.driver.wire().cancel)(&mut inner);
     }
 
     fn answer(&self, permission: u64, option: Option<String>) -> Result<(), String> {
@@ -947,15 +1037,8 @@ impl Chat {
         {
             return Err("that permission was already answered".into());
         }
-        match inner.driver {
-            Driver::Acp(_) => {
-                acp::answer(&mut inner, option)?;
-                inner.emit(ChatEvent::Permission { permission: None });
-            }
-            // It shows the permission or question waiting next, if one does.
-            Driver::Claude(_) => claude::answer(&mut inner, option)?,
-        }
-        Ok(())
+        // It shows the permission or question waiting next, if one does.
+        (inner.driver.wire().answer)(&mut inner, option)
     }
 
     fn answer_question(&self, question: u64, answers: Option<ChatAnswers>) -> Result<(), String> {
@@ -968,14 +1051,7 @@ impl Chat {
         {
             return Err("that question was already answered".into());
         }
-        match inner.driver {
-            Driver::Acp(_) => {
-                acp::answer_question(&mut inner, answers)?;
-                inner.emit(ChatEvent::Question { question: None });
-            }
-            Driver::Claude(_) => claude::answer_question(&mut inner, answers)?,
-        }
-        Ok(())
+        (inner.driver.wire().answer_question)(&mut inner, answers)
     }
 
     fn set_option(self: &Arc<Self>, option: String, value: String) -> Result<(), String> {
@@ -986,28 +1062,20 @@ impl Chat {
         if !shown.choices.iter().any(|choice| choice.value == value) {
             return Err(format!("{value} is not a choice of {}", shown.name));
         }
-        match inner.driver {
-            Driver::Acp(_) => acp::set_option(&mut inner, option, value),
-            Driver::Claude(_) => claude::set_option(self, &mut inner, option, value),
-        }
+        (inner.driver.wire().set_option)(self, &mut inner, option, value)
     }
 
-    fn list_sessions(
-        &self,
-    ) -> Result<mpsc::Receiver<Result<Vec<ChatSessionInfo>, String>>, String> {
+    fn list_sessions(&self) -> Result<SessionsReply, String> {
         let mut inner = self.lock();
         if !inner.initialized || inner.agent.is_none() {
             return Err(format!("{} isn't running", self.content.harness.name()));
         }
-        match inner.driver {
-            Driver::Acp(_) => acp::list_sessions(self, &mut inner),
-            Driver::Claude(_) => claude::list_sessions(self, &inner),
-        }
+        (inner.driver.wire().list_sessions)(self, &mut inner)
     }
 
     /// Shows `session`, its history replayed, or a new session, in the running harness
-    /// when it can switch sessions (OMP); a harness that isn't running, or can't, starts
-    /// again on it.
+    /// when it can switch sessions (`Wire::switch_session`); a harness that isn't
+    /// running, or can't, starts again on it.
     fn resume(self: &Arc<Self>, session: Option<String>) -> Result<(), String> {
         compi_protocol::chat::validate_session(session.as_deref())?;
         let mut inner = self.lock();
@@ -1020,18 +1088,22 @@ impl Chat {
             thread: inner.thread.is_some(),
             ..ChatState::default()
         };
-        if inner.initialized && inner.agent.is_some() && matches!(inner.driver, Driver::Acp(_)) {
-            inner.cancel_requests();
-            inner.emit(ChatEvent::Reset {
-                state: Box::new(state),
-            });
-            self.open_session(&mut inner, session);
-        } else {
-            inner.stop();
-            inner.emit(ChatEvent::Reset {
-                state: Box::new(state),
-            });
-            self.spawn(&mut inner);
+        let switch = inner.driver.wire().switch_session;
+        match switch.filter(|_| inner.initialized && inner.agent.is_some()) {
+            Some(switch) => {
+                inner.cancel_requests();
+                inner.emit(ChatEvent::Reset {
+                    state: Box::new(state),
+                });
+                switch(self, &mut inner, session);
+            }
+            None => {
+                inner.stop();
+                inner.emit(ChatEvent::Reset {
+                    state: Box::new(state),
+                });
+                self.spawn(&mut inner);
+            }
         }
         Ok(())
     }
@@ -1082,10 +1154,7 @@ impl Chat {
         let mut inner = self.lock();
         let working = inner.state.working();
         if working {
-            match inner.driver {
-                Driver::Acp(_) => acp::interrupt(&mut inner),
-                Driver::Claude(_) => claude::interrupt(&mut inner),
-            }
+            (inner.driver.wire().interrupt)(&mut inner);
         }
         inner.stop();
         inner.stop_agents();
@@ -1205,9 +1274,7 @@ impl Inner {
                 self.unseen = None;
                 self.prompted_with = None;
                 self.skip_replay = false;
-                if let Driver::Claude(claude) = &mut self.driver {
-                    claude.forget_transcript();
-                }
+                (self.driver.wire().forget_transcript)(self);
             }
             ChatEvent::Status {
                 status: ChatStatus::Failed { message },
@@ -1306,10 +1373,29 @@ impl Inner {
         self.start_thread();
     }
 
-    /// Whether prompts have a session to go to: OMP's go to the session it opened;
-    /// Claude Code opens its session with the first prompt.
+    /// Whether prompts have a session to go to: the session the agent opened, or, for
+    /// an agent that opens it with the first prompt (Claude Code), any.
     fn has_session(&self) -> bool {
-        self.state.session.is_some() || matches!(self.driver, Driver::Claude(_))
+        self.state.session.is_some() || self.driver.wire().session_with_first_prompt
+    }
+
+    /// The chat's folder as the running program names it: a Windows program in a WSL
+    /// chat names it by its `\\wsl.localhost` path, a Linux one in a Windows folder by
+    /// its mount.
+    fn agent_folder(&self) -> &str {
+        match (&self.started, &self.folder) {
+            (Some(started), _) => &started.folder,
+            (None, Some((_, folder))) => folder,
+            (None, None) => "",
+        }
+    }
+
+    /// What the running program is told at start, when it is told anything: the note
+    /// of its side.
+    fn note(&self) -> Option<&str> {
+        let windows = self.started.as_ref().is_some_and(|started| started.windows);
+        let (linux, windows_note) = &self.notes;
+        if windows { windows_note } else { linux }.as_deref()
     }
 
     /// Starts a turn on `prompt`, the harness having a session for it (`has_session`).
@@ -1322,10 +1408,7 @@ impl Inner {
         self.emit(ChatEvent::Status {
             status: ChatStatus::Working { since_ms },
         });
-        match self.driver {
-            Driver::Acp(_) => acp::prompt(self, &prompt),
-            Driver::Claude(_) => claude::prompt(self, &prompt),
-        }
+        (self.driver.wire().prompt)(self, &prompt);
     }
 
     /// The running turn ended with `result`. How it ended stays unseen until the user
@@ -1444,10 +1527,7 @@ impl Inner {
 
     /// Tells the harness nobody will answer its open permission or question.
     fn cancel_requests(&mut self) {
-        match self.driver {
-            Driver::Acp(_) => acp::cancel_asks(self),
-            Driver::Claude(_) => claude::cancel_asks(self),
-        }
+        (self.driver.wire().cancel_asks)(self);
         if self.state.permission.is_some() {
             self.emit(ChatEvent::Permission { permission: None });
         }
@@ -1458,19 +1538,13 @@ impl Inner {
 
     /// The harness's open permission and question need no answer any more.
     fn forget_requests(&mut self) {
-        match self.driver {
-            Driver::Acp(_) => acp::forget_asks(self),
-            Driver::Claude(_) => claude::forget_asks(self),
-        }
+        (self.driver.wire().forget_asks)(self);
     }
 
     /// Windows waiting on the harness hear it is gone; nothing it was asked is out any
     /// more.
     fn fail_pending(&mut self) {
-        match self.driver {
-            Driver::Acp(_) => acp::fail_pending(self),
-            Driver::Claude(_) => claude::fail_pending(self),
-        }
+        (self.driver.wire().fail_pending)(self);
     }
 
     /// A turn ended: tool calls still open will not report again, unless sub-agents they
@@ -1910,9 +1984,11 @@ fn tail(text: String, limit: usize) -> String {
 
 fn not_installed(content: &ChatContent) -> String {
     let place = match &content.environment {
-        ContentEnvironment::Host if cfg!(windows) => "on Windows".to_owned(),
+        ContentEnvironment::Host if cfg!(windows) => "on Windows or in WSL".to_owned(),
         ContentEnvironment::Host => "here".to_owned(),
-        ContentEnvironment::Wsl { distribution } => format!("in WSL ({distribution})"),
+        ContentEnvironment::Wsl { distribution } => {
+            format!("in WSL ({distribution}) or on Windows")
+        }
     };
     format!(
         "{} isn't installed {place}. Install it, then Retry.",
@@ -1955,55 +2031,36 @@ fn last_lines(text: &str, count: usize) -> &str {
     &text[start..]
 }
 
-/// Installs Compi's shell bridge where the chat's harness runs, as a terminal's launch
-/// does, so `compi` there runs the CLI; true when it is in place. A failure is logged;
-/// the harness starts anyway.
-fn install_bridge(content: &ChatContent) -> bool {
-    let installed = match &content.environment {
-        // A Windows harness finds `compi.exe` in the CLI's folder, first on its path.
-        #[cfg(windows)]
-        ContentEnvironment::Host => Ok(()),
-        #[cfg(windows)]
-        ContentEnvironment::Wsl { distribution } => {
-            crate::shell_integration::install_wsl_bridge(distribution)
-        }
-        #[cfg(unix)]
-        ContentEnvironment::Host => crate::shell_integration::install_home_bridge(),
-        #[cfg(unix)]
-        ContentEnvironment::Wsl { .. } => Ok(()),
-    };
-    if let Err(error) = &installed {
-        eprintln!(
-            "compi-daemon: could not install the shell bridge for chat {}: {error}",
-            content.id
-        );
-    }
-    installed.is_ok()
-}
-
-/// What a WSL chat's agent is told at start; `None` for other chats, or when the
-/// Windows home folder has no Linux path there (a failure is logged).
+/// What an agent running in `distribution` is told at start; `None` when the Windows
+/// home folder has no Linux path there (a failure is logged).
 #[cfg(windows)]
-fn agent_note(content: &ChatContent) -> Option<String> {
-    let ContentEnvironment::Wsl { distribution } = &content.environment else {
-        return None;
-    };
+fn wsl_note(distribution: &str) -> Option<String> {
     let home = std::env::var("USERPROFILE")
         .ok()
         .filter(|home| !home.is_empty())?;
     match linux_home(distribution, &home) {
-        Ok(linux) => Some(wsl_note(distribution, &home, &linux)),
+        Ok(linux) => Some(format!(
+            "You are running in WSL ({distribution}) on a Windows PC, inside Compi. \
+             The Windows user folder is {home}, which is {linux} here. \
+             Windows programs run from this shell by their .exe names, such as cmd.exe, \
+             powershell.exe, tasklist.exe and winget.exe. To see an open Windows app window, \
+             such as a dialog you caused: `compi screenshot` lists the windows, and \
+             `compi screenshot NAME` saves one as a PNG and prints its path for you to read."
+        )),
         Err(error) => {
-            eprintln!("compi-daemon: no WSL note for chat {}: {error}", content.id);
+            eprintln!("compi-daemon: no WSL note for {distribution}: {error}");
             None
         }
     }
 }
 
-/// Only WSL chats, which need a Windows host, get a note.
-#[cfg(unix)]
-fn agent_note(_: &ChatContent) -> Option<String> {
-    None
+/// The one thing a Windows agent in a WSL chat is told beyond `wsl_note`: its shell is
+/// that WSL's, but its own file tools take Windows paths, which Compi cannot translate.
+#[cfg(windows)]
+fn windows_paths_note(distribution: &str) -> String {
+    format!(
+        r"Your file tools take Windows paths: the Linux path /a/b is \\wsl.localhost\{distribution}\a\b, and /mnt/c/a/b is C:\a\b."
+    )
 }
 
 /// `home`'s Linux path in `distribution`, asked once per distribution and kept.
@@ -2018,39 +2075,6 @@ fn linux_home(distribution: &str, home: &str) -> compi_protocol::Result<String> 
     let linux = compi_protocol::wsl::wsl_path_for_windows(home, distribution)?;
     lock(&HOMES).insert(key, linux.clone());
     Ok(linux)
-}
-
-#[cfg(windows)]
-fn wsl_note(distribution: &str, windows_home: &str, linux_home: &str) -> String {
-    format!(
-        "You are running in WSL ({distribution}) on a Windows PC, inside Compi. \
-         The Windows user folder is {windows_home}, which is {linux_home} here. \
-         Windows programs run from this shell by their .exe names, such as cmd.exe, \
-         powershell.exe, tasklist.exe and winget.exe. To see an open Windows app window, \
-         such as a dialog you caused: `compi screenshot` lists the windows, and \
-         `compi screenshot NAME` saves one as a PNG and prints its path for you to read."
-    )
-}
-
-/// What a Windows agent (a Windows `claude` reached from WSL) is told in a WSL chat in
-/// `folder`: the project is Linux's, so its commands run there and its file tools use the
-/// share's paths, not the Windows drive's.
-fn windows_agent_note(distribution: &str, folder: &str) -> String {
-    let share = format!(
-        r"\\wsl.localhost\{distribution}{}",
-        folder.replace('/', r"\")
-    );
-    let quoted = format!("'{}'", folder.replace('\'', r"'\''"));
-    format!(
-        "This project is in WSL ({distribution}) at {folder}, which Windows sees as {share}. \
-         You run as a Windows program: your Bash tool is a Windows shell (Git Bash) and your \
-         file tools take Windows paths. Run every shell command inside WSL, in the project \
-         folder, exactly as: MSYS_NO_PATHCONV=1 wsl.exe -d {distribution} --cd {quoted} -- \
-         bash -lc 'COMMAND' (without MSYS_NO_PATHCONV, Git Bash rewrites the Linux path). \
-         For file tools, the Linux path /a/b is \\\\wsl.localhost\\{distribution}\\a\\b, never \
-         C:\\a\\b. Inside those WSL commands, `compi screenshot` lists open Windows app \
-         windows and `compi screenshot NAME` saves one as a PNG and prints its path."
-    )
 }
 
 #[cfg(test)]

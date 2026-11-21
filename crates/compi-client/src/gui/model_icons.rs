@@ -120,11 +120,12 @@ pub(super) fn for_provider(provider: &str) -> Option<&'static str> {
     path(icon)
 }
 
-/// The mark of a harness's own models, which name no provider: Claude Code's are Claude.
+/// The mark of an agent's own models, which name no provider: its model mark (Claude
+/// Code's are Claude, Codex's OpenAI); `None` for an agent with a brand mark of its own.
 pub(super) fn for_harness(harness: compi_protocol::chat::ChatHarness) -> Option<&'static str> {
-    match harness {
-        compi_protocol::chat::ChatHarness::Omp => None,
-        compi_protocol::chat::ChatHarness::Claude => path("claude"),
+    match harness.entry().mark {
+        compi_protocol::chat::AgentMark::Model { file, .. } => path(file),
+        compi_protocol::chat::AgentMark::Brand(_) => None,
     }
 }
 
@@ -157,5 +158,10 @@ mod tests {
         assert_eq!(for_model("openrouter/acme/zeta", "Zeta"), None);
         assert_eq!(for_provider("bedrock-mantle"), Some("models/bedrock.svg"));
         assert!(FILES.iter().all(|(path, _)| file(path).is_some()));
+        // An agent drawn with a model mark has it here; one with a brand of its own, none.
+        use compi_protocol::chat::ChatHarness;
+        assert_eq!(for_harness(ChatHarness::Omp), None);
+        assert_eq!(for_harness(ChatHarness::Claude), Some("models/claude.svg"));
+        assert_eq!(for_harness(ChatHarness::Codex), Some("models/openai.svg"));
     }
 }

@@ -3,9 +3,14 @@
 //! one action's details (`compi pane list --help`), and returned whole under `--json`.
 
 use super::human;
+use compi_protocol::chat::ChatHarness;
 use serde_json::{Value, json};
+use std::sync::LazyLock;
 
-/// One command, or one action of a command, as help describes it.
+/// One command, or one action of a command, as help describes it. Its usage and detail
+/// may name `{programs}` (`omp|claude|codex`) and `{agents}` (`omp (OMP), claude (Claude
+/// Code) or codex (Codex)`), which read as every agent `compi chat` takes.
+#[derive(Clone, Copy)]
 pub(super) struct Entry {
     pub(super) command: &'static str,
     /// `None` for a command without actions, or a command's own form beside them
@@ -35,8 +40,35 @@ const GROUPS: &[(&str, &[&str])] = &[
     ("Compi", &["theme", "update", "changes", "help"]),
 ];
 
+/// Every command and action, with the agents filled in.
+pub(super) static ENTRIES: LazyLock<Vec<Entry>> =
+    LazyLock::new(|| CATALOGUE.iter().map(Entry::naming_agents).collect());
+
+impl Entry {
+    /// The entry with `{programs}` and `{agents}` naming every agent.
+    fn naming_agents(&self) -> Self {
+        let fill = |text: &'static str| -> &'static str {
+            if !text.contains("{programs}") && !text.contains("{agents}") {
+                return text;
+            }
+            let programs = ChatHarness::ALL.map(ChatHarness::program).join("|");
+            let agents =
+                crate::chat::agent_list(|agent| format!("{} ({})", agent.program, agent.name));
+            String::leak(
+                text.replace("{programs}", &programs)
+                    .replace("{agents}", &agents),
+            )
+        };
+        Self {
+            usage: fill(self.usage),
+            detail: fill(self.detail),
+            ..*self
+        }
+    }
+}
+
 /// Every command and action. Each command of `super::COMMANDS` has at least one.
-pub(super) const ENTRIES: &[Entry] = &[
+const CATALOGUE: &[Entry] = &[
     Entry {
         command: "workspace",
         action: Some("list"),
@@ -440,9 +472,9 @@ pub(super) const ENTRIES: &[Entry] = &[
     Entry {
         command: "chat",
         action: None,
-        usage: "chat [--agent omp|claude]",
+        usage: "chat [--agent {programs}]",
         summary: "Chat with an agent in or beside the terminal's pane",
-        detail: "Start a new chat in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or the pane menu's Show terminal returns to it (Esc never leaves the chat). The chat's agent is --agent, omp (OMP) or claude (Claude Code), else the agent of the terminal's project (Settings → Projects), else the Default agent ([chat] agent, Settings → Chat). With [chat] open = \"beside\" (Settings → Chat → Opening a chat), it opens in a new pane beside the terminal instead. The agent works in the shell's current directory, in the terminal's environment (a WSL distribution runs it there). The chat runs while a pane or view holds it, hidden or not; closing its pane, view or tab ends it with the shell, like any terminal's process. Its transcript stays a thread: Threads in the palette reopens it on the same session, and compi threads lists it. --json adds the chat's id and folder.",
+        detail: "Start a new chat in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or the pane menu's Show terminal returns to it (Esc never leaves the chat). The chat's agent is --agent, {agents}, else the agent of the terminal's project (Settings → Projects), else the Default agent ([chat] agent, Settings → Chat). With [chat] open = \"beside\" (Settings → Chat → Opening a chat), it opens in a new pane beside the terminal instead. The agent works in the shell's current directory, in the terminal's environment (a WSL distribution runs it there). The chat runs while a pane or view holds it, hidden or not; closing its pane, view or tab ends it with the shell, like any terminal's process. Its transcript stays a thread: Threads in the palette reopens it on the same session, and compi threads lists it. --json adds the chat's id and folder.",
         example: "compi chat --agent claude",
     },
     Entry {
@@ -810,13 +842,29 @@ mod tests {
             assert!(!group(command).is_empty(), "{command} is in no group");
         }
         let overview = text("", None, 200);
-        for entry in ENTRIES {
+        for entry in ENTRIES.iter() {
             assert!(
                 overview.contains(&format!("  {} ", name(entry))),
                 "{} is missing from compi help",
                 name(entry)
             );
         }
+    }
+
+    #[test]
+    fn chat_help_names_every_agent() {
+        let chat = find("chat", None).unwrap();
+        assert_eq!(usage(chat), "compi chat [--agent omp|claude|codex]");
+        assert!(
+            chat.detail
+                .contains("--agent, omp (OMP), claude (Claude Code) or codex (Codex), else"),
+            "{}",
+            chat.detail
+        );
+        assert!(ENTRIES.iter().all(|entry| {
+            let text = format!("{} {}", entry.usage, entry.detail);
+            !text.contains("{agents}") && !text.contains("{programs}")
+        }));
     }
 
     #[test]

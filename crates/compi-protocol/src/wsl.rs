@@ -110,19 +110,16 @@ pub fn resolve_launch(
     }
 
     let windows_path = Path::new(requested).is_absolute() && !requested.starts_with('/');
+    let root = drive_root(&distribution.name);
     let resolved_wsl_path = if requested.starts_with('/') {
         requested.to_owned()
     } else if windows_path {
-        let output = run_wsl([
-            "--distribution",
-            distribution.name.as_str(),
-            "--exec",
-            "wslpath",
-            "-a",
-            "-u",
+        linux_path(
             requested,
-        ])?;
-        checked_output(output, "could not translate the Windows working directory")?
+            &distribution.name,
+            root.as_deref(),
+            "could not translate the Windows working directory",
+        )?
     } else {
         return Err(format!(
             "working directory must be an absolute WSL or Windows path: {requested:?}"
@@ -136,8 +133,12 @@ pub fn resolve_launch(
         )
         .into());
     }
-    // The WSL file provider validates ordinary paths without starting a second
-    // Linux process. Fall back for paths the Windows provider cannot represent.
+    // A folder on a Windows drive is checked on that drive; another, through the WSL file
+    // provider, without starting a second Linux process. Fall back for paths the Windows
+    // provider cannot represent.
+    let drive_folder = root
+        .as_deref()
+        .and_then(|root| mounted_windows_path(&resolved_wsl_path, root));
     let representable = resolved_wsl_path.split('/').all(|name| {
         let base = name.split('.').next().unwrap_or_default();
         name != "."
@@ -155,12 +156,15 @@ pub fn resolve_launch(
                 && matches!(base.as_bytes()[3], b'1'..=b'9'))
     });
     let native_directory_valid = representable
-        && Path::new(&format!(
-            r"\\wsl.localhost\{}\{}",
-            distribution.name,
-            resolved_wsl_path.trim_start_matches('/').replace('/', "\\")
-        ))
-        .is_dir();
+        && match &drive_folder {
+            Some(folder) => Path::new(folder).is_dir(),
+            None => Path::new(&format!(
+                r"\\wsl.localhost\{}\{}",
+                distribution.name,
+                resolved_wsl_path.trim_start_matches('/').replace('/', "\\")
+            ))
+            .is_dir(),
+        };
     if !native_directory_valid {
         let validation = run_wsl([
             "--distribution",
@@ -181,7 +185,9 @@ pub fn resolve_launch(
 
     let warning_path = if windows_path {
         Some(PathBuf::from(requested))
-    } else if is_mounted_windows_path(&resolved_wsl_path) {
+    } else if let Some(folder) = drive_folder {
+        Some(PathBuf::from(folder))
+    } else if root.is_none() && is_mounted_windows_path(&resolved_wsl_path) {
         run_wsl([
             "--distribution",
             distribution.name.as_str(),
@@ -233,6 +239,20 @@ pub fn windows_path_for_wsl(path: &str, distribution: &str) -> Result<PathBuf> {
 /// The Linux path `distribution` gives the Windows path `path`: `C:\Users\x` is
 /// `/mnt/c/Users/x` there, or under wherever its drives are mounted.
 pub fn wsl_path_for_windows(path: &str, distribution: &str) -> Result<String> {
+    linux_path(
+        path,
+        distribution,
+        drive_root(distribution).as_deref(),
+        "could not resolve the Windows folder in WSL",
+    )
+}
+
+/// `path` in `distribution`: a drive path under `root`, its drive mount root, as it is
+/// written; any other through `wslpath`.
+fn linux_path(path: &str, distribution: &str, root: Option<&str>, context: &str) -> Result<String> {
+    if let Some(linux) = root.and_then(|root| drive_linux_path(path, root)) {
+        return Ok(linux);
+    }
     let output = run_wsl([
         "--distribution",
         distribution,
@@ -243,7 +263,89 @@ pub fn wsl_path_for_windows(path: &str, distribution: &str) -> Result<String> {
         "--",
         path,
     ])?;
-    checked_output(output, "could not resolve the Windows folder in WSL")
+    checked_output(output, context)
+}
+
+/// Where `distribution` mounts Windows drives, ending in `/`: `/mnt/` unless its
+/// `wsl.conf` moves them. Asked of WSL once, through the system drive, and kept while
+/// that `wsl.conf` stays as it was; `None` when WSL does not mount that drive.
+pub fn drive_root(distribution: &str) -> Option<String> {
+    type Stamp = Option<(u64, u64)>;
+    static ROOTS: std::sync::Mutex<Vec<(String, Stamp, Option<String>)>> =
+        std::sync::Mutex::new(Vec::new());
+    let configuration: Stamp =
+        fs::metadata(format!(r"\\wsl.localhost\{distribution}\etc\wsl.conf"))
+            .ok()
+            .map(|metadata| (metadata.file_size(), metadata.last_write_time()));
+    if let Some((_, _, root)) = ROOTS
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(name, stamp, _)| name == distribution && *stamp == configuration)
+    {
+        return root.clone();
+    }
+    let drive = env::var("SystemDrive")
+        .ok()
+        .filter(|drive| matches!(drive.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic()))
+        .unwrap_or_else(|| "C:".to_owned());
+    // A WSL that could not be asked is asked again next time.
+    let output = run_wsl([
+        "--distribution",
+        distribution,
+        "--exec",
+        "wslpath",
+        "-a",
+        "-u",
+        "--",
+        &format!("{drive}\\"),
+    ])
+    .ok()?;
+    let root = checked_output(output, "")
+        .ok()
+        .and_then(|path| parse_drive_root(&path, drive.as_bytes()[0]));
+    let mut roots = ROOTS.lock().ok()?;
+    roots.retain(|(name, ..)| name != distribution);
+    roots.push((distribution.to_owned(), configuration, root.clone()));
+    root
+}
+
+/// The drive mount root in `path`, `wslpath`'s Linux path of drive `letter`'s root.
+fn parse_drive_root(path: &str, letter: u8) -> Option<String> {
+    let root = path
+        .trim_end_matches('/')
+        .strip_suffix(char::from(letter.to_ascii_lowercase()))?;
+    (root.starts_with('/') && root.ends_with('/')).then(|| root.to_owned())
+}
+
+/// `C:\x\y` as `<root>c/x/y`; `None` for a path that starts with no drive.
+fn drive_linux_path(path: &str, root: &str) -> Option<String> {
+    let [letter, b':', b'\\' | b'/', ..] = path.as_bytes() else {
+        return None;
+    };
+    letter.is_ascii_alphabetic().then(|| {
+        format!(
+            "{root}{}{}",
+            letter.to_ascii_lowercase() as char,
+            path[2..].replace('\\', "/")
+        )
+    })
+}
+
+/// `<root>c/x/y` as `C:\x\y`; `None` for a path under no drive mount.
+fn mounted_windows_path(path: &str, root: &str) -> Option<String> {
+    let rest = path.strip_prefix(root)?;
+    let (mount, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    let [letter] = mount.as_bytes() else {
+        return None;
+    };
+    letter.is_ascii_alphabetic().then(|| {
+        format!(
+            "{}:\\{}",
+            letter.to_ascii_uppercase() as char,
+            tail.replace('/', "\\")
+        )
+    })
 }
 
 fn selected_wsl2_distribution(name: &str) -> Result<DefaultDistribution> {
@@ -683,5 +785,35 @@ mod tests {
         assert!(is_mounted_windows_path("/mnt/d"));
         assert!(!is_mounted_windows_path("/home/dev/project"));
         assert!(!is_mounted_windows_path("/mnt/shared/project"));
+    }
+
+    #[test]
+    fn translates_drive_paths_through_the_mount_root() {
+        assert_eq!(parse_drive_root("/mnt/c/", b'C').as_deref(), Some("/mnt/"));
+        assert_eq!(parse_drive_root("/c", b'C').as_deref(), Some("/"));
+        assert_eq!(
+            parse_drive_root("/windows/d/", b'D').as_deref(),
+            Some("/windows/")
+        );
+        assert_eq!(parse_drive_root("c", b'C'), None);
+        assert_eq!(
+            drive_linux_path(r"C:\Users\Me\proj", "/mnt/").as_deref(),
+            Some("/mnt/c/Users/Me/proj")
+        );
+        assert_eq!(drive_linux_path("D:/", "/").as_deref(), Some("/d/"));
+        for path in [r"\\server\share", "/home/me", "C:", "relative"] {
+            assert_eq!(drive_linux_path(path, "/mnt/"), None, "{path}");
+        }
+        assert_eq!(
+            mounted_windows_path("/mnt/c/Users/Me", "/mnt/").as_deref(),
+            Some(r"C:\Users\Me")
+        );
+        assert_eq!(
+            mounted_windows_path("/mnt/d", "/mnt/").as_deref(),
+            Some(r"D:\")
+        );
+        for path in ["/mnt/shared/x", "/home/me", "/mnt/"] {
+            assert_eq!(mounted_windows_path(path, "/mnt/"), None, "{path}");
+        }
     }
 }

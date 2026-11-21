@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn registry_ids_are_unique_and_every_command_has_a_name_and_category() {
         let mut ids = HashSet::new();
-        for spec in REGISTRY {
+        for spec in REGISTRY.iter() {
             assert!(ids.insert(spec.id), "duplicate id {}", spec.id);
             assert!(!spec.label.is_empty(), "{}", spec.id);
             assert!(commands::by_id(spec.id).is_some());
@@ -154,7 +154,7 @@ mod tests {
         assert_eq!(value["platform"], platform_name(platform));
         let commands = value["commands"].as_array().unwrap();
         assert_eq!(commands.len(), REGISTRY.len());
-        for (command, spec) in commands.iter().zip(REGISTRY) {
+        for (command, spec) in commands.iter().zip(REGISTRY.iter()) {
             let mut keys: Vec<&str> = command
                 .as_object()
                 .unwrap()

@@ -10,7 +10,11 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
+
+use super::super::rfc3339;
 
 /// How far into a file the first prompt and the title are looked for.
 const HEAD_BYTES: u64 = 1024 * 1024;
@@ -255,35 +259,6 @@ fn end(text: &str) -> String {
         }
         _ => text.to_owned(),
     }
-}
-
-/// `time` in RFC 3339, in UTC, to the second.
-fn rfc3339(time: SystemTime) -> String {
-    let seconds = time
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    let (days, rest) = (seconds / 86_400, seconds % 86_400);
-    // Howard Hinnant's days-to-civil, for days since 1970-01-01.
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        rest / 3600,
-        rest % 3600 / 60,
-        rest % 60
-    )
 }
 
 #[cfg(test)]

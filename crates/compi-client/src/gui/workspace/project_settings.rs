@@ -54,8 +54,15 @@ pub(super) struct ListedProject {
 }
 
 /// New threads' agent choices: Default (Settings → Chat's), then each agent.
-const AGENT_CHOICES: [Option<ChatHarness>; 3] =
-    [None, Some(ChatHarness::Omp), Some(ChatHarness::Claude)];
+const AGENT_CHOICES: [Option<ChatHarness>; ChatHarness::ALL.len() + 1] = {
+    let mut choices = [None; ChatHarness::ALL.len() + 1];
+    let mut index = 0;
+    while index < ChatHarness::ALL.len() {
+        choices[index + 1] = Some(ChatHarness::ALL[index]);
+        index += 1;
+    }
+    choices
+};
 
 /// The project `key` names (`project_key`), for a project listed only by its settings.
 fn project_from_key(key: &str) -> Option<Project> {

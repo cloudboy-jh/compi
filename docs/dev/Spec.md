@@ -358,7 +358,7 @@ Profiles resolve into host-specific executable, argv, cwd, and environment data 
 ### Shell and environment fidelity
 
 - macOS defaults to the user's configured native shell with platform-appropriate interactive/login behavior; it must not assume Bash.
-- Windows starts the shell chosen in Settings → Terminal → Shell (`[shell] windows`): Windows PowerShell for new installations, WSL for installations that used Compi before it had the choice. WSL uses the chosen WSL2 distribution and configured shell, Bash by default. Open shells keep theirs when the choice changes.
+- Windows starts the shell of Settings → Terminal → Advanced → Shell (`[shell] windows`): automatic for new installations (the daemon picks WSL for a Linux-only folder, else Windows PowerShell, and stores the pick on the surface), WSL for installations that used Compi before it had the choice, or the one chosen. WSL uses the chosen WSL2 distribution and configured shell, Bash by default. Open shells keep theirs when the choice changes. At start the daemon warms what the workspace's shells need (WSL boot and shell bridge, PowerShell's files) in the background, and resolves each launch on its own thread so one shell waiting for WSL holds up no other.
 - Linux defaults to the user's configured shell.
 - Explicit profiles can choose a shell or directly launch a process without changing workspace semantics.
 - Preserve shell startup files, job control, SSH agent access, credential helpers, locale, and normal environment behavior. The only startup-file edit Compi makes is the reviewed login-shell prompt block described under [shell prompt settings](#shell-prompt-settings).

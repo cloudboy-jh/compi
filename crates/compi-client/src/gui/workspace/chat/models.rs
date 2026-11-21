@@ -218,21 +218,12 @@ fn provider_name(provider: &str) -> String {
         .join(" ")
 }
 
-/// Whether the models naming no provider are the harness's own: Claude Code's model IDs
-/// (`opus`, `sonnet`) name none, while OMP's name theirs (`anthropic/claude-opus-5-5`).
-fn own_models(harness: ChatHarness) -> bool {
-    match harness {
-        ChatHarness::Omp => false,
-        ChatHarness::Claude => true,
-    }
-}
-
-/// What the strip and list call `provider`; models naming none are the harness's own,
-/// else Other.
+/// What the strip and list call `provider`; models naming none are the agent's own
+/// (`AgentEntry::own_models`), else Other.
 fn provider_title(provider: Option<&str>, harness: ChatHarness) -> String {
     match provider {
         Some(provider) => provider_name(provider),
-        None if own_models(harness) => harness.name().to_owned(),
+        None if harness.entry().own_models => harness.name().to_owned(),
         None => "Other".to_owned(),
     }
 }
@@ -411,7 +402,7 @@ fn strip_tabs(option: &ChatOption, plans: &[ChatPlan]) -> Vec<PickerTab> {
 fn model_mark(choice: &ChatChoice, harness: ChatHarness) -> Option<&'static str> {
     model_icons::for_model(&choice.value, &choice.name).or_else(|| match choice_provider(choice) {
         Some(provider) => model_icons::for_provider(provider),
-        None if own_models(harness) => model_icons::for_harness(harness),
+        None if harness.entry().own_models => model_icons::for_harness(harness),
         None => None,
     })
 }
@@ -468,29 +459,20 @@ fn approval_face(approval: ChatApproval, harness: ChatHarness) -> (IconName, &'s
     }
 }
 
-/// The icon and name of the harness's own approval setting.
+/// The icon and name of the agent's own approval setting.
 fn harness_setting_face(harness: ChatHarness) -> (IconName, &'static str) {
-    match harness {
-        ChatHarness::Omp => (IconName::Shield, "OMP's own setting"),
-        ChatHarness::Claude => (IconName::Shield, "Same as Claude Code"),
-    }
+    (IconName::Shield, harness.entry().own_setting)
 }
 
-/// The icon and name of an approval mode `harness` runs with, by its own name for it.
+/// The icon and name of an approval mode `harness` runs with, by its own name for it: the
+/// Compi level it is, under the mode's own name when it has one.
 fn approval_mode_face(harness: ChatHarness, mode: &str) -> (IconName, &'static str) {
-    match (harness, mode) {
-        (ChatHarness::Omp, "always-ask") | (ChatHarness::Claude, "default") => {
-            (IconName::ShieldCheck, "Ask before anything")
+    match harness.approval_level(mode) {
+        Some((level, name)) => {
+            let (icon, label) = approval_face(level, harness);
+            (icon, name.unwrap_or(label))
         }
-        (ChatHarness::Omp, "always-ask-cached") => (IconName::ShieldCheck, "Ask once per tool"),
-        (ChatHarness::Omp, "write") | (ChatHarness::Claude, "acceptEdits") => {
-            (IconName::ShieldHalf, "Edits allowed")
-        }
-        (ChatHarness::Claude, "plan") => (IconName::Shield, "Plan"),
-        (ChatHarness::Omp, "yolo") | (ChatHarness::Claude, "bypassPermissions") => {
-            (IconName::ShieldOff, "Full access")
-        }
-        _ => harness_setting_face(harness),
+        None => harness_setting_face(harness),
     }
 }
 
@@ -1676,6 +1658,7 @@ impl CompiApp {
         } else {
             Vec::new()
         };
+        let own_models = chat.harness.entry().own_models;
         let providers =
             providers(option, plans)
                 .into_iter()
@@ -1685,7 +1668,7 @@ impl CompiApp {
                     let icon = match (provider.and_then(model_icons::for_provider), provider) {
                         (Some(path), _) => mark(Some(path), 18.0, muted),
                         // The harness's own models: its mark, in its colours.
-                        (None, None) if own_models(chat.harness) => img(harness_mark(chat.harness))
+                        (None, None) if own_models => img(harness_mark(chat.harness))
                             .flex_none()
                             .size(ui_rems(18.0))
                             .into_any_element(),
@@ -2234,6 +2217,14 @@ mod tests {
                 .all(|choice| model_mark(choice, claude) == Some("models/claude.svg"))
         );
         assert_eq!(model_mark(&option.choices[0], ChatHarness::Omp), None);
+        // Codex's own models wear OpenAI's mark, named for it or not.
+        for choice in [named("gpt-5.5", "GPT-5.5"), named("custom", "Custom")] {
+            assert_eq!(
+                model_mark(&choice, ChatHarness::Codex),
+                Some("models/openai.svg")
+            );
+        }
+        assert_eq!(provider_title(None, ChatHarness::Codex), "Codex");
     }
 
     #[test]
@@ -2258,9 +2249,43 @@ mod tests {
         }
         assert_eq!(approval_mode_face(omp, "write").1, "Edits allowed");
         assert_eq!(
+            approval_mode_face(omp, "always-ask-cached"),
+            (IconName::ShieldCheck, "Ask once per tool")
+        );
+        assert_eq!(
             approval_mode_face(omp, "acceptEdits").1,
             "OMP's own setting"
         );
+        let codex = ChatHarness::Codex;
+        assert_eq!(
+            approval_face(ChatApproval::Harness, codex).1,
+            "Same as Codex"
+        );
+        for (mode, face) in [
+            (
+                "untrusted/read-only",
+                (IconName::ShieldCheck, "Ask before anything"),
+            ),
+            (
+                "on-request/workspace-write",
+                (IconName::ShieldHalf, "Edits allowed"),
+            ),
+            (
+                "never/danger-full-access",
+                (IconName::ShieldOff, "Full access"),
+            ),
+            ("on-request/read-only", (IconName::ShieldCheck, "Read only")),
+            (
+                "on-request/danger-full-access",
+                (IconName::ShieldOff, "Full access"),
+            ),
+            (
+                "granular/workspace-write",
+                (IconName::Shield, "Same as Codex"),
+            ),
+        ] {
+            assert_eq!(approval_mode_face(codex, mode), face, "{mode}");
+        }
         assert_eq!(
             approval_shown(ChatApproval::Harness, claude, Some("plan")).1,
             "Plan"

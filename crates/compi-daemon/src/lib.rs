@@ -1,3 +1,5 @@
+#[cfg(windows)]
+pub mod agent_shell;
 mod chat;
 #[cfg(windows)]
 pub mod conpty;

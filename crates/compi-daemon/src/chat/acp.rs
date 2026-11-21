@@ -4,7 +4,7 @@
 //! tell (`saved`).
 use super::launch::Arg;
 use super::{
-    Chat, Driver, Inner, Prompt, head, new_agent, now_ms, saved, settle, short_line, tail,
+    Chat, Driver, Inner, Prompt, Wire, head, new_agent, now_ms, saved, settle, short_line, tail,
 };
 use compi_protocol::chat::{
     ChatAgent, ChatAnswer, ChatAnswers, ChatChoice, ChatCommand, ChatContent, ChatDiff, ChatEntry,
@@ -54,36 +54,58 @@ pub(super) struct Acp {
     question_request: Option<(Value, Vec<FieldShape>)>,
 }
 
+/// OMP's driver, as the chat core calls it.
+pub(super) const WIRE: Wire = Wire {
+    configured_approval,
+    launch_args,
+    start,
+    handle: |chat, inner, message| chat.handle(inner, message),
+    session_with_first_prompt: false,
+    prompt,
+    steer: Some((can_steer, steer)),
+    cancel,
+    interrupt,
+    answer,
+    answer_question,
+    set_option: |_, inner, option, value| set_option(inner, option, value),
+    list_sessions,
+    fill_sessions: saved::fill,
+    switch_session: Some(|chat, inner, session| chat.open_session(inner, session)),
+    cancel_asks,
+    forget_asks,
+    fail_pending,
+    forget_transcript: |_| {},
+};
+
 impl Inner {
     /// The ACP driver's state; only an OMP chat has one.
     pub(super) fn acp(&mut self) -> &mut Acp {
         match &mut self.driver {
             Driver::Acp(acp) => acp,
-            Driver::Claude(_) => unreachable!("an OMP chat speaks ACP"),
+            _ => unreachable!("an OMP chat speaks ACP"),
         }
     }
 
     pub(super) fn acp_state(&self) -> &Acp {
         match &self.driver {
             Driver::Acp(acp) => acp,
-            Driver::Claude(_) => unreachable!("an OMP chat speaks ACP"),
+            _ => unreachable!("an OMP chat speaks ACP"),
         }
     }
 }
 
-/// `omp acp`'s arguments: its approval mode, when there is one, and the extension that
-/// adds the WSL note to its system prompt, when there is one.
-pub(super) fn launch_args(approval_mode: Option<&'static str>, note: bool) -> Vec<Arg> {
+/// `omp acp`'s arguments: its approval mode, when there is one, and Compi's extension,
+/// which ends its system prompt with the chat's note and sends its bash tool's commands
+/// where the chat is.
+fn launch_args(_: &mut Inner, approval_mode: Option<&'static str>) -> Vec<Arg> {
     let mut args = vec![Arg::word("acp")];
     if let Some(mode) = approval_mode {
         args.extend([Arg::word("--approval-mode"), Arg::word(mode)]);
     }
-    if note {
-        args.extend([
-            Arg::word("-e"),
-            Arg::Shell(r#""$HOME/.compi/shell/compi-omp.js""#),
-        ]);
-    }
+    args.push(Arg::Bridge {
+        flag: "-e",
+        file: "compi-omp.js",
+    });
     args
 }
 
@@ -412,7 +434,10 @@ impl Chat {
                             pages: pages + 1,
                         },
                     ),
-                    (None, None) => self.load_session(inner, session, &self.content.folder),
+                    (None, None) => {
+                        let folder = inner.agent_folder().to_owned();
+                        self.load_session(inner, session, &folder);
+                    }
                 }
             }
             (Pending::Steer(prompt), Ok(result)) if result["outcome"] == "injected" => {
@@ -471,13 +496,19 @@ impl Chat {
                 None if can_list => {
                     self.list_page(inner, None, Pending::Locate { session, pages: 1 });
                 }
-                None => self.load_session(inner, session, &self.content.folder),
+                None => {
+                    let folder = inner.agent_folder().to_owned();
+                    self.load_session(inner, session, &folder);
+                }
             },
-            None => inner.request(
-                "session/new",
-                json!({ "cwd": self.content.folder, "mcpServers": [] }),
-                Pending::NewSession,
-            ),
+            None => {
+                let cwd = inner.agent_folder().to_owned();
+                inner.request(
+                    "session/new",
+                    json!({ "cwd": cwd, "mcpServers": [] }),
+                    Pending::NewSession,
+                );
+            }
         }
     }
 
@@ -491,7 +522,7 @@ impl Chat {
 
     /// Asks for a page of the sessions in the chat's folder; `None` is the first.
     fn list_page(&self, inner: &mut Inner, cursor: Option<String>, pending: Pending) {
-        let mut params = json!({ "cwd": self.content.folder });
+        let mut params = json!({ "cwd": inner.agent_folder() });
         if let Some(cursor) = cursor {
             params["cursor"] = cursor.into();
         }
@@ -560,6 +591,7 @@ pub(super) fn answer(inner: &mut Inner, option: Option<String>) -> Result<(), St
         None => json!({ "outcome": "cancelled" }),
     };
     inner.respond(request, json!({ "outcome": outcome }));
+    inner.emit(ChatEvent::Permission { permission: None });
     Ok(())
 }
 
@@ -578,6 +610,7 @@ pub(super) fn answer_question(
         None => json!({ "action": "decline" }),
     };
     inner.respond(request, result);
+    inner.emit(ChatEvent::Question { question: None });
     Ok(())
 }
 
@@ -1695,10 +1728,11 @@ fn file_name(path: &str) -> String {
 /// `omp acp` takes; `None` when the lookup fails or takes longer than
 /// `APPROVAL_LOOKUP_TIMEOUT`. The value is the last line: a login shell's profile may
 /// print before it.
-pub(super) fn configured_approval(content: &ChatContent) -> Option<&'static str> {
+fn configured_approval(content: &ChatContent) -> Option<&'static str> {
     let args = ["config", "get", "tools.approvalMode"].map(Arg::word);
-    let mut child = super::launch::command(content, &[], &args)
-        .ok()?
+    let programs = super::launch::programs(content);
+    let (mut command, _) = super::launch::command(content, &[], &args, &programs).ok()?;
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

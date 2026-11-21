@@ -829,7 +829,7 @@ impl Default for LoadedConfig {
             chat_enter: ChatEnter::Steer,
             chat_open: ChatOpen::InPlace,
             new_tab: None,
-            chat_agent: ChatHarness::Omp,
+            chat_agent: ChatHarness::default(),
             projects: HashMap::new(),
             chat_agents_bar: true,
             chat_models: HashMap::new(),
@@ -1239,13 +1239,14 @@ impl LoadedConfig {
         Ok(())
     }
 
-    /// Persist the agent new threads start with; OMP, the default, removes it.
+    /// Persist the agent new threads start with; the default agent removes it.
     pub fn save_chat_agent(&mut self, agent: ChatHarness) -> Result<(), String> {
-        update_table(&self.path, "chat", |table| match agent {
-            ChatHarness::Omp => {
+        update_table(&self.path, "chat", |table| {
+            if agent == ChatHarness::default() {
                 table.remove("agent");
+            } else {
+                set_table_value(table, "agent", agent.program().into());
             }
-            agent => set_table_value(table, "agent", agent.program().into()),
         })?;
         self.chat_agent = agent;
         Ok(())
@@ -1910,11 +1911,12 @@ fn apply_launch(document: &toml::Table, loaded: &mut LoadedConfig) {
         }
     }
     // Absent only where `settle_windows_shell` could not write it: a fresh install's choice.
-    launch.profile.windows_shell = WindowsShell::PowerShell;
+    launch.profile.windows_shell = WindowsShell::Automatic;
     if let Some(value) = shell.get("windows") {
         match value.as_str().and_then(WindowsShell::from_id) {
             Some(windows_shell) => launch.profile.windows_shell = windows_shell,
-            None => errors.push(r#"shell.windows must be "powershell" or "wsl""#.to_owned()),
+            None => errors
+                .push(r#"shell.windows must be "automatic", "powershell" or "wsl""#.to_owned()),
         }
     }
     for (key, value) in environment {
@@ -2011,7 +2013,7 @@ fn names_windows_shell(document: &toml::Table) -> bool {
 
 /// Run by the app and the CLI before they load the configuration. The first time a version
 /// with the Windows shell setting runs, writes the shell new tabs start: WSL for someone
-/// who used Compi before, when every shell was WSL; else PowerShell.
+/// who used Compi before, when every shell was WSL; else automatic.
 pub fn settle_windows_shell(explicit: Option<&Path>) {
     if !cfg!(windows) {
         return;
@@ -2044,7 +2046,7 @@ fn settle_windows_shell_in(path: &Path, used_before: bool) {
         let shell = if used_before {
             WindowsShell::Wsl
         } else {
-            WindowsShell::PowerShell
+            WindowsShell::Automatic
         };
         let _ = save_windows_shell(path, shell);
     }
@@ -2448,7 +2450,7 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
                 None => invalid(
                     loaded,
                     "chat.agent",
-                    "\"omp\" or \"claude\"",
+                    &crate::chat::agent_list(|agent| format!("\"{}\"", agent.program)),
                     "configuration",
                 ),
             }
@@ -2898,7 +2900,7 @@ fn apply_projects(document: &toml::Table, loaded: &mut LoadedConfig) {
                 None => invalid(
                     loaded,
                     &format!("{field}.agent"),
-                    "\"omp\" or \"claude\"",
+                    &crate::chat::agent_list(|agent| format!("\"{}\"", agent.program)),
                     "configuration",
                 ),
             }
@@ -3491,18 +3493,18 @@ mod tests {
                 .contains("# retain me")
         );
 
-        // A fresh install, with no configuration file yet, gets PowerShell.
+        // A fresh install, with no configuration file yet, picks automatically.
         let fresh = root.join("fresh.toml");
         settle_windows_shell_in(&fresh, false);
-        assert_eq!(shell(&fresh), WindowsShell::PowerShell);
+        assert_eq!(shell(&fresh), WindowsShell::Automatic);
 
         // Once named, it stays, even after the fresh install has saved windows.
         settle_windows_shell_in(&fresh, true);
-        assert_eq!(shell(&fresh), WindowsShell::PowerShell);
+        assert_eq!(shell(&fresh), WindowsShell::Automatic);
         let mut loaded = load(Some(&fresh), FontOverrides::default());
-        loaded.save_windows_shell(WindowsShell::Wsl).unwrap();
+        loaded.save_windows_shell(WindowsShell::PowerShell).unwrap();
         settle_windows_shell_in(&fresh, false);
-        assert_eq!(shell(&fresh), WindowsShell::Wsl);
+        assert_eq!(shell(&fresh), WindowsShell::PowerShell);
 
         // Named in the selected profile counts too.
         let profile = root.join("profile.toml");
@@ -3909,7 +3911,7 @@ mod tests {
 
         fs::write(
             &path,
-            "version = 1\n[projects.'host:/a']\nname = ''\npinned = 'yes'\nagent = 'codex'\n\
+            "version = 1\n[projects.'host:/a']\nname = ''\npinned = 'yes'\nagent = 'nonesuch'\n\
              icon = { kind = 'monogram', text = 'ABC', color = 3 }\nmodel = 'm'\n\
              [projects.'host:/b']\nicon = { kind = 'lucide', name = 'rocket', color = 16 }\n\
              [projects.'host:/c']\nicon = { kind = 'sticker' }\n",
@@ -4102,14 +4104,17 @@ mod tests {
         );
 
         fs::write(&path, "version = 1\n[chat]\nagent = \"codex\"\n").unwrap();
+        assert_eq!(
+            load(Some(&path), FontOverrides::default()).chat_agent,
+            ChatHarness::Codex
+        );
+
+        fs::write(&path, "version = 1\n[chat]\nagent = \"nonesuch\"\n").unwrap();
         let invalid = load(Some(&path), FontOverrides::default());
         assert_eq!(invalid.chat_agent, ChatHarness::Omp);
-        assert!(
-            invalid
-                .diagnostics
-                .iter()
-                .any(|message| message.contains("chat.agent"))
-        );
+        assert!(invalid.diagnostics.iter().any(|message| {
+            message.contains("chat.agent") && message.contains("\"omp\", \"claude\" or \"codex\"")
+        }));
         fs::remove_dir_all(root).unwrap();
     }
 

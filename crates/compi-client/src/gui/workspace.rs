@@ -453,7 +453,7 @@ pub(super) enum Popup {
     UiFont,
     /// Settings → Terminal → Terminal font.
     TerminalFont,
-    /// Settings → Terminal → Default shell (Windows).
+    /// Settings → Terminal → Advanced → Shell (Windows).
     Shell,
     /// Settings → Notifications → Show notifications.
     NotificationDelivery,
@@ -4373,11 +4373,8 @@ impl CompiApp {
             Command::OpenChat => {
                 self.open_chat(self.new_thread_agent(self.selected_project()), window, cx);
             }
-            Command::OpenChatOmp => {
-                self.open_chat(compi_protocol::chat::ChatHarness::Omp, window, cx);
-            }
-            Command::OpenChatClaude => {
-                self.open_chat(compi_protocol::chat::ChatHarness::Claude, window, cx);
+            Command::OpenChatWith(agent) => {
+                self.open_chat(agent, window, cx);
             }
             Command::Threads => self.open_palette(Some(palette::Scope::Threads), cx),
             Command::SendSelectionToChat => self.send_selection_to_chat(window, cx),

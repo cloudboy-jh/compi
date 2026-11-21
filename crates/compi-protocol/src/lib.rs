@@ -92,7 +92,9 @@ use std::fmt;
 // `ListThreads` (`Threads`, `ThreadInfo`), `DeleteThread`, and the mutation `OpenThread`.
 // Tabs and threads belong to a project (`Project`, `WorkspaceTab::project`,
 // `ThreadInfo::project`), with `ProjectIcon` and `SearchProjectFiles`. Settings gains a
-// Projects section.
+// Projects section. A launch profile's Windows shell can be automatic
+// (`WindowsShell::Automatic`): the daemon starts WSL in a Linux folder and Windows
+// PowerShell in a Windows one, and keeps the shell it picked on the surface.
 pub const PROTOCOL_VERSION: u32 = 41;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
@@ -1291,8 +1293,9 @@ pub struct LaunchProfile {
     pub windows_shell: WindowsShell,
 }
 
-/// What a Windows daemon launches: a WSL shell, or Windows PowerShell on the host.
-/// Profiles saved before this choice existed are WSL.
+/// What a Windows daemon launches: a WSL shell, Windows PowerShell on the host, or, when
+/// automatic, whichever is native to the folder the shell starts in. Profiles saved
+/// before this choice existed are WSL.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum WindowsShell {
     #[default]
@@ -1300,6 +1303,8 @@ pub enum WindowsShell {
     Wsl,
     #[serde(rename = "powershell")]
     PowerShell,
+    #[serde(rename = "automatic")]
+    Automatic,
 }
 
 impl WindowsShell {
@@ -1307,9 +1312,10 @@ impl WindowsShell {
         *self == Self::Wsl
     }
 
-    /// The configuration value: `powershell` or `wsl`.
+    /// The configuration value: `automatic`, `powershell` or `wsl`.
     pub fn id(self) -> &'static str {
         match self {
+            Self::Automatic => "automatic",
             Self::PowerShell => "powershell",
             Self::Wsl => "wsl",
         }
@@ -1317,10 +1323,40 @@ impl WindowsShell {
 
     pub fn from_id(id: &str) -> Option<Self> {
         match id {
+            "automatic" => Some(Self::Automatic),
             "powershell" => Some(Self::PowerShell),
             "wsl" => Some(Self::Wsl),
             _ => None,
         }
+    }
+
+    /// The shell a launch in `directory` starts. Automatic is WSL in a folder only Linux
+    /// has (`/home/me`, `\\wsl.localhost\Ubuntu\…`), and Windows PowerShell in a Windows
+    /// folder (`C:\…`, a drive mount such as `/mnt/c/…`) or the home folder, where it
+    /// starts without waiting for WSL.
+    pub fn for_directory(self, directory: Option<&str>) -> Self {
+        if self != Self::Automatic {
+            return self;
+        }
+        let linux = directory.is_some_and(|path| {
+            let lower = path.to_ascii_lowercase().replace('/', "\\");
+            if lower.starts_with(r"\\wsl.localhost\") || lower.starts_with(r"\\wsl$\") {
+                return true;
+            }
+            let Some(rest) = path.strip_prefix('/') else {
+                return false;
+            };
+            let mut names = rest.split('/');
+            let first = names.next().unwrap_or_default();
+            // `/C:/x`, as a PowerShell pane reports `C:\x`, or a drive mount.
+            let windows = matches!(first.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic())
+                || (first == "mnt"
+                    && names.next().is_some_and(
+                        |name| matches!(name.as_bytes(), [letter] if letter.is_ascii_alphabetic()),
+                    ));
+            !windows
+        });
+        if linux { Self::Wsl } else { Self::PowerShell }
     }
 }
 
@@ -2535,6 +2571,38 @@ pub fn decode_server(payload: &[u8]) -> serde_json::Result<ServerControl> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_windows_shell_follows_the_folder() {
+        let automatic = |path| WindowsShell::Automatic.for_directory(path);
+        for path in [
+            "/home/me",
+            "/",
+            "/mnt/shared/x",
+            r"\\wsl.localhost\Ubuntu\home",
+            "//wsl$/Ubuntu",
+        ] {
+            assert_eq!(automatic(Some(path)), WindowsShell::Wsl, "{path}");
+        }
+        for path in [
+            r"C:\Users\me",
+            "/mnt/c/Users/me",
+            "/mnt/d",
+            "/C:/x",
+            r"\\server\share",
+        ] {
+            assert_eq!(automatic(Some(path)), WindowsShell::PowerShell, "{path}");
+        }
+        assert_eq!(automatic(None), WindowsShell::PowerShell);
+        assert_eq!(
+            WindowsShell::Wsl.for_directory(Some(r"C:\x")),
+            WindowsShell::Wsl
+        );
+        assert_eq!(
+            WindowsShell::PowerShell.for_directory(Some("/home/me")),
+            WindowsShell::PowerShell
+        );
+    }
 
     #[test]
     fn input_json_remains_compatible_without_alternate_scroll_marker() {

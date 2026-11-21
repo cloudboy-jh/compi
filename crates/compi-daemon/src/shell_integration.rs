@@ -40,6 +40,7 @@ pub(crate) fn cli_environment(
 }
 
 const BRIDGE: &str = include_str!("../../../assets/compi-shell.sh");
+const AGENT_HOOK: &str = include_str!("../../../assets/compi-agent.sh");
 const BASH_FUNCTIONS: [&str; 20] = [
     "compi",
     "_compi_cli_init",
@@ -295,7 +296,7 @@ pub(crate) fn install_home_bridge() -> Result<()> {
 }
 
 /// How many files `shell_files` installs.
-const SHELL_FILES: usize = 8;
+const SHELL_FILES: usize = 9;
 
 fn shell_files() -> [(&'static str, &'static str); SHELL_FILES] {
     [
@@ -376,18 +377,38 @@ fi
 unset _compi_shell_dir _compi_user_zdotdir _compi_zdotdir_set
 "#,
         ),
-        // An OMP extension a WSL chat loads (`omp acp -e`): it ends the system prompt
-        // with `COMPI_AGENT_NOTE`. `--append-system-prompt` would replace the user's
-        // own `APPEND_SYSTEM.md` instead.
+        // Compi's hook for the shells agents run commands in (`BASH_ENV`): their
+        // commands land where the chat is, as a Compi terminal's do.
+        ("compi-agent.sh", AGENT_HOOK),
+        // Compi's extension for OMP (`omp acp -e`). It ends the system prompt with
+        // `COMPI_AGENT_NOTE` (`--append-system-prompt` would replace the user's own
+        // `APPEND_SYSTEM.md`), and sends the bash tool's commands where the chat is: OMP
+        // runs them in a shell of its own, which no `BASH_ENV` reaches. A Linux OMP
+        // gives a command that can be PowerShell's to Bash, whose hook sends it on; a
+        // Windows OMP in a WSL chat runs every command with Compi's agent shell.
         (
             "compi-omp.js",
             r#"export default function (pi) {
   const note = process.env.COMPI_AGENT_NOTE;
-  if (!note) return;
-  pi.on("before_agent_start", event => {
-    const base = Array.isArray(event.systemPrompt) ? event.systemPrompt : [event.systemPrompt];
-    if (base.includes(note)) return;
-    return { systemPrompt: [...base, note] };
+  if (note) {
+    pi.on("before_agent_start", event => {
+      const base = Array.isArray(event.systemPrompt) ? event.systemPrompt : [event.systemPrompt];
+      if (base.includes(note)) return;
+      return { systemPrompt: [...base, note] };
+    });
+  }
+  const quote = text => `'${text.replaceAll("'", `'\\''`)}'`;
+  const shell = process.platform === "win32" ? process.env.COMPI_AGENT_SHELL : undefined;
+  const hook = process.platform !== "win32" && (process.env.BASH_ENV ?? "").endsWith("/compi-agent.sh");
+  const maybePowerShell = /^\s*(?:\$|\[|["']|\(?[A-Za-z]+-[A-Za-z])/;
+  if (!shell && !hook) return;
+  pi.on("tool_call", event => {
+    const command = event.input?.command;
+    if (event.toolName !== "bash" || typeof command !== "string") return;
+    if (shell) return { input: { ...event.input, command: `${quote(shell)} -c ${quote(command)}` } };
+    if (maybePowerShell.test(command)) {
+      return { input: { ...event.input, command: `/usr/bin/env bash -c ${quote(command)}` } };
+    }
   });
 }
 "#,
@@ -901,6 +922,76 @@ pub(crate) fn install_wsl_bridge(distribution: &str) -> Result<()> {
     Ok(())
 }
 
+/// Does ahead of time what `distribution`'s first terminal or chat would wait for:
+/// starting WSL, installing the shell bridge and the Windows command index, and learning
+/// where its Windows drives are mounted.
+#[cfg(windows)]
+pub(crate) fn warm_wsl(distribution: &str) -> Result<()> {
+    {
+        let mut bridges = BRIDGES
+            .lock()
+            .map_err(|_| "WSL bridge cache was poisoned")?;
+        let bridge = installed_bridge(&mut bridges, distribution, None)?;
+        link_windows_commands(bridge, distribution, None);
+    }
+    compi_protocol::wsl::drive_root(distribution);
+    Ok(())
+}
+
+/// Starts Windows PowerShell once, without a profile, so the first terminal's PowerShell
+/// finds its program and libraries already read from disk; encodes Compi's integration.
+#[cfg(windows)]
+pub(crate) fn warm_powershell() {
+    use std::os::windows::process::CommandExt;
+    powershell_argv();
+    let Some(root) = std::env::var_os("SystemRoot") else {
+        return;
+    };
+    let _ = std::process::Command::new(
+        std::path::PathBuf::from(root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"),
+    )
+    .args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "exit",
+    ])
+    .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status();
+}
+
+/// Links the Windows commands of the current search path into `bridge`'s
+/// distribution, unless the index it has is current. An index directory is immutable,
+/// so an existing one (e.g. from before a daemon restart) needs no WSL call. A failed
+/// refresh keeps any earlier index; without one, the shell keeps WSL's Windows
+/// directories.
+#[cfg(windows)]
+fn link_windows_commands(bridge: &mut WslBridge, distribution: &str, home_override: Option<&str>) {
+    let Some(commands) = windows_commands() else {
+        return;
+    };
+    if bridge.commands.as_deref() == Some(commands.digest.as_str()) {
+        return;
+    }
+    let installed = bridge
+        .directory
+        .parent()
+        .is_some_and(|root| root.join(format!("wincmd.{}", commands.digest)).is_dir());
+    let result = if installed {
+        Ok(())
+    } else {
+        install_windows_commands(distribution, home_override, &commands)
+    };
+    match result {
+        Ok(()) => bridge.commands = Some(commands.digest.clone()),
+        Err(error) => eprintln!("compi-daemon: {error}"),
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn prepare_wsl(
     distribution: Option<&str>,
@@ -921,26 +1012,7 @@ pub(crate) fn prepare_wsl(
         .lock()
         .map_err(|_| "WSL bridge cache was poisoned")?;
     let bridge = installed_bridge(&mut bridges, distribution, home_override)?;
-    if let Some(commands) = windows_commands()
-        && bridge.commands.as_deref() != Some(commands.digest.as_str())
-    {
-        // An index directory is immutable, so an existing one (e.g. from before
-        // a daemon restart) needs no WSL call. A failed refresh keeps any
-        // earlier index; without one, the shell keeps WSL's Windows directories.
-        let installed = bridge
-            .directory
-            .parent()
-            .is_some_and(|root| root.join(format!("wincmd.{}", commands.digest)).is_dir());
-        let result = if installed {
-            Ok(())
-        } else {
-            install_windows_commands(distribution, home_override, &commands)
-        };
-        match result {
-            Ok(()) => bridge.commands = Some(commands.digest.clone()),
-            Err(error) => eprintln!("compi-daemon: {error}"),
-        }
-    }
+    link_windows_commands(bridge, distribution, home_override);
     let commands = OsString::from(bridge.commands.as_deref().unwrap_or_default());
     if login {
         if bridge.functions.is_none() {
@@ -1031,7 +1103,7 @@ mkdir -p "$dir"
 if [ -L "$dir" ]; then echo 'Compi shell directory must not be a symbolic link' >&2; exit 1; fi
 chmod 700 "$dir"
 while IFS='	' read -r name encoded; do
-    case "$name" in compi|compi-shell.sh|bashrc|.zshenv|.zprofile|.zshrc|.zlogin|compi-omp.js) ;; *) echo 'invalid Compi shell file' >&2; exit 1 ;; esac
+    case "$name" in compi|compi-shell.sh|compi-agent.sh|bashrc|.zshenv|.zprofile|.zshrc|.zlogin|compi-omp.js) ;; *) echo 'invalid Compi shell file' >&2; exit 1 ;; esac
     if [ -f "$dir/$name" ] && [ "$(base64 -w 0 "$dir/$name")" = "$encoded" ]; then
         if [ "$name" = compi ]; then chmod 700 "$dir/$name"; fi
         continue

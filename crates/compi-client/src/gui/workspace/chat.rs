@@ -308,12 +308,15 @@ fn chat_leaves<'a>(node: &'a LayoutNode, output: &mut Vec<(&'a PaneId, &'a ChatC
     }
 }
 
-/// The harness's own mark, in its colours.
+/// The agent's own mark, in its colours (`controls::agent_mark_path`).
 pub(super) fn harness_mark(harness: ChatHarness) -> &'static str {
-    match harness {
-        ChatHarness::Omp => controls::OMP_MARK,
-        ChatHarness::Claude => controls::CLAUDE_MARK,
-    }
+    static MARKS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+        ChatHarness::ALL
+            .into_iter()
+            .map(|harness| -> &'static str { controls::agent_mark_path(harness).leak() })
+            .collect()
+    });
+    MARKS[harness as usize]
 }
 
 /// `folder` shortened to its last two names.

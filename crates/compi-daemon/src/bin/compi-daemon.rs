@@ -1,5 +1,10 @@
 #[cfg(any(windows, unix))]
 fn main() {
+    // Started as Compi's agent shell (`bash.exe`), it runs a Windows agent's command.
+    #[cfg(windows)]
+    if compi_daemon::agent_shell::invoked() {
+        std::process::exit(compi_daemon::agent_shell::run());
+    }
     if let Err(error) = run() {
         eprintln!("compi-daemon: {error}");
         std::process::exit(1);

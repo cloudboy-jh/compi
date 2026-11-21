@@ -446,6 +446,64 @@ fn digest_hex(bytes: &[u8]) -> String {
     output
 }
 
+/// Does in the background what the first terminal or chat would otherwise wait for:
+/// reading Windows PowerShell from disk, and for each WSL distribution the workspace's
+/// terminals, folders and chats use, starting WSL and installing Compi's shell bridge.
+#[cfg(windows)]
+fn warm_launches(manager: &SurfaceManager) {
+    use compi_protocol::{ContentEnvironment, LayoutNode, PaneContent};
+    use std::collections::BTreeSet;
+    fn wsl_content(node: &LayoutNode, distributions: &mut BTreeSet<String>) {
+        match node {
+            LayoutNode::Pane { .. } => {}
+            LayoutNode::Content { content, .. } => {
+                let environment = match content {
+                    PaneContent::Chat(chat) => Some(&chat.environment),
+                    other => other.folder().map(|folder| &folder.environment),
+                };
+                if let Some(ContentEnvironment::Wsl { distribution }) = environment {
+                    distributions.insert(distribution.clone());
+                }
+            }
+            LayoutNode::Split { first, second, .. } => {
+                wsl_content(first, distributions);
+                wsl_content(second, distributions);
+            }
+        }
+    }
+    let mut distributions = BTreeSet::new();
+    let mut default_distribution = false;
+    if let Ok(workspace) = manager.snapshot() {
+        for surface in &workspace.surfaces {
+            match surface.wsl_distribution() {
+                Some(distribution) => {
+                    distributions.insert(distribution.to_owned());
+                }
+                None => default_distribution |= !surface.runs_powershell(),
+            }
+        }
+        for tab in workspace.sessions.iter().flat_map(|session| &session.tabs) {
+            wsl_content(&tab.layout, &mut distributions);
+        }
+    }
+    let _ = thread::Builder::new()
+        .name("compi-warm-launches".into())
+        .spawn(move || {
+            let powershell = thread::spawn(crate::shell_integration::warm_powershell);
+            if default_distribution
+                && let Ok(name) = compi_protocol::wsl::directory_distribution(None)
+            {
+                distributions.insert(name);
+            }
+            for distribution in distributions {
+                if let Err(error) = crate::shell_integration::warm_wsl(&distribution) {
+                    eprintln!("compi-daemon: could not prepare WSL {distribution}: {error}");
+                }
+            }
+            let _ = powershell.join();
+        });
+}
+
 pub fn run(instance: Option<&str>) -> Result<()> {
     let started_at = Instant::now();
     let names = identity::instance_names(instance)?;
@@ -453,6 +511,8 @@ pub fn run(instance: Option<&str>) -> Result<()> {
     compi_protocol::perf::log_startup_metric("daemon_singleton_ready_ms", started_at.elapsed());
     let manager = Arc::new(SurfaceManager::persistent(instance)?);
     crate::chat::hub().set_instance(instance);
+    #[cfg(windows)]
+    warm_launches(&manager);
     compi_protocol::perf::log_startup_metric("daemon_store_ready_ms", started_at.elapsed());
     launch::check_system()?;
     compi_protocol::perf::log_startup_metric("daemon_host_ready_ms", started_at.elapsed());

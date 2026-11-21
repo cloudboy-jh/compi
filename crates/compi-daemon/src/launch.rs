@@ -236,7 +236,9 @@ pub fn resolve_profile(
     }
     #[cfg(windows)]
     {
-        if profile.windows_shell == compi_protocol::WindowsShell::PowerShell {
+        if profile.windows_shell.for_directory(directory)
+            == compi_protocol::WindowsShell::PowerShell
+        {
             return resolve_powershell(profile, directory, context);
         }
         let resolved =

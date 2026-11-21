@@ -1,7 +1,7 @@
 //! New native agent chats, as the palette's New chat and `compi chat` start them, and
 //! how the palette's Threads and `compi threads` describe a thread.
 use compi_protocol::ContentEnvironment;
-use compi_protocol::chat::{ChatContent, ChatHarness, ThreadActivity, ThreadInfo};
+use compi_protocol::chat::{AgentEntry, ChatContent, ChatHarness, ThreadActivity, ThreadInfo};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,6 +24,21 @@ pub fn new_chat(
         environment,
         folder,
         session: None,
+    }
+}
+
+/// Every agent, as a sentence lists them, each as `show` writes it: `omp, claude or
+/// codex`.
+pub fn agent_list(show: impl Fn(&AgentEntry) -> String) -> String {
+    let mut agents: Vec<String> = ChatHarness::ALL
+        .into_iter()
+        .map(|agent| show(agent.entry()))
+        .collect();
+    let last = agents.pop().unwrap_or_default();
+    if agents.is_empty() {
+        last
+    } else {
+        format!("{} or {last}", agents.join(", "))
     }
 }
 
@@ -88,6 +103,18 @@ mod tests {
         assert_eq!(first.harness, ChatHarness::Omp);
         assert_eq!(second.harness, ChatHarness::Claude);
         assert_eq!(first.session, None);
+    }
+
+    #[test]
+    fn agent_lists_name_every_agent() {
+        assert_eq!(
+            agent_list(|agent| agent.program.to_owned()),
+            "omp, claude or codex"
+        );
+        assert_eq!(
+            agent_list(|agent| format!("\"{}\"", agent.program)),
+            "\"omp\", \"claude\" or \"codex\""
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Native agent chat: a content pane talking to an installed agent harness (OMP over the
-//! Agent Client Protocol, Claude Code over its headless JSON stream). The daemon runs the
-//! harness, like a shell, and keeps the transcript; windows watch it (`WatchChat`) and
-//! send prompts, cancels and answers. The harness owns its sessions, models, tools and
-//! credentials.
+//! Agent Client Protocol, Claude Code over its headless JSON stream, Codex over its app
+//! server's JSON-RPC). The daemon runs the harness, like a shell, and keeps the
+//! transcript; windows watch it (`WatchChat`) and send prompts, cancels and answers. The
+//! harness owns its sessions, models, tools and credentials.
 use crate::ContentEnvironment;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -32,33 +32,200 @@ pub const MAX_CHAT_AGENT_RESULT_BYTES: usize = 32 * 1024;
 /// The most tool calls of a sub-agent kept for display: its latest.
 pub const MAX_CHAT_AGENT_STEPS: usize = 200;
 
-/// An installed agent program Compi can chat with.
+/// An installed agent program Compi can chat with. Everything Compi knows of each one is
+/// its `AgentEntry`; every list of agents (Settings → Default agent, the palette's New
+/// chat with …, `compi chat --agent`, project settings, the model picker's marks, the
+/// daemon's lookup and launch) reads `ALL` and the entries. Adding an agent is a variant,
+/// its entry in `ENTRIES` and its driver in the daemon (docs/dev/ADDING_AN_AGENT.md).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatHarness {
+    /// OMP, driven over the Agent Client Protocol (`omp acp`).
     #[default]
     Omp,
     /// Claude Code, driven by its headless JSON stream mode.
     Claude,
+    /// OpenAI's Codex, driven through `codex app-server` (JSON-RPC over its standard
+    /// input and output).
+    Codex,
 }
 
+/// Everything Compi knows of one agent: what it is called, how it looks, how it names
+/// Compi's permission levels and where its real program is on each side of a Windows PC.
+#[derive(Debug)]
+pub struct AgentEntry {
+    pub harness: ChatHarness,
+    /// The agent's own name.
+    pub name: &'static str,
+    /// Its command name: `compi chat --agent`, `[chat.<program>]` in the configuration,
+    /// and the program Compi looks for.
+    pub program: &'static str,
+    /// More words the palette finds its New chat with … command by.
+    pub keywords: &'static str,
+    /// Its mark.
+    pub mark: AgentMark,
+    /// Model IDs naming no provider are the agent's own (Claude Code's `opus`, Codex's
+    /// `gpt-5.5`), listed under its name and drawn with its mark; else they are Other.
+    pub own_models: bool,
+    /// What the picker calls the agent's own permissions setting (`ChatApproval::Harness`).
+    pub own_setting: &'static str,
+    /// The approval mode Compi starts it with for `ChatApproval::AlwaysAsk`, `Write` and
+    /// `Yolo`, by its own name, as `ChatState::approval_mode` reports it.
+    pub approval_modes: [&'static str; 3],
+    /// Other modes it can report running with, each with the Compi level it is nearest
+    /// to (`Harness` for none) and its name.
+    pub other_modes: &'static [(&'static str, ChatApproval, &'static str)],
+    /// Folders under the Linux home searched for `program` after the search path, where
+    /// its installers put it.
+    pub linux_folders: &'static [&'static str],
+    /// Where its real Windows program is, in order. Never a script launcher (npm's
+    /// `.cmd` and shell shims), whose interpreter can be the wrong side's.
+    pub windows: &'static [WindowsProgram],
+    /// The variable naming the Bash its Windows program runs commands with (Claude
+    /// Code's `CLAUDE_CODE_GIT_BASH_PATH`; OMP's, through the extension Compi loads,
+    /// `COMPI_AGENT_SHELL`): in a WSL chat it names Compi's agent shell, which runs them
+    /// in WSL. `None` for an agent whose Windows program's commands Compi cannot reach
+    /// (Codex's always run in PowerShell).
+    pub windows_bash: Option<&'static str>,
+}
+
+/// How an agent's mark is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMark {
+    /// Its own mark, in its colours: `assets/brands/<file>.svg`.
+    Brand(&'static str),
+    /// A model mark, `assets/models/<file>.svg`, drawn in `colour` (`#RRGGBB`).
+    Model {
+        file: &'static str,
+        colour: &'static str,
+    },
+}
+
+/// One place an agent's Windows program can be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsProgram {
+    /// This file name, on the search path.
+    Path(&'static str),
+    /// This `/`-separated path under the user's home folder.
+    Home(&'static str),
+    /// This `/`-separated path under npm's global folder: the folder of the agent's npm
+    /// launcher (`<program>.cmd`) on the search path, else `%APPDATA%\npm`.
+    Npm(&'static str),
+}
+
+/// Every agent's entry, in `ChatHarness::ALL` order.
+static ENTRIES: [AgentEntry; 3] = [
+    AgentEntry {
+        harness: ChatHarness::Omp,
+        name: "OMP",
+        program: "omp",
+        keywords: "oh my pi acp",
+        mark: AgentMark::Brand("omp"),
+        own_models: false,
+        own_setting: "OMP's own setting",
+        approval_modes: ["always-ask", "write", "yolo"],
+        other_modes: &[(
+            "always-ask-cached",
+            ChatApproval::AlwaysAsk,
+            "Ask once per tool",
+        )],
+        linux_folders: &[".local/bin", ".bun/bin"],
+        windows: &[
+            WindowsProgram::Path("omp.exe"),
+            WindowsProgram::Home(".bun/bin/omp.exe"),
+        ],
+        windows_bash: Some("COMPI_AGENT_SHELL"),
+    },
+    AgentEntry {
+        harness: ChatHarness::Claude,
+        name: "Claude Code",
+        program: "claude",
+        keywords: "anthropic",
+        mark: AgentMark::Model {
+            file: "claude",
+            colour: "#D97757",
+        },
+        own_models: true,
+        own_setting: "Same as Claude Code",
+        approval_modes: ["default", "acceptEdits", "bypassPermissions"],
+        other_modes: &[("plan", ChatApproval::Harness, "Plan")],
+        linux_folders: &[".local/bin", ".claude/local"],
+        windows: &[
+            WindowsProgram::Path("claude.exe"),
+            WindowsProgram::Home(".local/bin/claude.exe"),
+            WindowsProgram::Npm("node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
+        ],
+        windows_bash: Some("CLAUDE_CODE_GIT_BASH_PATH"),
+    },
+    AgentEntry {
+        harness: ChatHarness::Codex,
+        name: "Codex",
+        program: "codex",
+        keywords: "openai gpt chatgpt",
+        mark: AgentMark::Model {
+            file: "openai",
+            colour: "#10A37F",
+        },
+        own_models: true,
+        own_setting: "Same as Codex",
+        approval_modes: [
+            "untrusted/read-only",
+            "on-request/workspace-write",
+            "never/danger-full-access",
+        ],
+        other_modes: &[
+            ("on-request/read-only", ChatApproval::AlwaysAsk, "Read only"),
+            (
+                "untrusted/workspace-write",
+                ChatApproval::AlwaysAsk,
+                "Ask before commands",
+            ),
+            (
+                "on-failure/workspace-write",
+                ChatApproval::Write,
+                "Edits allowed",
+            ),
+            (
+                "never/workspace-write",
+                ChatApproval::Write,
+                "Edits allowed, never ask",
+            ),
+            (
+                "on-request/danger-full-access",
+                ChatApproval::Yolo,
+                "Full access",
+            ),
+        ],
+        linux_folders: &[".local/bin", ".codex/packages/standalone/current/bin"],
+        windows: &[
+            WindowsProgram::Path("codex.exe"),
+            WindowsProgram::Home(".codex/packages/standalone/current/bin/codex.exe"),
+            WindowsProgram::Npm(
+                "node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+            ),
+        ],
+        windows_bash: None,
+    },
+];
+
 impl ChatHarness {
-    pub const ALL: [Self; 2] = [Self::Omp, Self::Claude];
+    pub const ALL: [Self; 3] = [Self::Omp, Self::Claude, Self::Codex];
+
+    /// Everything Compi knows of the agent.
+    pub fn entry(self) -> &'static AgentEntry {
+        let entry = &ENTRIES[self as usize];
+        debug_assert_eq!(entry.harness, self);
+        entry
+    }
 
     /// The harness's own name.
     pub fn name(self) -> &'static str {
-        match self {
-            Self::Omp => "OMP",
-            Self::Claude => "Claude Code",
-        }
+        self.entry().name
     }
 
     /// The program's command name.
     pub fn program(self) -> &'static str {
-        match self {
-            Self::Omp => "omp",
-            Self::Claude => "claude",
-        }
+        self.entry().program
     }
 
     /// The harness named `program` (`ChatHarness::program`).
@@ -67,12 +234,44 @@ impl ChatHarness {
             .into_iter()
             .find(|harness| harness.program() == program)
     }
+
+    /// The approval mode Compi starts the agent with for `approval`, by the agent's own
+    /// name; `None` keeps the agent's own setting.
+    pub fn approval_mode(self, approval: ChatApproval) -> Option<&'static str> {
+        let [always_ask, write, yolo] = self.entry().approval_modes;
+        match approval {
+            ChatApproval::Harness => None,
+            ChatApproval::AlwaysAsk => Some(always_ask),
+            ChatApproval::Write => Some(write),
+            ChatApproval::Yolo => Some(yolo),
+        }
+    }
+
+    /// The Compi level and name of approval mode `mode` the agent reports running with;
+    /// `None` for a mode its entry does not know.
+    pub fn approval_level(self, mode: &str) -> Option<(ChatApproval, Option<&'static str>)> {
+        let entry = self.entry();
+        let levels = [
+            ChatApproval::AlwaysAsk,
+            ChatApproval::Write,
+            ChatApproval::Yolo,
+        ];
+        if let Some(index) = entry.approval_modes.iter().position(|known| *known == mode) {
+            return Some((levels[index], None));
+        }
+        entry
+            .other_modes
+            .iter()
+            .find(|(known, ..)| *known == mode)
+            .map(|(_, level, name)| (*level, Some(*name)))
+    }
 }
 
 /// How the harness asks before running tools, as Compi starts it. `Harness` keeps the
 /// harness's own setting (OMP's `tools.approvalMode`, which `omp acp` does not read by
 /// itself, so the daemon looks it up and passes it on; Claude Code's `permissions`
-/// settings, which it reads itself).
+/// settings and Codex's `approval_policy` and `sandbox_mode`, which they read
+/// themselves). Each agent names the levels its own way (`AgentEntry::approval_modes`).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatApproval {
@@ -84,28 +283,6 @@ pub enum ChatApproval {
     Write,
     /// Run everything without asking.
     Yolo,
-}
-
-impl ChatApproval {
-    /// OMP's `--approval-mode` value; `None` keeps the harness's own setting.
-    pub fn omp_mode(self) -> Option<&'static str> {
-        match self {
-            Self::Harness => None,
-            Self::AlwaysAsk => Some("always-ask"),
-            Self::Write => Some("write"),
-            Self::Yolo => Some("yolo"),
-        }
-    }
-
-    /// Claude Code's `--permission-mode` value; `None` keeps the harness's own setting.
-    pub fn claude_mode(self) -> Option<&'static str> {
-        match self {
-            Self::Harness => None,
-            Self::AlwaysAsk => Some("default"),
-            Self::Write => Some("acceptEdits"),
-            Self::Yolo => Some("bypassPermissions"),
-        }
-    }
 }
 
 /// The settings a new session of the harness starts on, by `ChatOption::category`: the
@@ -212,9 +389,12 @@ pub struct ChatState {
     pub thread: bool,
     /// How the running harness asks before it runs tools, whether Compi chose it or the
     /// harness's own setting did: OMP's `--approval-mode` (`always-ask`,
-    /// `always-ask-cached`, `write`, `yolo`), or Claude Code's permission mode (`default`,
+    /// `always-ask-cached`, `write`, `yolo`), Claude Code's permission mode (`default`,
     /// `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk`, `auto`), which follows the
-    /// session's `mode` setting as it changes; `None` while unknown.
+    /// session's `mode` setting as it changes, or Codex's approval policy and sandbox
+    /// mode as `policy/sandbox` (`untrusted/read-only`, `on-request/workspace-write`,
+    /// `never/danger-full-access`, …; a granular policy is `granular`); `None` while
+    /// unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
 }
@@ -354,8 +534,8 @@ pub struct ChatTool {
     pub started_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_ms: Option<u64>,
-    /// The sub-agents it started (OMP's `task`, Claude Code's `Agent`), in its order. The
-    /// call runs while one of them does.
+    /// The sub-agents it started (OMP's `task`, Claude Code's `Agent`, Codex's
+    /// `spawn_agent`), in its order. The call runs while one of them does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<ChatAgent>,
     /// It only waits for sub-agents (OMP's `wait` on `task` jobs): their call and the

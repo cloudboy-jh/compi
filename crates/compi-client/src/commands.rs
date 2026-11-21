@@ -1,6 +1,8 @@
 //! One source of command metadata, enablement, and terminal-safe shortcut routing.
 use compi_protocol::SurfaceStatus;
+use compi_protocol::chat::ChatHarness;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {
@@ -71,12 +73,79 @@ pub struct CommandSpec {
 macro_rules! registry {
     ($( $command:ident, $id:literal, $label:literal, $mac:expr, $windows:expr; )*) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-        pub enum Command { $( $command, )* }
-        pub static REGISTRY: &[CommandSpec] = &[
-            $(CommandSpec { command: Command::$command, id: $id, label: $label, mac_shortcut: $mac, windows_shortcut: $windows },)*
-        ];
+        pub enum Command {
+            $( $command, )*
+            /// New chat with this agent; its commands come from `ChatHarness::ALL`, after
+            /// New chat.
+            OpenChatWith(ChatHarness),
+        }
+        /// Every command, in the stable order shortcut collisions resolve in.
+        pub static REGISTRY: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
+            let mut specs = vec![
+                $(CommandSpec { command: Command::$command, id: $id, label: $label, mac_shortcut: $mac, windows_shortcut: $windows },)*
+            ];
+            let after_open_chat = specs
+                .iter()
+                .position(|spec| spec.command == Command::OpenChat)
+                .expect("New chat is a command")
+                + 1;
+            specs.splice(
+                after_open_chat..after_open_chat,
+                ChatHarness::ALL.map(open_chat_with_spec),
+            );
+            specs
+        });
     };
 }
+
+/// New chat with `agent`: `open_chat_<program>`, so keybindings name the agent's command.
+fn open_chat_with_spec(agent: ChatHarness) -> CommandSpec {
+    CommandSpec {
+        command: Command::OpenChatWith(agent),
+        id: String::leak(format!("open_chat_{}", agent.program())),
+        label: String::leak(format!("New chat with {}", agent.name())),
+        mac_shortcut: None,
+        windows_shortcut: None,
+    }
+}
+
+/// Search words naming every agent, for the commands about chats: each one's program,
+/// name and `AgentEntry::keywords`.
+struct ChatWords {
+    open_chat: &'static str,
+    threads: &'static str,
+    send_selection: &'static str,
+    /// New chat with …'s, in `ChatHarness::ALL` order.
+    open_chat_with: Vec<&'static str>,
+}
+
+static CHAT_WORDS: LazyLock<ChatWords> = LazyLock::new(|| {
+    let agent_words = |agent: ChatHarness| {
+        let entry = agent.entry();
+        format!(
+            "{} {} {}",
+            entry.program,
+            entry.name.to_lowercase(),
+            entry.keywords
+        )
+    };
+    let every_agent = ChatHarness::ALL.map(agent_words).join(" ");
+    let words = |base: &str| -> &'static str { String::leak(format!("{base} {every_agent}")) };
+    ChatWords {
+        open_chat: words("new agent ai assistant chat prompt llm"),
+        threads: words("chat history sessions conversations agent ai reopen resume delete"),
+        send_selection: words("agent ai chat quote output prompt"),
+        open_chat_with: ChatHarness::ALL
+            .into_iter()
+            .map(|agent| -> &'static str {
+                String::leak(format!(
+                    "new agent ai assistant chat with thread {}",
+                    agent_words(agent)
+                ))
+            })
+            .collect(),
+    }
+});
 
 registry! {
     OpenPalette, "open_palette", "Open command palette", Some("cmd-shift-p"), Some("ctrl-shift-p");
@@ -184,8 +253,6 @@ registry! {
     OpenMonitor, "open_monitor", "Monitor", None, None;
     OpenBrowser, "open_browser", "Open browser", None, None;
     OpenChat, "open_chat", "New chat", None, None;
-    OpenChatOmp, "open_chat_omp", "New chat with OMP", None, None;
-    OpenChatClaude, "open_chat_claude", "New chat with Claude Code", None, None;
     Threads, "threads", "Threads", None, None;
     BrowserBack, "browser_back", "Back", None, None;
     BrowserForward, "browser_forward", "Forward", None, None;
@@ -226,7 +293,7 @@ impl CommandSpec {
         self.command.category()
     }
 
-    pub const fn aliases(&self) -> &'static str {
+    pub fn aliases(&self) -> &'static str {
         self.command.aliases()
     }
     pub fn disabled_reason(&self, context: &CommandContext) -> Option<&'static str> {
@@ -370,8 +437,8 @@ impl Command {
             | FocusDown | ResizeSplitDecrease | ResizeSplitIncrease | ResetSplitRatio
             | ArrangePanes | MirrorArrangement | FlipArrangement | RestoreArrangement
             | SplitMergedTabs | SaveArrangement | SwapPaneLeft | SwapPaneRight | SwapPaneUp
-            | SwapPaneDown | RemovePane | OpenBrowser | OpenChat | OpenChatOmp | OpenChatClaude
-            | Threads | BrowserBack | BrowserForward | BrowserReload | FocusAddressBar => {
+            | SwapPaneDown | RemovePane | OpenBrowser | OpenChat | OpenChatWith(_) | Threads
+            | BrowserBack | BrowserForward | BrowserReload | FocusAddressBar => {
                 CommandCategory::Panes
             }
             ShowFiles | ShowChanges | DiffThisFile | ToggleMarkdownRead | NextChange
@@ -545,7 +612,7 @@ impl Command {
         }
     }
 
-    pub const fn aliases(self) -> &'static str {
+    pub fn aliases(self) -> &'static str {
         use Command::*;
         match self {
             OpenPalette => "commands actions",
@@ -604,13 +671,10 @@ impl Command {
                 "task manager processes activity monitor resources top htop cpu memory threads pid kill end usage"
             }
             OpenBrowser => "web page url localhost preview site dev server http",
-            OpenChat => "new agent ai assistant omp claude code chat prompt llm acp",
-            OpenChatOmp => "new agent ai assistant omp oh my pi chat with thread",
-            OpenChatClaude => "new agent ai assistant claude code anthropic chat with thread",
-            Threads => {
-                "chat history sessions conversations agent omp claude ai reopen resume delete"
-            }
-            SendSelectionToChat => "agent ai omp claude chat quote output prompt",
+            OpenChat => CHAT_WORDS.open_chat,
+            OpenChatWith(agent) => CHAT_WORDS.open_chat_with[agent as usize],
+            Threads => CHAT_WORDS.threads,
+            SendSelectionToChat => CHAT_WORDS.send_selection,
             BrowserBack | BrowserForward => "browser web page history navigate",
             BrowserReload => "browser web page refresh stop",
             FocusAddressBar => "browser web page url location navigate go",
@@ -714,8 +778,7 @@ impl Command {
                 | EndSurface
                 | RestartSurface
                 | OpenChat
-                | OpenChatOmp
-                | OpenChatClaude
+                | OpenChatWith(_)
         );
         if !c.connected
             && (mutation
@@ -985,7 +1048,7 @@ impl Command {
             GitPull => c.git_reason.or(c.pull_reason),
             GitPush => c.git_reason.or(c.push_reason),
             RecoverUnsavedEdits => (!c.has_pane).then_some("Select a pane first"),
-            OpenChat | OpenChatOmp | OpenChatClaude => {
+            OpenChat | OpenChatWith(_) => {
                 if !c.has_pane {
                     Some("Select a pane first")
                 } else {
@@ -1113,7 +1176,7 @@ fn resolve_terminal_key(
     context: &CommandContext,
     overrides: &HashMap<String, String>,
 ) -> KeyRoute {
-    for spec in REGISTRY {
+    for spec in REGISTRY.iter() {
         if let Some(binding) = overrides.get(spec.id)
             && shortcut_matches(binding, key)
         {
@@ -1212,7 +1275,7 @@ fn resolve_terminal_key(
         }
     }
 
-    for spec in REGISTRY {
+    for spec in REGISTRY.iter() {
         if overrides.contains_key(spec.id) {
             continue;
         }
@@ -2070,6 +2133,34 @@ mod tests {
         assert!(search("agent").any(|spec| spec.command == Command::OpenChat));
         assert!(search("claude").any(|spec| spec.command == Command::OpenChat));
         assert!(search("omp").any(|spec| spec.command == Command::OpenChat));
+        assert!(search("codex").any(|spec| spec.command == Command::OpenChat));
+        // Every agent has its own New chat with …, by a stable ID, right after New chat.
+        let open_chat = REGISTRY
+            .iter()
+            .position(|spec| spec.command == Command::OpenChat)
+            .unwrap();
+        for (offset, agent) in ChatHarness::ALL.into_iter().enumerate() {
+            let spec = &REGISTRY[open_chat + 1 + offset];
+            assert_eq!(spec.command, Command::OpenChatWith(agent));
+            assert_eq!(by_id(spec.id).unwrap().command, spec.command);
+            assert_eq!(spec.category(), CommandCategory::Panes);
+            assert!(search(agent.program()).any(|found| found.command == spec.command));
+        }
+        assert_eq!(
+            Command::OpenChatWith(ChatHarness::Omp).spec().id,
+            "open_chat_omp"
+        );
+        assert_eq!(
+            Command::OpenChatWith(ChatHarness::Claude).spec().label,
+            "New chat with Claude Code"
+        );
+        assert_eq!(
+            Command::OpenChatWith(ChatHarness::Codex).spec().id,
+            "open_chat_codex"
+        );
+        assert!(
+            search("openai").any(|spec| spec.command == Command::OpenChatWith(ChatHarness::Codex))
+        );
         context.chat_reason = Some("no folder");
         assert_eq!(
             Command::OpenChat.disabled_reason(&context),
@@ -2083,6 +2174,10 @@ mod tests {
         context.connected = false;
         assert_eq!(
             Command::OpenChat.disabled_reason(&context),
+            Some("Reconnect to the server first")
+        );
+        assert_eq!(
+            Command::OpenChatWith(ChatHarness::Codex).disabled_reason(&context),
             Some("Reconnect to the server first")
         );
     }
