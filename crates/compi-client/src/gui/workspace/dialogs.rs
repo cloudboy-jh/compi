@@ -897,7 +897,7 @@ impl CompiApp {
                                     .flex()
                                     .flex_col()
                                     .gap_1()
-                                    .child(settings_group_label("Configuration"))
+                                    .child(settings_group_label("Configuration", &colors))
                                     .child(
                                         div()
                                             .text_size(px(UI_SMALL_TEXT_SIZE))
@@ -944,7 +944,10 @@ impl CompiApp {
                                     .flex()
                                     .flex_col()
                                     .gap_1()
-                                    .child(settings_group_label(format!("Pane {}", view.pane_id)))
+                                    .child(settings_group_label(
+                                        format!("Pane {}", view.pane_id),
+                                        &colors,
+                                    ))
                                     .when(!details.is_empty(), |pane| {
                                         pane.child(
                                             div()

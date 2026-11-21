@@ -1147,13 +1147,16 @@ impl CompiApp {
                 )
             })
             .child(
-                settings_group_label(if catalog.remove_mode {
-                    "Remove local themes"
-                } else if terminal {
-                    "Terminal colors"
-                } else {
-                    "Theme"
-                })
+                settings_group_label(
+                    if catalog.remove_mode {
+                        "Remove local themes"
+                    } else if terminal {
+                        "Terminal colors"
+                    } else {
+                        "Theme"
+                    },
+                    &colors,
+                )
                 .flex_none(),
             )
             .child(
@@ -1225,13 +1228,13 @@ impl CompiApp {
                 .gap_4()
                 .text_size(px(UI_SMALL_TEXT_SIZE))
                 .line_height(px(UI_SMALL_LINE_HEIGHT))
-                .child(settings_group_label("Selected theme attribution"))
+                .child(settings_group_label("Selected theme attribution", &colors))
                 .child(attribution.attribution().to_owned())
-                .child(settings_group_label("Bundled theme licenses"))
+                .child(settings_group_label("Bundled theme licenses", &colors))
                 .child(crate::theme::THEME_ATTRIBUTION)
-                .child(settings_group_label("Bundled font licenses"))
+                .child(settings_group_label("Bundled font licenses", &colors))
                 .child(crate::font_catalog::FONT_ATTRIBUTION)
-                .child(settings_group_label("Bundled icon licenses"))
+                .child(settings_group_label("Bundled icon licenses", &colors))
                 .child(crate::gui::language_icons::ATTRIBUTION)
                 .child(crate::gui::model_icons::ATTRIBUTION)
                 .child(crate::gui::lucide_icons::ATTRIBUTION)

@@ -9,13 +9,15 @@
 //! and model new threads start with). One card is open at a time; a sidebar project
 //! header's Project settings… opens its project's.
 use super::settings::{
-    RowCx, SettingsAction, Stop, settings_card, settings_group_label, share_config_change,
+    RowCx, SettingsAction, Stop, Tile, choice_index, settings_card, settings_group_label,
+    share_config_change,
 };
 use super::*;
 use crate::config::{ProjectIcon, ProjectSettings, project_key};
 use crate::gui::controls::IconName;
 use compi_protocol::chat::{ChatHarness, ChatPicks};
 use compi_protocol::{ContentEnvironment, Project, SettingsSection};
+use std::rc::Rc;
 
 /// The Projects page, one row drawn as the page.
 pub(super) const PROJECTS_ROW: &str = "projects";
@@ -367,13 +369,7 @@ impl CompiApp {
             .iter()
             .position(|agent| *agent == current)
             .unwrap_or(0);
-        let last = AGENT_CHOICES.len() - 1;
-        let next = match (forward, wrap) {
-            (true, true) => (at + 1) % AGENT_CHOICES.len(),
-            (true, false) => (at + 1).min(last),
-            (false, true) => (at + last) % AGENT_CHOICES.len(),
-            (false, false) => at.saturating_sub(1),
-        };
+        let next = choice_index(at, AGENT_CHOICES.len(), forward, wrap);
         self.set_project_agent(&project, AGENT_CHOICES[next], cx);
     }
 
@@ -474,7 +470,7 @@ impl CompiApp {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(settings_group_label(label))
+                    .child(settings_group_label(label, &colors))
                     .children(range.map(|index| {
                         self.render_project_card(row, index, &listed[index].project, cx)
                     }))
@@ -484,7 +480,7 @@ impl CompiApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .gap_5()
+            .gap_6()
             .children(group("Open", 0..split))
             .children(group("Recent", split..listed.len()))
             .into_any_element()
@@ -510,69 +506,54 @@ impl CompiApp {
         };
         let head_action = action(ProjectPart::Open);
         let focused = self.settings_focused(row, head_action);
+        // The head is an item card's: the icon, the name and pin, the folder, and the
+        // chevron that opens the card.
+        let title = [div()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .child(self.project_name(project))
+            .into_any_element()]
+        .into_iter()
+        .chain(
+            settings
+                .pinned
+                .then(|| controls::glyph(IconName::Pin, muted).into_any_element()),
+        );
+        let place = div()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .line_height(px(UI_SMALL_LINE_HEIGHT))
+            .text_color(muted)
+            .child(project_place(project))
+            .into_any_element();
+        let chevron = controls::glyph(
+            if open {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            },
+            muted,
+        )
+        .into_any_element();
         let head = div()
             .id(("project-card", index))
             .relative()
             .w_full()
-            .px_4()
-            .py_3()
-            .flex()
-            .items_center()
-            .gap_3()
             .rounded_md()
             .cursor_pointer()
             .hover(move |style| style.bg(color(blend_rgb(colors.surface, colors.foreground, 0.04))))
             .on_click(self.settings_click(row, head_action, cx))
-            .child(
-                div()
-                    .flex_none()
-                    .child(self.project_icon(Some(project), CARD_ICON_SIZE)),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(self.project_name(project)),
-                            )
-                            .when(settings.pinned, |name| {
-                                name.child(controls::glyph(IconName::Pin, muted))
-                            }),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(UI_SMALL_TEXT_SIZE))
-                            .line_height(px(UI_SMALL_LINE_HEIGHT))
-                            .text_color(muted)
-                            .child(project_place(project)),
-                    ),
-            )
-            .child(controls::glyph(
-                if open {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                },
-                muted,
+            .child(self.item_card_head(
+                self.project_icon(Some(project), CARD_ICON_SIZE),
+                title,
+                [place],
+                Some(chevron),
+                false,
             ))
             .when(focused, |head| {
                 head.child(
@@ -683,40 +664,34 @@ impl CompiApp {
         .child(self.settings_focus_anchor(pin_focused, cx))
         .into_any_element();
 
-        // New threads: the agent, then its model.
-        let agent_action = action(ProjectPart::Agent);
-        let agent_focused = self.settings_focused(row, agent_action);
+        // New threads: the agent, as tiles of each agent's mark after Default (General's
+        // gear beside the agent it picks now), then its model.
         let default_agent = self.config.chat_agent;
-        let agents = AGENT_CHOICES
-            .into_iter()
-            .enumerate()
-            .map(|(choice, agent)| {
-                let (row, project) = (row.clone(), project.clone());
-                controls::text_button(
-                    ("project-agent", index * AGENT_CHOICES.len() + choice),
-                    agent_label(agent),
-                )
-                .selected(settings.agent == agent)
-                .detail(match agent {
-                    None => format!(
-                        "Settings → General's Default agent, now {}",
-                        default_agent.name()
-                    ),
-                    Some(agent) => format!("New threads here start with {}", agent.name()),
-                })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.focus_settings_control(&row, agent_action);
-                    this.set_project_agent(&project, agent, cx);
-                    cx.notify();
-                }))
-            });
-        let agent = controls::highlight(
-            agent_focused,
-            controls::segmented(("project-agents", index), agents),
+        let tiles = AGENT_CHOICES.map(|agent| Tile {
+            label: match agent {
+                None => format!("{} ({})", agent_label(None), default_agent.name()).into(),
+                Some(agent) => agent_label(Some(agent)).into(),
+            },
+            preview: match agent {
+                None => self
+                    .sketch_agent(default_agent)
+                    .gap_1p5()
+                    .child(controls::glyph(IconName::Settings, muted)),
+                Some(agent) => self.sketch_agent(agent),
+            },
+            picked: settings.agent == agent,
+            unavailable: None,
+        });
+        let picked = project.clone();
+        let agent = self.render_tiles(
+            row,
+            (index, action(ProjectPart::Agent)),
+            tiles,
+            Rc::new(move |this, choice, _, cx| {
+                this.set_project_agent(&picked, AGENT_CHOICES[choice], cx);
+            }),
             cx,
-        )
-        .child(self.settings_focus_anchor(agent_focused, cx))
-        .into_any_element();
+        );
         let agent_now = settings.agent.unwrap_or(default_agent);
         let agent_detail = match settings.agent {
             Some(agent) => format!("New threads in this project start with {}.", agent.name()),
@@ -760,7 +735,7 @@ impl CompiApp {
             "New threads' agent",
             agent_detail,
             agent,
-            row.compact,
+            true,
         )))
         .child(line(self.settings_row(
             "New threads' model",

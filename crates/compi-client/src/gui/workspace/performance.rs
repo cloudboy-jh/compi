@@ -271,7 +271,7 @@ impl CompiApp {
                 true,
             ))
             .child(self.render_sparkline(&self.performance.fps_history))
-            .child(settings_group_label("Resources"))
+            .child(settings_group_label("Resources", self.colors()))
             .child(metric(
                 "Compi window",
                 process_summary(latest.and_then(|latest| latest.client_cpu), client),
@@ -298,7 +298,7 @@ impl CompiApp {
                 ),
                 true,
             ))
-            .child(settings_group_label("Renderer"))
+            .child(settings_group_label("Renderer", self.colors()))
             .child(metric(
                 "Cached text rows",
                 format!("{} / {}", cache.shaped_rows, cache.shaped_capacity),

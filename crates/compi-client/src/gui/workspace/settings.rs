@@ -26,19 +26,27 @@ use compi_protocol::{PaneContent, SettingsContent, SettingsSection, WindowsShell
 use gpui::Entity;
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
+use std::rc::Rc;
 
-/// Widest a section page grows; a wider pane centres it.
-const PAGE_MAX_WIDTH: f32 = 1280.0;
+/// Widest a section page grows, so controls stay near their text; a wider pane centres
+/// it.
+const PAGE_MAX_WIDTH: f32 = 720.0;
 /// The Appearance row of the theme grid.
 pub(super) const THEME_ROW: &str = "theme";
-/// Narrower than this, a row's control goes below its title.
-const STACKED_ROW_WIDTH: f32 = 440.0;
+/// Narrower than this, a pane stacks its rows: a row's control goes below its title.
+const STACKED_PANE_WIDTH: f32 = 520.0;
 /// Narrower than this, the header drops its title so the section icons fit.
-const HEADER_TITLE_MIN_WIDTH: f32 = 380.0;
-/// The width of a drawn choice (pane density, focus indicator).
-const OPTION_CARD_WIDTH: f32 = 120.0;
-/// The size of an agent's mark on its Settings → Agents card.
+const HEADER_TITLE_MIN_WIDTH: f32 = 500.0;
+/// The height of the header line, and of each line of section icons when they wrap.
+const HEADER_HEIGHT: f32 = 44.0;
+/// The width of a picture tile (pane density, new tabs, an agent).
+const TILE_WIDTH: f32 = 120.0;
+/// The height of a picture tile's drawing.
+const TILE_PREVIEW_HEIGHT: f32 = 58.0;
+/// The size of an agent's mark on its card and its tile.
 const AGENT_MARK_SIZE: f32 = 24.0;
+/// The side of the square an item card's mark sits in.
+pub(super) const ITEM_MARK_TILE: f32 = 40.0;
 /// The width of Quick Appearance's content.
 const QUICK_APPEARANCE_WIDTH: f32 = 380.0;
 /// The row holding the shell prompt group; see `prompt`.
@@ -117,18 +125,25 @@ pub(super) enum SettingsAction {
     FileTextSize(Command),
     /// Zoom in, out or reset of the chat text size.
     ChatTextSize(Command),
-    /// Enter while the agent works: Left and Right pick Steer or Queue, Enter flips it.
+    // Choices: one stop each, drawn as a switch or as picture tiles. Left and Right
+    // pick the one before or after (stopping at the ends), Enter the next (going round);
+    // see `CompiApp::step_choice`.
+    /// Enter while the agent works: Steer or Queue.
     ChatEnter,
-    /// Opening a chat: Left and Right pick in place or beside, Enter flips it.
+    /// Opening a chat: in place or beside.
     ChatOpen,
-    /// Default agent: Left and Right step through the installed agents, Enter moves to
-    /// the next.
+    /// Default agent, passing agents not installed where new chats open.
     ChatAgent,
-    /// New tabs: Left and Right pick Chat first or Terminal first, Enter flips it.
+    /// New tabs: Chat first or Terminal first.
     NewTab,
-    /// When a dev server starts: Left and Right step through the choices, Enter moves
-    /// to the next.
+    /// Shell (Windows): Automatic, PowerShell or WSL.
+    Shell,
+    /// When a dev server starts.
     DevServer,
+    /// Pane density: Comfy or Compact.
+    Density,
+    /// Focus indicator.
+    FocusIndicator,
     ToggleChatAgentsBar,
     /// Copies how to install an agent installed nowhere.
     CopyInstallCommand(ChatHarness),
@@ -153,9 +168,7 @@ pub(super) enum SettingsAction {
     Update(UpdateControl),
     Prompt(super::prompt::PromptAction),
     Metadata(usize),
-    Density(crate::theme::WorkspaceDensity),
     ToggleConfirmClose,
-    FocusIndicator(crate::theme::FocusIndicator),
     ProgramStatus(usize),
     NotificationAttention,
     OtherShellCommands,
@@ -241,6 +254,9 @@ struct SettingsPane {
 #[derive(Default)]
 pub(in crate::gui) struct SettingsUi {
     focus: Option<SettingsFocus>,
+    /// The section icons draw the highlight: the keyboard took it there. Opened or
+    /// clicked, only the current section's icon is lit.
+    section_ring: bool,
     panes: HashMap<PaneId, SettingsPane>,
     quick: SettingsScroll,
     /// The stop the next Settings pane drawn starts on: set when a command opens one.
@@ -289,6 +305,19 @@ pub(super) struct RowCx {
     /// Drawn on the page's heading line rather than as a row.
     pub(super) header: bool,
 }
+
+/// One picture tile of a choice; see `CompiApp::render_tiles`.
+pub(super) struct Tile {
+    pub(super) label: SharedString,
+    /// The drawing, which the tile sizes and frames.
+    pub(super) preview: Div,
+    pub(super) picked: bool,
+    /// Why it can't be picked, under its label; the tile shows dimmed.
+    pub(super) unavailable: Option<&'static str>,
+}
+
+/// What picking the tile of a given index does.
+pub(super) type PickTile = Rc<dyn Fn(&mut CompiApp, usize, &mut Window, &mut Context<CompiApp>)>;
 
 /// How a row draws.
 #[derive(Clone, Copy)]
@@ -468,44 +497,35 @@ const fn status_row(
 
 /// Every setting, in section order and, within a section, in display order.
 static ROWS: &[Row] = &[
-    // General: how you work.
-    grouped(
-        "Start",
-        row(
-            "new-tab",
-            SettingsSection::General,
-            "New tabs",
-            "What the tab strip's + and Ctrl+T open: a new thread or a shell.",
-            "chat first terminal first new tab plus ctrl+t thread shell default",
-            |_| vec![SettingsAction::NewTab],
-            |app, row, cx| app.render_new_tab_row(row, cx),
-        ),
+    // General: how you work. Its three rows are the page, with no group label.
+    row(
+        "new-tab",
+        SettingsSection::General,
+        "New tabs",
+        "What the tab strip's + and Ctrl+T open: a new thread or a shell.",
+        "chat first terminal first new tab plus ctrl+t thread shell default",
+        |_| vec![SettingsAction::NewTab],
+        |app, row, cx| app.render_new_tab_row(row, cx),
     ),
-    grouped(
-        "Start",
-        row(
-            "chat-agent",
-            SettingsSection::General,
-            "Default agent",
-            "Every new thread starts with it, unless its project picks another.",
-            "default agent harness new thread chat",
-            |_| vec![SettingsAction::ChatAgent],
-            |app, row, cx| app.render_chat_agent_row(row, cx),
-        ),
+    row(
+        "chat-agent",
+        SettingsSection::General,
+        "Default agent",
+        "Every new thread starts with it, unless its project picks another.",
+        "default agent harness new thread chat",
+        |_| vec![SettingsAction::ChatAgent],
+        |app, row, cx| app.render_chat_agent_row(row, cx),
     ),
     shown_when(
         |_| cfg!(windows),
-        grouped(
-            "Start",
-            row(
-                "shell",
-                SettingsSection::General,
-                "Shell",
-                "What new tabs and splits start: picked for their folder, Windows PowerShell or WSL. Compi runs commands meant for the other shell there either way.",
-                "powershell wsl linux bash windows default distribution automatic",
-                |_| vec![SettingsAction::Select(Popup::Shell)],
-                |app, row, cx| app.render_shell_row(row, cx),
-            ),
+        row(
+            "shell",
+            SettingsSection::General,
+            "Shell",
+            "What new tabs and splits start: picked for their folder, Windows PowerShell or WSL. Compi runs commands meant for the other shell there either way.",
+            "powershell wsl linux bash windows default distribution automatic",
+            |_| vec![SettingsAction::Shell],
+            |app, row, cx| app.render_shell_row(row, cx),
         ),
     ),
     // Agents: every agent and where it is installed, then how they ask, then each one's
@@ -720,11 +740,7 @@ static ROWS: &[Row] = &[
             "Pane density",
             "Rounded panes with gaps between them, or edge to edge.",
             "comfy compact gaps spacing islands",
-            |_| {
-                crate::theme::WorkspaceDensity::ALL
-                    .map(SettingsAction::Density)
-                    .to_vec()
-            },
+            |_| vec![SettingsAction::Density],
             |app, row, cx| app.render_density_row(row, cx),
         ),
     ),
@@ -738,16 +754,23 @@ static ROWS: &[Row] = &[
             "reset",
             |_| vec![SettingsAction::ResetSidebar],
             |app, row, cx| {
-                app.render_button_row(
-                    row,
-                    format!(
-                        "{:.0}px. Drag the sidebar's edge to resize it.",
-                        app.sidebar_width
-                    ),
-                    "Reset width",
-                    SettingsAction::ResetSidebar,
-                    false,
-                    cx,
+                app.settings_row(
+                    row.title,
+                    row_description(row.row).into(),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(app.settings_value(format!("{:.0} px", app.sidebar_width)))
+                        .child(app.settings_button(
+                            row,
+                            0,
+                            "Reset width",
+                            SettingsAction::ResetSidebar,
+                            cx,
+                        ))
+                        .into_any_element(),
+                    row.compact,
                 )
             },
         ),
@@ -829,11 +852,7 @@ static ROWS: &[Row] = &[
             "Focus indicator",
             "How the focused pane is marked: marker, outline, dim or none.",
             "marker outline dim focused pane",
-            |_| {
-                crate::theme::FocusIndicator::ALL
-                    .map(SettingsAction::FocusIndicator)
-                    .to_vec()
-            },
+            |_| vec![SettingsAction::FocusIndicator],
             |app, row, cx| app.render_focus_indicator_row(row, cx),
         ),
     ),
@@ -1224,10 +1243,10 @@ static ROWS: &[Row] = &[
         |_| Vec::new(),
         |app, _, width, cx| app.render_settings_monitor(width, cx),
     ),
-    // Updates: the version, the notes, the switches, then Advanced.
+    // Updates: Compi's own card, the notes, the switches, then Advanced.
     grouped(
         "Version",
-        row(
+        page_row(
             "update-status",
             SettingsSection::Updates,
             "Compi version",
@@ -1240,7 +1259,7 @@ static ROWS: &[Row] = &[
                     .into_iter()
                     .collect()
             },
-            |app, row, cx| app.render_update_status(row, cx),
+            |app, row, _, cx| app.render_update_status(row, cx),
         ),
     ),
     shown_when(
@@ -1678,6 +1697,24 @@ fn focus_order(
     order
 }
 
+/// The choice after (`forward`) or before `index` of `count`: at the ends it stays, or
+/// with `wrap` goes round.
+pub(super) fn choice_index(index: usize, count: usize, forward: bool, wrap: bool) -> usize {
+    match (forward, wrap) {
+        (true, true) => (index + 1) % count,
+        (true, false) => (index + 1).min(count - 1),
+        (false, true) => (index + count - 1) % count,
+        (false, false) => index.saturating_sub(1),
+    }
+}
+
+/// Shell's choices, in the order its tiles show them.
+const WINDOWS_SHELLS: [WindowsShell; 3] = [
+    WindowsShell::Automatic,
+    WindowsShell::PowerShell,
+    WindowsShell::Wsl,
+];
+
 /// The stop after (or before) `current` in `order`, wrapping; the first (or last)
 /// when `current` is not in it.
 fn step(order: &[Stop], current: Option<Stop>, forward: bool) -> Option<Stop> {
@@ -1946,11 +1983,13 @@ impl CompiApp {
     }
 
     /// Moves the keyboard highlight to `stop` where `host` draws, scrolling it into view.
+    /// On a section icon it shows only once a key moves it (see `settings_pane_key_down`).
     fn set_settings_focus(&mut self, host: SettingsHost, stop: Stop) {
         if let Some(scroll) = self.settings_scroll_mut(&host, in_theme_grid(stop)) {
             scroll.to_focus = true;
         }
         self.settings.focus = Some(SettingsFocus { host, stop });
+        self.settings.section_ring = false;
     }
 
     /// Whether `action` of `row` has the keyboard highlight.
@@ -2261,6 +2300,15 @@ impl CompiApp {
                     false,
                 );
             }
+        }
+        // A highlight on the section icons stays on the section shown, however it
+        // changed (`compi settings`, a restored pane).
+        if let Some(focus) = &mut self.settings.focus
+            && let (SettingsHost::Pane(pane), Stop::Section(section)) =
+                (&focus.host, &mut focus.stop)
+            && let Some(ui) = self.settings.panes.get(pane)
+        {
+            *section = ui.section;
         }
         if self
             .settings
@@ -2657,6 +2705,12 @@ impl CompiApp {
             self.handle_app_key(event, window, cx)
         };
         if handled {
+            // A key that leaves the highlight on the section icons shows it there.
+            self.settings.section_ring = self
+                .settings
+                .focus
+                .as_ref()
+                .is_some_and(|focus| matches!(focus.stop, Stop::Section(_)));
             self.apply_settings_focus(pane_id, window, cx);
         }
         // Nothing typed in Settings reaches a shell.
@@ -2705,6 +2759,12 @@ impl CompiApp {
             SettingsHost::Pane(pane) => Some(pane.clone()),
             SettingsHost::Quick => None,
         };
+        // A choice's Left and Right pick the one before or after.
+        if let ("left" | "right", Some(Stop::Control { action, .. })) = (key.key.as_str(), current)
+            && self.step_choice(action, key.key == "right", false, window, cx)
+        {
+            return true;
+        }
         let next = match (key.key.as_str(), current) {
             (
                 "up" | "down" | "home" | "end",
@@ -2766,36 +2826,6 @@ impl CompiApp {
             (
                 "left" | "right",
                 Some(Stop::Control {
-                    action: SettingsAction::ChatEnter,
-                    ..
-                }),
-            ) => {
-                self.set_chat_enter(ChatEnter::ALL[usize::from(key.key == "right")], cx);
-                current
-            }
-            (
-                "left" | "right",
-                Some(Stop::Control {
-                    action: SettingsAction::ChatOpen,
-                    ..
-                }),
-            ) => {
-                self.set_chat_open(ChatOpen::ALL[usize::from(key.key == "right")], cx);
-                current
-            }
-            (
-                "left" | "right",
-                Some(Stop::Control {
-                    action: SettingsAction::ChatAgent,
-                    ..
-                }),
-            ) => {
-                self.step_chat_agent(key.key == "right", false, cx);
-                current
-            }
-            (
-                "left" | "right",
-                Some(Stop::Control {
                     action:
                         SettingsAction::Project(
                             control @ ProjectControl {
@@ -2807,35 +2837,6 @@ impl CompiApp {
                 }),
             ) => {
                 self.step_project_agent(control, key.key == "right", false, cx);
-                current
-            }
-            (
-                "left" | "right",
-                Some(Stop::Control {
-                    action: SettingsAction::NewTab,
-                    ..
-                }),
-            ) => {
-                self.set_new_tab(NewTab::ALL[usize::from(key.key == "right")], cx);
-                current
-            }
-            (
-                "left" | "right",
-                Some(Stop::Control {
-                    action: SettingsAction::DevServer,
-                    ..
-                }),
-            ) => {
-                let index = DevServer::ALL
-                    .iter()
-                    .position(|action| *action == self.config.dev_server)
-                    .unwrap_or(0);
-                let next = if key.key == "right" {
-                    (index + 1).min(DevServer::ALL.len() - 1)
-                } else {
-                    index.saturating_sub(1)
-                };
-                self.set_dev_server(DevServer::ALL[next], cx);
                 current
             }
             ("tab", _) => step(&order, current, !modifiers.shift),
@@ -2941,41 +2942,16 @@ impl CompiApp {
                     self.global_error = Some(error);
                 }
             }
-            SettingsAction::FocusIndicator(indicator) => {
-                if let Err(error) = self.config.save_focus_indicator(indicator) {
-                    self.global_error = Some(error);
-                }
+            SettingsAction::ChatEnter
+            | SettingsAction::ChatOpen
+            | SettingsAction::ChatAgent
+            | SettingsAction::NewTab
+            | SettingsAction::Shell
+            | SettingsAction::DevServer
+            | SettingsAction::Density
+            | SettingsAction::FocusIndicator => {
+                self.step_choice(action, true, true, window, cx);
             }
-            SettingsAction::ChatEnter => self.set_chat_enter(
-                match self.config.chat_enter {
-                    ChatEnter::Steer => ChatEnter::Queue,
-                    ChatEnter::Queue => ChatEnter::Steer,
-                },
-                cx,
-            ),
-            SettingsAction::ChatOpen => self.set_chat_open(
-                match self.config.chat_open {
-                    ChatOpen::InPlace => ChatOpen::Beside,
-                    ChatOpen::Beside => ChatOpen::InPlace,
-                },
-                cx,
-            ),
-            SettingsAction::ChatAgent => self.step_chat_agent(true, true, cx),
-            SettingsAction::NewTab => self.set_new_tab(
-                match self.config.new_tab.unwrap_or_default() {
-                    NewTab::Chat => NewTab::Terminal,
-                    NewTab::Terminal => NewTab::Chat,
-                },
-                cx,
-            ),
-            SettingsAction::DevServer => self.set_dev_server(
-                match self.config.dev_server {
-                    DevServer::Offer => DevServer::Open,
-                    DevServer::Open => DevServer::Nothing,
-                    DevServer::Nothing => DevServer::Offer,
-                },
-                cx,
-            ),
             SettingsAction::CopyInstallCommand(agent) => {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                     agent.entry().install.to_owned(),
@@ -3128,7 +3104,6 @@ impl CompiApp {
             SettingsAction::OpenDiagnostics => self.execute(Command::OpenDiagnostics, window, cx),
             SettingsAction::RestartDaemon => self.execute(Command::RestartDaemon, window, cx),
             SettingsAction::Prompt(action) => self.activate_prompt_action(action),
-            SettingsAction::Density(density) => self.apply_density(density, window, cx),
             SettingsAction::ChooseStartingFolder => self.choose_starting_folder(cx),
             SettingsAction::StartAtHome => self.set_starting_folder(None, cx),
             SettingsAction::Project(control) => self.activate_project_control(control, window, cx),
@@ -3136,6 +3111,65 @@ impl CompiApp {
                 self.open_settings(Some(SettingsSection::Appearance), None, window, cx)
             }
         }
+    }
+
+    /// Picks the choice of `action` after the current one (`forward`) or before it:
+    /// at the ends it stops there, or with `wrap` goes round. False when `action` is
+    /// not a choice.
+    fn step_choice(
+        &mut self,
+        action: SettingsAction,
+        forward: bool,
+        wrap: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        use crate::theme::{FocusIndicator, WorkspaceDensity};
+        fn next<T: Copy + PartialEq>(all: &[T], current: T, forward: bool, wrap: bool) -> T {
+            let index = all.iter().position(|choice| *choice == current);
+            all[choice_index(index.unwrap_or(0), all.len(), forward, wrap)]
+        }
+        match action {
+            SettingsAction::ChatEnter => {
+                let enter = next(&ChatEnter::ALL, self.config.chat_enter, forward, wrap);
+                self.set_chat_enter(enter, cx);
+            }
+            SettingsAction::ChatOpen => {
+                let open = next(&ChatOpen::ALL, self.config.chat_open, forward, wrap);
+                self.set_chat_open(open, cx);
+            }
+            SettingsAction::ChatAgent => self.step_chat_agent(forward, wrap, cx),
+            SettingsAction::NewTab => {
+                let current = self.config.new_tab.unwrap_or_default();
+                self.set_new_tab(next(&NewTab::ALL, current, forward, wrap), cx);
+            }
+            SettingsAction::Shell => {
+                if let Some(current) = self.windows_shell() {
+                    self.set_windows_shell(next(&WINDOWS_SHELLS, current, forward, wrap), cx);
+                }
+            }
+            SettingsAction::DevServer => {
+                let action = next(&DevServer::ALL, self.config.dev_server, forward, wrap);
+                self.set_dev_server(action, cx);
+            }
+            SettingsAction::Density => {
+                let density = next(&WorkspaceDensity::ALL, self.config.density, forward, wrap);
+                self.apply_density(density, window, cx);
+            }
+            SettingsAction::FocusIndicator => {
+                let indicator = next(
+                    &FocusIndicator::ALL,
+                    self.config.focus_indicator,
+                    forward,
+                    wrap,
+                );
+                if let Err(error) = self.config.save_focus_indicator(indicator) {
+                    self.global_error = Some(error);
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// Global defaults or this window; a theme preview of the other scope ends.
@@ -3378,8 +3412,9 @@ impl CompiApp {
     }
 
     /// The header line of the Settings pane `pane_id`: the title, the section icons
-    /// (the current one filled and underlined in the accent) and the search icon; or
-    /// while searching, the title and the search field in their place.
+    /// (the current one lit: drawn in the accent, filled and underlined) and the search
+    /// icon; or while searching, the title and the search field in their place. Too
+    /// narrow for every icon on one line, the icons wrap onto lines of their own.
     fn render_settings_header(
         &self,
         pane_id: &PaneId,
@@ -3390,10 +3425,16 @@ impl CompiApp {
         let colors = *self.colors();
         // Narrow panes give the title's room to the section icons.
         let titled = width >= HEADER_TITLE_MIN_WIDTH;
+        // The icons' room: the pane less the padding, the search icon and the gaps.
+        let strip_room = width - 32.0 - 24.0 - 12.0;
+        let strip_width = SettingsSection::ALL.len() as f32 * 28.0 + 4.0;
+        let wrapped = !titled && strip_room < strip_width;
+        let line_height = if wrapped { 34.0 } else { HEADER_HEIGHT };
         let header = div()
             .flex_none()
-            .h(px(44.0))
+            .min_h(px(HEADER_HEIGHT))
             .px_4()
+            .when(wrapped, |header| header.py_1())
             .flex()
             .items_center()
             .gap_3()
@@ -3434,15 +3475,20 @@ impl CompiApp {
             .enumerate()
             .map(|(index, section)| {
                 let active = pane.section == section;
-                let focused = self.settings.focus.as_ref()
-                    == Some(&SettingsFocus {
-                        host: host.clone(),
-                        stop: Stop::Section(section),
-                    });
+                let focused = self.settings.section_ring
+                    && self.settings.focus.as_ref()
+                        == Some(&SettingsFocus {
+                            host: host.clone(),
+                            stop: Stop::Section(section),
+                        });
                 let pane_id = pane_id.clone();
                 let entry = controls::icon_button(
                     ("settings-section", index),
-                    section_icon(section),
+                    if active {
+                        controls::glyph(section_icon(section), color(colors.accent))
+                    } else {
+                        section_icon(section).into()
+                    },
                     section.label(),
                 )
                 .header()
@@ -3456,12 +3502,12 @@ impl CompiApp {
                     this.apply_settings_focus(&pane_id, window, cx);
                     cx.notify();
                 }));
-                // The entry fills the header's height: the icon centred, its ring clear of
-                // the edges, and the underline on the header's bottom edge.
+                // The entry fills its line's height: the icon centred, its ring clear of
+                // the edges, and the underline on the line's bottom edge.
                 div()
                     .relative()
                     .flex_none()
-                    .h_full()
+                    .h(px(line_height))
                     .flex()
                     .items_center()
                     .child(
@@ -3485,17 +3531,15 @@ impl CompiApp {
         header
             .child(
                 div()
-                    .id("settings-sections")
-                    .h_full()
+                    .flex_1()
                     .min_w_0()
-                    // The strip scrolls, so it clips: room for the end icons' rings.
+                    // Room for the end icons' rings.
                     .px(px(4.0))
                     .flex()
-                    .gap_1()
-                    .overflow_x_scroll()
+                    .flex_wrap()
+                    .gap_x_1()
                     .children(entries),
             )
-            .child(div().flex_1())
             .child(
                 controls::icon_button("settings-search", IconName::Search, "Search settings")
                     .header()
@@ -3585,7 +3629,8 @@ impl CompiApp {
     }
 
     /// One setting inside its card: title and description on the left, the control on
-    /// the right (below them when `compact`).
+    /// the right, every row's control ending on the card's one right edge; below them
+    /// when `compact` (a narrow pane, picture tiles).
     pub(super) fn settings_row(
         &self,
         label: &'static str,
@@ -3609,12 +3654,11 @@ impl CompiApp {
         let colors = *self.colors();
         div()
             .min_w_0()
-            .min_h(px(52.0))
-            .py_3()
+            .min_h(px(48.0))
+            .py(px(10.0))
             .flex()
-            .gap_3()
-            .when(compact, |row| row.flex_col().items_start())
-            .when(!compact, |row| row.items_center().justify_between())
+            .when(compact, |row| row.flex_col().items_start().gap(px(10.0)))
+            .when(!compact, |row| row.items_center().justify_between().gap_4())
             .child(
                 div()
                     .min_w_0()
@@ -3645,6 +3689,101 @@ impl CompiApp {
                     .items_center()
                     .child(control),
             )
+            .into_any_element()
+    }
+
+    /// A setting's current value beside its control, muted: "237 px", "80%".
+    fn settings_value(&self, value: impl Into<SharedString>) -> Div {
+        let colors = *self.colors();
+        div()
+            .flex_none()
+            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .line_height(px(UI_SMALL_LINE_HEIGHT))
+            .text_color(color(modal_text_color(colors.muted, &colors)))
+            .child(value.into())
+    }
+
+    /// The head of an item card (an agent, a project, Compi itself): its `mark` in a
+    /// square, its `title` line (the name, then any chips), what it says of itself
+    /// (`details`) and its `action`, which goes under the text when `stacked`. Each
+    /// item is a card of its own, unlike the setting rows a group's card holds.
+    pub(super) fn item_card_head(
+        &self,
+        mark: impl IntoElement,
+        title: impl IntoIterator<Item = AnyElement>,
+        details: impl IntoIterator<Item = AnyElement>,
+        action: Option<AnyElement>,
+        stacked: bool,
+    ) -> Div {
+        let colors = *self.colors();
+        let mark = div()
+            .flex_none()
+            .size(px(ITEM_MARK_TILE))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_lg()
+            .border_1()
+            .border_color(color(colors.border))
+            .bg(material_color(colors.background, 1.0))
+            .child(mark);
+        let text = div()
+            .min_w_0()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_x_1p5()
+                    .font_weight(FontWeight::MEDIUM)
+                    .children(title),
+            )
+            .children(details);
+        let head = div()
+            .min_w_0()
+            .w_full()
+            .px_4()
+            .py_3()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(mark)
+            .child(text);
+        match action {
+            Some(action) if stacked => div()
+                .min_w_0()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(head)
+                .child(
+                    div()
+                        .min_w_0()
+                        .pl(px(16.0 + ITEM_MARK_TILE + 12.0))
+                        .pr_4()
+                        .pb_3()
+                        .flex()
+                        .child(action),
+                ),
+            Some(action) => head.child(div().flex_none().flex().items_center().child(action)),
+            None => head,
+        }
+    }
+
+    /// A line under an item card's name, in `tint` (a theme color, made legible).
+    pub(super) fn item_detail(&self, text: impl Into<SharedString>, tint: u32) -> AnyElement {
+        let colors = *self.colors();
+        div()
+            .min_w_0()
+            .text_size(px(UI_SMALL_TEXT_SIZE))
+            .line_height(px(UI_SMALL_LINE_HEIGHT))
+            .text_color(color(modal_text_color(tint, &colors)))
+            .child(text.into())
             .into_any_element()
     }
 
@@ -3880,12 +4019,9 @@ impl CompiApp {
                     .child(self.settings_focus_anchor(focused, cx)),
             )
             .child(
-                div()
-                    .flex_none()
+                self.settings_value(format!("{:.0}%", appearance.terminal_opacity * 100.0))
                     .w(px(40.0))
-                    .text_right()
-                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                    .child(format!("{:.0}%", appearance.terminal_opacity * 100.0)),
+                    .text_right(),
             )
             .into_any_element();
         self.settings_row(
@@ -3976,63 +4112,29 @@ impl CompiApp {
     }
 
     /// Shell (Windows): what new tabs and splits start, picked for their folder, Windows
-    /// PowerShell or WSL. Saved to the configuration and given to every window; running
-    /// shells keep theirs.
+    /// PowerShell or WSL, as tiles of each one's console. Saved to the configuration and
+    /// given to every window; running shells keep theirs.
     fn render_shell_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        const SHELLS: [(WindowsShell, &str, &str); 3] = [
-            (
-                WindowsShell::Automatic,
-                "Automatic",
-                "WSL in a Linux folder, else PowerShell",
-            ),
-            (
-                WindowsShell::PowerShell,
-                "PowerShell",
-                "Windows PowerShell, on Windows",
-            ),
-            (WindowsShell::Wsl, "WSL", "Your default Linux distribution"),
-        ];
-        let popup = Popup::Shell;
-        let action = SettingsAction::Select(popup);
-        let focused = self.settings_focused(row, action);
-        let current = self
-            .config
-            .launch
-            .as_ref()
-            .ok()
-            .map(|launch| launch.profile.windows_shell);
-        let selected = SHELLS
-            .iter()
-            .position(|(shell, ..)| Some(*shell) == current);
-        let open_row = row.clone();
-        let select = controls::select(
-            "shell-select",
-            SHELLS
-                .iter()
-                .map(|(_, label, detail)| controls::select_option(*label).detail(*detail)),
-            selected,
-            self.popup == Some(popup),
-        )
-        .placeholder(selected.map_or("Choose", |index| SHELLS[index].1))
-        .focused(focused)
-        .anchor(Anchor::TopRight)
-        .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
-            this.focus_settings_control(&open_row, action);
-            this.set_popup(popup, *open);
-            cx.notify();
-        }))
-        .on_pick(cx.listener(|this, index: &usize, _, cx| {
-            if let Some((shell, ..)) = SHELLS.get(*index) {
-                this.set_windows_shell(*shell, cx);
+        let current = self.windows_shell();
+        let tiles = WINDOWS_SHELLS.map(|shell| Tile {
+            label: match shell {
+                WindowsShell::Automatic => "Automatic",
+                WindowsShell::PowerShell => "PowerShell",
+                WindowsShell::Wsl => "WSL",
             }
-            cx.notify();
-        }));
-        let control = div()
-            .relative()
-            .flex_none()
-            .child(select)
-            .child(self.settings_focus_anchor(focused, cx))
-            .into_any_element();
+            .into(),
+            preview: match shell {
+                // Half each: whichever the folder calls for.
+                WindowsShell::Automatic => div()
+                    .flex()
+                    .child(self.sketch_powershell(true))
+                    .child(self.sketch_ubuntu(true)),
+                WindowsShell::PowerShell => div().flex().child(self.sketch_powershell(false)),
+                WindowsShell::Wsl => div().flex().child(self.sketch_ubuntu(false)),
+            },
+            picked: current == Some(shell),
+            unavailable: None,
+        });
         let detail = match current {
             Some(WindowsShell::Automatic) => {
                 "New tabs and splits in a Linux folder start WSL; elsewhere Windows PowerShell, which starts without waiting for WSL. Open tabs keep their shell."
@@ -4045,7 +4147,20 @@ impl CompiApp {
             }
             None => "Fix the configuration file to choose a shell.",
         };
-        self.settings_row(row.title, detail.into(), control, row.compact)
+        self.render_tile_row(
+            row,
+            SettingsAction::Shell,
+            detail.into(),
+            tiles,
+            Rc::new(|this, index, _, cx| this.set_windows_shell(WINDOWS_SHELLS[index], cx)),
+            cx,
+        )
+    }
+
+    /// The shell new tabs start, as configured; `None` while the configuration is broken.
+    fn windows_shell(&self) -> Option<WindowsShell> {
+        let launch = self.config.launch.as_ref().ok()?;
+        Some(launch.profile.windows_shell)
     }
 
     /// Saves the shell and gives it to every window.
@@ -4144,8 +4259,8 @@ impl CompiApp {
         )
     }
 
-    /// New tabs: Chat first or Terminal first, as a switch. Unset reads as Terminal
-    /// first, what + opens until it is chosen.
+    /// New tabs: Chat first or Terminal first, as tiles of a new thread and a new shell.
+    /// Unset reads as Terminal first, what + opens until it is chosen.
     fn render_new_tab_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         let current = self.config.new_tab.unwrap_or_default();
         let detail = match current {
@@ -4156,26 +4271,26 @@ impl CompiApp {
                 "The tab strip's + and Ctrl+T open a shell; right-click + for a new thread."
             }
         };
-        self.render_choice_row(
+        let tiles = NewTab::ALL.map(|new_tab| Tile {
+            label: new_tab.label().into(),
+            preview: div().flex().child(match new_tab {
+                NewTab::Chat => self.sketch_chat(),
+                NewTab::Terminal => self.sketch_shell(),
+            }),
+            picked: new_tab == current,
+            unavailable: None,
+        });
+        self.render_tile_row(
             row,
             SettingsAction::NewTab,
-            NewTab::ALL.map(|new_tab| {
-                (
-                    new_tab.label(),
-                    match new_tab {
-                        NewTab::Chat => "New tabs start a thread",
-                        NewTab::Terminal => "New tabs start a shell",
-                    },
-                    new_tab == current,
-                )
-            }),
-            |app, index, cx| app.set_new_tab(NewTab::ALL[index], cx),
             detail.into(),
+            tiles,
+            Rc::new(|this, index, _, cx| this.set_new_tab(NewTab::ALL[index], cx)),
             cx,
         )
     }
 
-    /// Opening a chat: in place of the shell or beside it, as a switch.
+    /// Opening a chat: in place of the shell or beside it, as tiles of the pane.
     fn render_chat_open_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         let current = self.config.chat_open;
         let detail = match current {
@@ -4186,68 +4301,48 @@ impl CompiApp {
                 "New chat and compi chat open the chat in a new pane beside the terminal."
             }
         };
-        self.render_choice_row(
+        let seam = color(self.colors().border);
+        let tiles = ChatOpen::ALL.map(|open| Tile {
+            label: open.label().into(),
+            preview: match open {
+                ChatOpen::InPlace => div().flex().child(self.sketch_chat()),
+                ChatOpen::Beside => div()
+                    .flex()
+                    .child(self.sketch_shell())
+                    .child(div().flex_none().w(px(1.0)).bg(seam))
+                    .child(self.sketch_chat()),
+            },
+            picked: open == current,
+            unavailable: None,
+        });
+        self.render_tile_row(
             row,
             SettingsAction::ChatOpen,
-            ChatOpen::ALL.map(|open| {
-                (
-                    open.label(),
-                    match open {
-                        ChatOpen::InPlace => "Over the terminal's shell",
-                        ChatOpen::Beside => "In a new pane beside the terminal",
-                    },
-                    open == current,
-                )
-            }),
-            |app, index, cx| app.set_chat_open(ChatOpen::ALL[index], cx),
             detail.into(),
+            tiles,
+            Rc::new(|this, index, _, cx| this.set_chat_open(ChatOpen::ALL[index], cx)),
             cx,
         )
     }
 
-    /// Default agent: the agents as a switch, each one not installed where new chats
-    /// open dimmed, with why, and not picked.
+    /// Default agent: a tile per agent, its own mark and name; one not installed where
+    /// new chats open is dimmed, says so, and can't be picked.
     fn render_chat_agent_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
-        let action = SettingsAction::ChatAgent;
         let current = self.config.chat_agent;
-        let focused = self.settings_focused(row, action);
-        let buttons = ChatHarness::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(index, agent)| {
-                let row = row.clone();
-                controls::text_button((row.row, index), agent.name())
-                    .selected(agent == current)
-                    .detail(format!("New threads start with {}", agent.name()))
-                    .disabled_because(
-                        (!self.chat_agent_installed(agent)).then_some("Not installed"),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.focus_settings_control(&row, action);
-                        this.set_chat_agent(agent, cx);
-                        cx.notify();
-                    }))
-            });
-        let switch = controls::highlight(
-            focused,
-            controls::segmented((row.row, 9_usize), buttons),
+        let tiles = ChatHarness::ALL.map(|agent| Tile {
+            label: agent.name().into(),
+            preview: self.sketch_agent(agent),
+            picked: agent == current,
+            unavailable: (!self.chat_agent_installed(agent)).then_some("Not installed"),
+        });
+        self.render_tile_row(
+            row,
+            SettingsAction::ChatAgent,
+            row_description(row.row).into(),
+            tiles,
+            Rc::new(|this, index, _, cx| this.set_chat_agent(ChatHarness::ALL[index], cx)),
             cx,
         )
-        .child(self.settings_focus_anchor(focused, cx))
-        .into_any_element();
-        let missing: Vec<&str> = ChatHarness::ALL
-            .into_iter()
-            .filter(|agent| !self.chat_agent_installed(*agent))
-            .map(ChatHarness::name)
-            .collect();
-        let mut detail = row_description(row.row).to_owned();
-        if !missing.is_empty() {
-            detail.push_str(&format!(
-                " Not installed where new chats open: {}.",
-                missing.join(", ")
-            ));
-        }
-        self.settings_row(row.title, detail, switch, row.compact)
     }
 
     /// Whether `agent` is installed where new chats open, as far as Settings knows: an
@@ -4319,7 +4414,10 @@ impl CompiApp {
         };
         Some(agent_places(
             installs.distribution.as_deref(),
-            installs.agents.iter().find(|install| install.harness == agent),
+            installs
+                .agents
+                .iter()
+                .find(|install| install.harness == agent),
         ))
     }
 
@@ -4327,7 +4425,10 @@ impl CompiApp {
     fn agent_stops(&self) -> Vec<SettingsAction> {
         ChatHarness::ALL
             .into_iter()
-            .filter(|agent| self.agent_places(*agent).is_some_and(|places| places.is_empty()))
+            .filter(|agent| {
+                self.agent_places(*agent)
+                    .is_some_and(|places| places.is_empty())
+            })
             .map(SettingsAction::CopyInstallCommand)
             .collect()
     }
@@ -4347,11 +4448,11 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// One agent's card: its mark and name, Default when new threads start with it, and
-    /// where it is installed with each side's version, or how to install it.
+    /// One agent's item card: its mark and name, Default when new threads start with it,
+    /// and where it is installed with each side's version, or how to install it, with
+    /// Copy command.
     fn render_agent_card(&self, row: &RowCx, agent: ChatHarness, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
-        let muted = color(modal_text_color(colors.muted, &colors));
         let places = self.agent_places(agent);
         let missing = places.as_ref().is_some_and(Vec::is_empty);
         let status = match (&self.settings.agent_installs, places) {
@@ -4377,55 +4478,20 @@ impl CompiApp {
                 cx,
             )
         });
+        let default = (self.config.chat_agent == agent).then(|| {
+            controls::chip("Default", controls::ChipTone::Tint(colors.accent)).into_any_element()
+        });
         settings_card(&colors)
             .child(
-                div()
-                    .min_w_0()
-                    .px_4()
-                    .py_3()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        gpui::img(super::chat::harness_mark(agent))
-                            .flex_none()
-                            .size(px(AGENT_MARK_SIZE)),
-                    )
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(agent.name()),
-                                    )
-                                    .when(self.config.chat_agent == agent, |name| {
-                                        name.child(controls::chip(
-                                            "Default",
-                                            controls::ChipTone::Tint(colors.accent),
-                                        ))
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .line_height(px(UI_SMALL_LINE_HEIGHT))
-                                    .text_color(muted)
-                                    .child(status),
-                            ),
-                    )
-                    .children(copy),
+                self.item_card_head(
+                    gpui::img(super::chat::harness_mark(agent))
+                        .size(px(AGENT_MARK_SIZE))
+                        .when(missing, |mark| mark.opacity(0.5)),
+                    std::iter::once(div().child(agent.name()).into_any_element()).chain(default),
+                    [self.item_detail(status, colors.muted)],
+                    copy,
+                    row.compact,
+                ),
             )
             .into_any_element()
     }
@@ -4458,8 +4524,10 @@ impl CompiApp {
         }
     }
 
-    /// When a dev server starts: the card, the page by itself, or nothing, as a switch.
+    /// When a dev server starts: tiles of the terminal with the card, the page in its
+    /// place, and the terminal as it is.
     fn render_dev_server_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let colors = *self.colors();
         let current = self.config.dev_server;
         let detail = match current {
             DevServer::Offer => {
@@ -4470,22 +4538,101 @@ impl CompiApp {
             }
             DevServer::Nothing => "The terminal stays as it is.",
         };
-        self.render_choice_row(
+        let card = || {
+            div()
+                .absolute()
+                .right(px(5.0))
+                .bottom(px(5.0))
+                .w(px(46.0))
+                .h(px(16.0))
+                .px(px(4.0))
+                .flex()
+                .items_center()
+                .gap(px(3.0))
+                .rounded(px(3.0))
+                .border_1()
+                .border_color(color(colors.accent))
+                .bg(material_color(colors.background, 1.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(5.0))
+                        .rounded_full()
+                        .bg(color(colors.accent)),
+                )
+                .child(self.sketch_line(24.0))
+        };
+        let page = || {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .bg(color(colors.surface))
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(12.0))
+                        .px(px(4.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(2.0))
+                        .border_b_1()
+                        .border_color(color(colors.border))
+                        .children((0..3).map(|_| {
+                            div()
+                                .flex_none()
+                                .size(px(3.0))
+                                .rounded_full()
+                                .bg(color(colors.muted).opacity(0.6))
+                        }))
+                        .child(
+                            div()
+                                .ml(px(3.0))
+                                .h(px(6.0))
+                                .w(px(52.0))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(color(colors.border)),
+                        ),
+                )
+                .child(
+                    div()
+                        .p(px(5.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .h(px(6.0))
+                                .w(px(34.0))
+                                .rounded(px(2.0))
+                                .bg(color(colors.accent).opacity(0.8)),
+                        )
+                        .child(self.sketch_line(52.0))
+                        .child(self.sketch_line(40.0)),
+                )
+        };
+        let tiles = DevServer::ALL.map(|action| Tile {
+            label: action.label().into(),
+            preview: match action {
+                DevServer::Offer => div()
+                    .relative()
+                    .flex()
+                    .child(self.sketch_shell())
+                    .child(card()),
+                DevServer::Open => div().flex().child(page()),
+                DevServer::Nothing => div().flex().child(self.sketch_shell()),
+            },
+            picked: action == current,
+            unavailable: None,
+        });
+        self.render_tile_row(
             row,
             SettingsAction::DevServer,
-            DevServer::ALL.map(|action| {
-                (
-                    action.label(),
-                    match action {
-                        DevServer::Offer => "A card in the terminal",
-                        DevServer::Open => "The page, in place of the shell",
-                        DevServer::Nothing => "No card and no page",
-                    },
-                    action == current,
-                )
-            }),
-            |app, index, cx| app.set_dev_server(DevServer::ALL[index], cx),
             detail.into(),
+            tiles,
+            Rc::new(|this, index, _, cx| this.set_dev_server(DevServer::ALL[index], cx)),
             cx,
         )
     }
@@ -4592,13 +4739,29 @@ impl CompiApp {
             .as_deref()
     }
 
-    /// Starting folder: the folder, with Choose… and, once one is set, Home.
+    /// Starting folder: the folder, muted, with Choose… and, once one is set, Home.
     fn render_starting_folder_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         let folder = self.starting_folder();
-        let buttons = div()
+        let value = match folder {
+            Some(folder) => folder,
+            None if self.config.launch.is_err() => "Fix the configuration file",
+            None => "Home folder",
+        };
+        let control = div()
+            .min_w_0()
             .flex()
             .items_center()
             .gap_1()
+            .child(
+                self.settings_value(value.to_owned())
+                    .flex_initial()
+                    .min_w_0()
+                    .max_w(px(240.0))
+                    .mr_2()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis(),
+            )
             .child(self.settings_button(
                 row,
                 0,
@@ -4610,14 +4773,12 @@ impl CompiApp {
                 buttons.child(self.settings_button(row, 1, "Home", SettingsAction::StartAtHome, cx))
             })
             .into_any_element();
-        let detail = match folder {
-            Some(folder) => folder.to_owned(),
-            None if self.config.launch.is_err() => {
-                "Fix the configuration file to choose a folder.".into()
-            }
-            None => "Your home folder.".into(),
-        };
-        self.settings_row(row.title, detail, buttons, row.compact)
+        self.settings_row(
+            row.title,
+            row_description(row.row).into(),
+            control,
+            row.compact,
+        )
     }
 
     /// Asks for a folder on this computer. A WSL shell starts in a Windows folder's WSL path.
@@ -4654,71 +4815,133 @@ impl CompiApp {
         });
     }
 
-    /// One drawn choice of a setting: `preview` above its `label`, an accent edge when
-    /// `selected`.
-    fn option_card(
+    /// A choice drawn as picture tiles, one stop for `action` (`id` tells apart rows
+    /// that share a row id): a click picks a tile (`pick` with its index), Left and
+    /// Right pick the one before or after, Enter the next. While the stop has the
+    /// highlight, the picked tile has the ring. The tiles wrap to the width they get.
+    pub(super) fn render_tiles(
         &self,
         row: &RowCx,
-        (index, action): (usize, SettingsAction),
-        selected: bool,
-        label: &'static str,
-        preview: Div,
+        (id, action): (usize, SettingsAction),
+        tiles: impl IntoIterator<Item = Tile>,
+        pick: PickTile,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
         let focused = self.settings_focused(row, action);
-        let card = div()
-            .id((row.row, index))
-            .w(px(OPTION_CARD_WIDTH))
-            .flex()
-            .flex_col()
-            .gap_1()
-            .cursor_pointer()
-            .on_click(self.settings_click(row, action, cx))
-            .child(
-                preview
-                    .h(px(58.0))
-                    .w_full()
-                    .rounded_md()
-                    .overflow_hidden()
-                    .bg(material_color(colors.background, 1.0))
-                    .when(selected, |preview| {
-                        preview.border_2().border_color(color(colors.accent))
-                    })
-                    .when(!selected, |preview| {
-                        preview.border_1().border_color(color(colors.border))
-                    }),
-            )
-            .child(
-                div()
-                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                    .line_height(px(UI_SMALL_LINE_HEIGHT))
-                    .text_color(color(modal_text_color(
-                        if selected {
-                            colors.foreground
+        let tiles: Vec<Tile> = tiles.into_iter().collect();
+        // With none picked, the first tile takes the ring.
+        let ringed = tiles.iter().position(|tile| tile.picked).unwrap_or(0);
+        let tiles = tiles.into_iter().enumerate().map(|(index, tile)| {
+            let picked = tile.picked;
+            let preview = tile
+                .preview
+                .h(px(TILE_PREVIEW_HEIGHT))
+                .w_full()
+                .rounded_md()
+                .overflow_hidden()
+                .bg(material_color(colors.background, 1.0))
+                .when(picked, |preview| {
+                    preview.border_2().border_color(color(colors.accent))
+                })
+                .when(!picked, |preview| {
+                    preview.border_1().border_color(color(colors.border))
+                });
+            let label = div()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .text_size(px(UI_SMALL_TEXT_SIZE))
+                .line_height(px(UI_SMALL_LINE_HEIGHT))
+                .child(
+                    div()
+                        .text_color(if picked {
+                            color(modal_text_color(colors.foreground, &colors))
                         } else {
-                            colors.muted
-                        },
-                        &colors,
-                    )))
-                    .when(selected, |label| label.font_weight(FontWeight::MEDIUM))
-                    .child(label),
-            );
-        controls::highlight(focused, card, cx)
-            .child(self.settings_focus_anchor(focused, cx))
+                            muted
+                        })
+                        .when(picked, |label| label.font_weight(FontWeight::MEDIUM))
+                        .child(tile.label),
+                )
+                .children(
+                    tile.unavailable
+                        .map(|why| div().text_color(muted).child(why)),
+                );
+            let (tile_row, pick) = (row.clone(), pick.clone());
+            let card = div()
+                .id((row.row, id * 16 + index))
+                .w(px(TILE_WIDTH))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(preview)
+                .child(label)
+                .when_some(tile.unavailable, |card, _| card.opacity(0.55))
+                .when(tile.unavailable.is_none(), |card| {
+                    card.cursor_pointer()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.focus_settings_control(&tile_row, action);
+                            pick(this, index, window, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
+                });
+            let ring = focused && index == ringed;
+            controls::highlight(ring, card, cx).child(self.settings_focus_anchor(ring, cx))
+        });
+        div()
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .gap_3()
+            .children(tiles)
             .into_any_element()
     }
 
-    /// A pane of an option drawing: the surface with two lines of text.
+    /// A setting whose choice is picture tiles, under its title and `detail`.
+    fn render_tile_row(
+        &self,
+        row: &RowCx,
+        action: SettingsAction,
+        detail: String,
+        tiles: impl IntoIterator<Item = Tile>,
+        pick: PickTile,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let tiles = self.render_tiles(row, (0, action), tiles, pick, cx);
+        self.settings_row(row.title, detail, tiles, true)
+    }
+
+    /// A line of text in a tile's drawing, `width` long.
+    fn sketch_line(&self, width: f32) -> Div {
+        div()
+            .flex_none()
+            .h(px(3.0))
+            .w(px(width))
+            .rounded_full()
+            .bg(color(self.colors().muted).opacity(0.5))
+    }
+
+    /// Terminal text in a tile's drawing.
+    fn sketch_text(&self, text: &'static str, tint: impl Into<gpui::Hsla>) -> Div {
+        div()
+            .flex_none()
+            .whitespace_nowrap()
+            .font(self.typography.font.clone())
+            .text_size(px(9.0))
+            .line_height(px(11.0))
+            .text_color(tint.into())
+            .child(text)
+    }
+
+    /// A terminal's cursor in a tile's drawing.
+    fn sketch_cursor(tint: impl Into<gpui::Hsla>) -> Div {
+        div().flex_none().w(px(5.0)).h(px(9.0)).bg(tint.into())
+    }
+
+    /// A pane of a tile's drawing: the surface with two lines of text.
     fn sketch_pane(&self) -> Div {
-        let colors = *self.colors();
-        let line = |width: f32| {
-            div()
-                .h(px(3.0))
-                .w(px(width))
-                .rounded_full()
-                .bg(color(colors.muted).opacity(0.5))
-        };
         div()
             .relative()
             .flex_1()
@@ -4727,56 +4950,170 @@ impl CompiApp {
             .flex()
             .flex_col()
             .gap(px(4.0))
+            .bg(color(self.colors().surface))
+            .child(self.sketch_line(22.0))
+            .child(self.sketch_line(14.0))
+    }
+
+    /// A chat in a tile's drawing: its title, a reply, and the message box at the foot.
+    fn sketch_chat(&self) -> Div {
+        let colors = *self.colors();
+        div()
+            .flex_1()
+            .min_w_0()
+            .p(px(5.0))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
             .bg(color(colors.surface))
-            .child(line(22.0))
-            .child(line(14.0))
+            .child(
+                self.sketch_line(30.0)
+                    .h(px(4.0))
+                    .bg(color(colors.foreground).opacity(0.7)),
+            )
+            .child(self.sketch_line(44.0))
+            .child(self.sketch_line(32.0))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(12.0))
+                    .w_full()
+                    .px(px(2.0))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .rounded(px(3.0))
+                    .border_1()
+                    .border_color(color(colors.border))
+                    .bg(material_color(colors.background, 1.0))
+                    .child(div().size(px(6.0)).rounded_full().bg(color(colors.accent))),
+            )
+    }
+
+    /// A shell in a tile's drawing: a command, its output, and the prompt with the
+    /// cursor.
+    fn sketch_shell(&self) -> Div {
+        let colors = *self.colors();
+        div()
+            .flex_1()
+            .min_w_0()
+            .p(px(5.0))
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .bg(color(colors.surface))
+            .child(self.sketch_text("$ ls", color(colors.muted)))
+            .child(self.sketch_line(40.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(3.0))
+                    .child(self.sketch_text("$", color(colors.accent)))
+                    .child(Self::sketch_cursor(color(colors.foreground))),
+            )
+    }
+
+    /// A shell of `background` in a tile's drawing, its prompt `parts` (text and
+    /// color) and the cursor under a line of earlier output.
+    fn sketch_prompt(&self, background: u32, parts: &[(&'static str, u32)]) -> Div {
+        let text = parts.last().map_or(0xffffff, |(_, tint)| *tint);
+        div()
+            .flex_1()
+            .min_w_0()
+            .p(px(5.0))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .bg(gpui::rgb(background))
+            .child(
+                div()
+                    .flex_none()
+                    .h(px(3.0))
+                    .w(px(34.0))
+                    .rounded_full()
+                    .bg(gpui::Hsla::from(gpui::rgb(text)).opacity(0.35)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(1.0))
+                    .children(
+                        parts
+                            .iter()
+                            .map(|(part, tint)| self.sketch_text(part, gpui::rgb(*tint))),
+                    )
+                    .child(Self::sketch_cursor(gpui::rgb(text))),
+            )
+    }
+
+    /// Windows PowerShell's console in a tile's drawing; `short` for half a tile.
+    fn sketch_powershell(&self, short: bool) -> Div {
+        let prompt = if short { "PS>" } else { "PS C:\\>" };
+        self.sketch_prompt(0x012456, &[(prompt, 0xeeedf0)])
+    }
+
+    /// Ubuntu's shell under WSL in a tile's drawing; `short` for half a tile.
+    fn sketch_ubuntu(&self, short: bool) -> Div {
+        if short {
+            self.sketch_prompt(0x300a24, &[("~$", 0xeeeeec)])
+        } else {
+            self.sketch_prompt(0x300a24, &[("ubuntu", 0x8ae234), (":~$", 0xeeeeec)])
+        }
+    }
+
+    /// An agent's tile drawing: its own mark.
+    pub(super) fn sketch_agent(&self, agent: ChatHarness) -> Div {
+        div().flex().items_center().justify_center().child(
+            gpui::img(super::chat::harness_mark(agent))
+                .flex_none()
+                .size(px(AGENT_MARK_SIZE + 4.0)),
+        )
     }
 
     fn render_density_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         use crate::theme::WorkspaceDensity;
         let colors = *self.colors();
-        let cards = WorkspaceDensity::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(index, density)| {
-                let comfy = density == WorkspaceDensity::Comfy;
-                let pane = |sketch: Div| {
-                    if comfy {
-                        sketch
-                            .rounded(px(4.0))
-                            .border_1()
-                            .border_color(color(colors.border))
-                    } else {
-                        sketch
-                    }
-                };
-                let seam = color(colors.border);
-                let preview = div()
-                    .flex()
-                    .when(comfy, |preview| preview.p(px(5.0)).gap(px(4.0)))
-                    .child(pane(self.sketch_pane()).flex_none().w(px(28.0)))
-                    .when(!comfy, |preview| preview.child(div().w(px(1.0)).bg(seam)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .flex()
-                            .flex_col()
-                            .when(comfy, |column| column.gap(px(4.0)))
-                            .child(pane(self.sketch_pane()))
-                            .when(!comfy, |column| column.child(div().h(px(1.0)).bg(seam)))
-                            .child(pane(self.sketch_pane())),
-                    );
-                self.option_card(
-                    row,
-                    (index, SettingsAction::Density(density)),
-                    self.config.density == density,
-                    density.label(),
-                    preview,
-                    cx,
-                )
-            });
-        self.settings_row(
-            row.title,
+        let tiles = WorkspaceDensity::ALL.map(|density| {
+            let comfy = density == WorkspaceDensity::Comfy;
+            let pane = |sketch: Div| {
+                if comfy {
+                    sketch
+                        .rounded(px(4.0))
+                        .border_1()
+                        .border_color(color(colors.border))
+                } else {
+                    sketch
+                }
+            };
+            let seam = color(colors.border);
+            let preview = div()
+                .flex()
+                .when(comfy, |preview| preview.p(px(5.0)).gap(px(4.0)))
+                .child(pane(self.sketch_pane()).flex_none().w(px(28.0)))
+                .when(!comfy, |preview| preview.child(div().w(px(1.0)).bg(seam)))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .when(comfy, |column| column.gap(px(4.0)))
+                        .child(pane(self.sketch_pane()))
+                        .when(!comfy, |column| column.child(div().h(px(1.0)).bg(seam)))
+                        .child(pane(self.sketch_pane())),
+                );
+            Tile {
+                label: density.label().into(),
+                preview,
+                picked: self.config.density == density,
+                unavailable: None,
+            }
+        });
+        self.render_tile_row(
+            row,
+            SettingsAction::Density,
             match self.config.density {
                 WorkspaceDensity::Comfy => "Rounded panes with gaps between them, in every window.",
                 WorkspaceDensity::Compact => {
@@ -4784,13 +5121,11 @@ impl CompiApp {
                 }
             }
             .into(),
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_3()
-                .children(cards)
-                .into_any_element(),
-            true,
+            tiles,
+            Rc::new(|this, index, window, cx| {
+                this.apply_density(WorkspaceDensity::ALL[index], window, cx);
+            }),
+            cx,
         )
     }
 
@@ -4826,53 +5161,49 @@ impl CompiApp {
     fn render_focus_indicator_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         use crate::theme::FocusIndicator;
         let colors = *self.colors();
-        let cards = FocusIndicator::ALL
-            .into_iter()
-            .enumerate()
-            .map(|(index, indicator)| {
-                let island = |sketch: Div| {
-                    sketch
-                        .rounded(px(4.0))
-                        .border_1()
-                        .border_color(color(colors.border))
-                };
-                let focused = match indicator {
-                    FocusIndicator::Marker => island(self.sketch_pane()).child(
-                        div()
-                            .absolute()
-                            .top(px(-1.0))
-                            .left(px(6.0))
-                            .w(px(14.0))
-                            .h(px(2.0))
-                            .rounded_full()
-                            .bg(color(colors.accent)),
-                    ),
-                    FocusIndicator::Outline => {
-                        island(self.sketch_pane()).border_color(color(colors.accent))
-                    }
-                    FocusIndicator::Dim | FocusIndicator::None => island(self.sketch_pane()),
+        let tiles = FocusIndicator::ALL.map(|indicator| {
+            let island = |sketch: Div| {
+                sketch
+                    .rounded(px(4.0))
+                    .border_1()
+                    .border_color(color(colors.border))
+            };
+            let focused = match indicator {
+                FocusIndicator::Marker => island(self.sketch_pane()).child(
+                    div()
+                        .absolute()
+                        .top(px(-1.0))
+                        .left(px(6.0))
+                        .w(px(14.0))
+                        .h(px(2.0))
+                        .rounded_full()
+                        .bg(color(colors.accent)),
+                ),
+                FocusIndicator::Outline => {
+                    island(self.sketch_pane()).border_color(color(colors.accent))
                 }
-                // Every indicator keeps the focused pane's cursor.
-                .child(div().w(px(5.0)).h(px(7.0)).bg(color(colors.foreground)));
-                let other = island(self.sketch_pane())
-                    .when(indicator == FocusIndicator::Dim, |pane| pane.opacity(0.4));
-                let preview = div()
-                    .flex()
-                    .p(px(5.0))
-                    .gap(px(4.0))
-                    .child(focused)
-                    .child(other);
-                self.option_card(
-                    row,
-                    (index, SettingsAction::FocusIndicator(indicator)),
-                    self.config.focus_indicator == indicator,
-                    indicator.label(),
-                    preview,
-                    cx,
-                )
-            });
-        self.settings_row(
-            row.title,
+                FocusIndicator::Dim | FocusIndicator::None => island(self.sketch_pane()),
+            }
+            // Every indicator keeps the focused pane's cursor.
+            .child(div().w(px(5.0)).h(px(7.0)).bg(color(colors.foreground)));
+            let other = island(self.sketch_pane())
+                .when(indicator == FocusIndicator::Dim, |pane| pane.opacity(0.4));
+            let preview = div()
+                .flex()
+                .p(px(5.0))
+                .gap(px(4.0))
+                .child(focused)
+                .child(other);
+            Tile {
+                label: indicator.label().into(),
+                preview,
+                picked: self.config.focus_indicator == indicator,
+                unavailable: None,
+            }
+        });
+        self.render_tile_row(
+            row,
+            SettingsAction::FocusIndicator,
             match self.config.focus_indicator {
                 FocusIndicator::Marker => {
                     "A short accent bar on the focused pane; an outline flashes when focus moves."
@@ -4882,13 +5213,13 @@ impl CompiApp {
                 FocusIndicator::None => "Only the cursor, which unfocused panes do not draw.",
             }
             .into(),
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_3()
-                .children(cards)
-                .into_any_element(),
-            true,
+            tiles,
+            Rc::new(|this, index, _, _| {
+                if let Err(error) = this.config.save_focus_indicator(FocusIndicator::ALL[index]) {
+                    this.global_error = Some(error);
+                }
+            }),
+            cx,
         )
     }
 
@@ -4935,19 +5266,20 @@ impl CompiApp {
     fn render_terminal_colors_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         let appearance = self.scoped_appearance();
         let theme_locked = self.config.provenance.theme == crate::config::ValueSource::CommandLine;
-        let current = if appearance.terminal_theme_override {
-            format!(
-                "Override: {}.",
-                self.resolve_theme(&appearance.terminal_theme).label()
-            )
+        let current: SharedString = if appearance.terminal_theme_override {
+            self.resolve_theme(&appearance.terminal_theme)
+                .label()
+                .to_owned()
+                .into()
         } else {
-            "Following the theme.".into()
+            "Following the theme".into()
         };
         let buttons = div()
             .flex()
             .flex_wrap()
             .items_center()
             .gap_2()
+            .child(self.settings_value(current).mr_1())
             .when(appearance.terminal_theme_override, |buttons| {
                 buttons.child(self.settings_button(
                     row,
@@ -4970,7 +5302,7 @@ impl CompiApp {
             if theme_locked {
                 "Colors are fixed by --theme.".into()
             } else {
-                format!("{} {current}", row_description(row.row))
+                row_description(row.row).into()
             },
             buttons,
             row.compact,
@@ -5216,9 +5548,9 @@ impl CompiApp {
         }
     }
 
-    /// The installed version as a row: the updater's status under it and its one
-    /// primary button on the right, its facts and what updating ends under it, and the
-    /// download's progress below while it runs.
+    /// Compi's own item card: its mark and version, the updater's status, facts and what
+    /// updating ends under it, its one primary button, and the download's progress at
+    /// the foot while it runs.
     fn render_update_status(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
         use crate::updates::UpdateButton;
         let colors = *self.colors();
@@ -5227,7 +5559,7 @@ impl CompiApp {
             (Some(button), Some(label)) => {
                 let action = SettingsAction::Update(UpdateControl::Primary(button));
                 let control = controls::text_button((row.row, 0_usize), label).header();
-                self.settings_control(
+                Some(self.settings_control(
                     row,
                     action,
                     match button {
@@ -5236,62 +5568,42 @@ impl CompiApp {
                         _ => control.primary(),
                     },
                     cx,
-                )
+                ))
             }
-            _ => div().into_any_element(),
+            _ => None,
         };
-        let line = |text: String, tint: u32| {
-            div()
-                .text_size(px(UI_SMALL_TEXT_SIZE))
-                .line_height(px(UI_SMALL_LINE_HEIGHT))
-                .text_color(color(modal_text_color(tint, &colors)))
-                .child(text)
+        let accent = color(colors.accent);
+        let mark = canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| brand::paint(bounds, accent, window),
+        )
+        .size(px(AGENT_MARK_SIZE));
+        let status_tint = if view.failed {
+            colors.error
+        } else {
+            colors.foreground
         };
-        let compact = row.compact;
-        div()
-            .min_w_0()
-            .flex()
-            .flex_col()
+        let details = std::iter::once(self.item_detail(view.status, status_tint)).chain(
+            [view.facts, view.consequence]
+                .into_iter()
+                .flatten()
+                .map(|line| self.item_detail(line, colors.muted)),
+        );
+        settings_card(&colors)
             .child(
-                div()
-                    .min_w_0()
-                    .min_h(px(52.0))
-                    .py_3()
-                    .flex()
-                    .gap_3()
-                    .when(compact, |status| status.flex_col().items_start())
-                    .when(!compact, |status| status.items_center().justify_between())
-                    .child(
-                        div()
-                            .min_w_0()
-                            .when(!compact, |text| text.flex_auto().min_w(px(72.0)))
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(format!("Compi {}", env!("CARGO_PKG_VERSION"))),
-                            )
-                            .child(line(
-                                view.status,
-                                if view.failed {
-                                    colors.error
-                                } else {
-                                    colors.foreground
-                                },
-                            ))
-                            .children(view.facts.map(|facts| line(facts, colors.muted)))
-                            .children(
-                                view.consequence
-                                    .map(|consequence| line(consequence, colors.muted)),
-                            ),
-                    )
-                    .child(div().flex_none().flex().items_center().child(primary)),
+                self.item_card_head(
+                    mark,
+                    [div()
+                        .child(format!("Compi {}", env!("CARGO_PKG_VERSION")))
+                        .into_any_element()],
+                    details,
+                    primary,
+                    row.compact,
+                ),
             )
-            .when_some(view.progress, |summary, fraction| {
-                summary.child(
-                    div().pb_3().child(
+            .when_some(view.progress, |card, fraction| {
+                card.child(
+                    div().px_4().pb_3().child(
                         div()
                             .h(px(4.0))
                             .rounded_full()
@@ -5300,7 +5612,7 @@ impl CompiApp {
                                 div()
                                     .h(px(4.0))
                                     .rounded_full()
-                                    .bg(color(colors.accent))
+                                    .bg(accent)
                                     .w(gpui::relative(fraction)),
                             ),
                     ),
@@ -5340,10 +5652,10 @@ impl CompiApp {
             .flex()
             .flex_col()
             .gap_2()
-            .child(settings_group_label(format!(
-                "What's new in {}",
-                notes.version
-            )))
+            .child(settings_group_label(
+                format!("What's new in {}", notes.version),
+                &colors,
+            ))
             .child(
                 settings_card(&colors).child(
                     div()
@@ -5655,14 +5967,14 @@ impl CompiApp {
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(settings_group_label(category.label()))
+                .child(settings_group_label(category.label(), &colors))
                 .child(settings_card(&colors).children(lines))
         });
         div()
             .min_w_0()
             .flex()
             .flex_col()
-            .gap_5()
+            .gap_6()
             .children(groups)
             .into_any_element()
     }
@@ -5793,7 +6105,7 @@ impl CompiApp {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(settings_group_label(label))
+                    .child(settings_group_label(label, &colors))
                     .child(card)
                     .into_any_element(),
                 None => card,
@@ -5817,8 +6129,10 @@ impl CompiApp {
         };
         let colors = *self.colors();
         let host = SettingsHost::Pane(pane_id.clone());
-        let page_width = (width - 48.0).clamp(1.0, PAGE_MAX_WIDTH);
-        let stacked = page_width < STACKED_ROW_WIDTH;
+        // Narrow panes stack their rows and give the margins' room to the page.
+        let stacked = width < STACKED_PANE_WIDTH;
+        let margin = if stacked { 16.0 } else { 24.0 };
+        let page_width = (width - 2.0 * margin).clamp(1.0, PAGE_MAX_WIDTH);
         let searching = !pane.query.trim().is_empty();
         let rows = self.pane_rows(pane);
         let terminal_page = self.theme_list_shown(pane_id);
@@ -5856,7 +6170,7 @@ impl CompiApp {
             );
             // No `min_h_0`: the page is at least its cards plus the grid's minimum, so a
             // short pane scrolls the page instead of drawing past its bottom.
-            let mut page = div().flex_1().min_w_0().flex().flex_col().gap_4();
+            let mut page = div().flex_1().min_w_0().flex().flex_col().gap_6();
             if !terminal_page {
                 let (header, rows): (Vec<_>, Vec<_>) = rows
                     .into_iter()
@@ -5885,7 +6199,7 @@ impl CompiApp {
                 .flex()
                 .flex_col()
                 .overflow_y_scroll()
-                .px_6()
+                .px(px(margin))
                 .py_5()
                 .child(
                     page.w_full()
@@ -5930,7 +6244,7 @@ impl CompiApp {
                         .min_h_0()
                         .overflow_y_scroll()
                         .track_scroll(&pane.scroll.handle)
-                        .px_6()
+                        .px(px(margin))
                         .py_5()
                         .child(
                             div()
@@ -5940,7 +6254,7 @@ impl CompiApp {
                                 .min_w_0()
                                 .flex()
                                 .flex_col()
-                                .gap_5()
+                                .gap_6()
                                 .children(body),
                         ),
                 )
@@ -6140,12 +6454,15 @@ fn section_icon(section: SettingsSection) -> IconName {
     }
 }
 
-/// A group's label: the line above its card, or a heading inside one.
-pub(super) fn settings_group_label(label: impl Into<SharedString>) -> Div {
+/// A group's label: the line above its card, or a heading inside one. Quiet, so a page
+/// reads as its cards.
+pub(super) fn settings_group_label(label: impl Into<SharedString>, colors: &ThemeColors) -> Div {
     div()
         .min_w_0()
         .text_size(px(UI_SMALL_TEXT_SIZE))
-        .font_weight(FontWeight::SEMIBOLD)
+        .line_height(px(UI_SMALL_LINE_HEIGHT))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(color(modal_text_color(colors.muted, colors)))
         .child(label.into())
 }
 
@@ -6468,9 +6785,10 @@ mod tests {
     }
 
     #[test]
-    fn every_row_sits_under_a_group_label_in_a_fixed_order() {
-        // Only page rows that draw their own labels have no group: the project list,
-        // the command list, Overview and the release notes.
+    fn rows_sit_under_group_labels_in_a_fixed_order() {
+        // No group: General's rows, which are its whole page under its heading, and the
+        // page rows that draw their own labels: the project list, the command list,
+        // Overview and the release notes.
         let ungrouped: Vec<_> = ROWS
             .iter()
             .filter(|row| !row.header && row.group.is_none())
@@ -6478,12 +6796,21 @@ mod tests {
             .collect();
         assert_eq!(
             ungrouped,
-            [PROJECTS_ROW, COMMANDS_ROW, MONITOR_ROW, "update-notes"]
+            [
+                "new-tab",
+                "chat-agent",
+                "shell",
+                PROJECTS_ROW,
+                COMMANDS_ROW,
+                MONITOR_ROW,
+                "update-notes"
+            ]
         );
         assert!(
             ROWS.iter()
                 .filter(|row| ungrouped.contains(&row.id))
-                .all(|row| matches!(row.draw, Draw::Page(_)))
+                .all(|row| row.section == SettingsSection::General
+                    || matches!(row.draw, Draw::Page(_)))
         );
         // Each section's labels top to bottom; a page row stands for its own.
         let groups = |section| {
@@ -6512,8 +6839,8 @@ mod tests {
             groups(SettingsSection::Notifications),
             ["Delivery", "Events", "Sound"]
         );
-        // The shell choice is Windows only, and General's only row group.
-        assert_eq!(groups(SettingsSection::General), ["Start"]);
+        // General draws no group label; its shell choice is Windows only.
+        assert!(rows_for(SettingsSection::General, "").all(|row| row.group.is_none()));
         assert_eq!(
             groups(SettingsSection::Terminal),
             ["Shell", "Font", "Dev servers", "Prompt"]
@@ -6576,5 +6903,18 @@ mod tests {
         );
         assert!(agent_places(Some("Ubuntu"), Some(&install(None, None))).is_empty());
         assert!(agent_places(Some("Ubuntu"), None).is_empty());
+    }
+
+    #[test]
+    fn left_and_right_stop_at_a_choices_ends_and_enter_goes_round() {
+        // Left and Right (no wrap) stay at the ends.
+        assert_eq!(choice_index(0, 3, false, false), 0);
+        assert_eq!(choice_index(1, 3, false, false), 0);
+        assert_eq!(choice_index(1, 3, true, false), 2);
+        assert_eq!(choice_index(2, 3, true, false), 2);
+        // Enter (forward, wrapping) goes from the last to the first.
+        assert_eq!(choice_index(2, 3, true, true), 0);
+        assert_eq!(choice_index(0, 3, false, true), 2);
+        assert_eq!(choice_index(0, 1, true, true), 0);
     }
 }
