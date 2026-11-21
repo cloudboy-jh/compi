@@ -450,6 +450,46 @@ const fn status_row(
 
 /// Every setting, in section order and, within a section, in display order.
 static ROWS: &[Row] = &[
+    // General: how you work.
+    grouped(
+        "Start",
+        row(
+            "new-tab",
+            SettingsSection::General,
+            "New tabs",
+            "What the tab strip's + and Ctrl+T open: a new thread or a shell.",
+            "chat first terminal first new tab plus ctrl+t thread shell default",
+            |_| vec![SettingsAction::NewTab],
+            |app, row, cx| app.render_new_tab_row(row, cx),
+        ),
+    ),
+    grouped(
+        "Start",
+        row(
+            "chat-agent",
+            SettingsSection::General,
+            "Default agent",
+            "Every new thread starts with it, unless its project picks another.",
+            "default agent harness new thread chat omp claude codex",
+            |_| vec![SettingsAction::ChatAgent],
+            |app, row, cx| app.render_chat_agent_row(row, cx),
+        ),
+    ),
+    shown_when(
+        |_| cfg!(windows),
+        grouped(
+            "Start",
+            row(
+                "shell",
+                SettingsSection::General,
+                "Shell",
+                "What new tabs and splits start: picked for their folder, Windows PowerShell or WSL. Compi runs commands meant for the other shell there either way.",
+                "powershell wsl linux bash windows default distribution automatic",
+                |_| vec![SettingsAction::Select(Popup::Shell)],
+                |app, row, cx| app.render_shell_row(row, cx),
+            ),
+        ),
+    ),
     // Appearance; Quick Appearance shows these too.
     in_header(row(
         "scope",
@@ -1030,34 +1070,7 @@ static ROWS: &[Row] = &[
             |app, row, cx| app.render_prompt_group(row, cx),
         ),
     ),
-    shown_when(
-        |_| cfg!(windows),
-        grouped(
-            "Advanced",
-            row(
-                "shell",
-                SettingsSection::Terminal,
-                "Shell",
-                "What new tabs and splits start: picked for their folder, Windows PowerShell or WSL.",
-                "powershell wsl linux bash windows default distribution automatic",
-                |_| vec![SettingsAction::Select(Popup::Shell)],
-                |app, row, cx| app.render_shell_row(row, cx),
-            ),
-        ),
-    ),
     // Chat.
-    grouped(
-        "Agent",
-        row(
-            "chat-agent",
-            SettingsSection::Chat,
-            "Default agent",
-            "Every new thread starts with it.",
-            "default agent harness new thread chat",
-            |_| vec![SettingsAction::ChatAgent],
-            |app, row, cx| app.render_chat_agent_row(row, cx),
-        ),
-    ),
     grouped(
         "Agent",
         row(
@@ -1105,18 +1118,6 @@ static ROWS: &[Row] = &[
             "steer queue send key ctrl cmd turn message composer agent",
             |_| vec![SettingsAction::ChatEnter],
             |app, row, cx| app.render_chat_enter_row(row, cx),
-        ),
-    ),
-    grouped(
-        "Opening",
-        row(
-            "new-tab",
-            SettingsSection::Chat,
-            "New tabs",
-            "What the tab strip's + and Ctrl+T open: a new thread or a shell.",
-            "chat first terminal first new tab plus ctrl+t thread shell default",
-            |_| vec![SettingsAction::NewTab],
-            |app, row, cx| app.render_new_tab_row(row, cx),
         ),
     ),
     grouped(
@@ -1572,6 +1573,9 @@ fn terminal_key_notice(keys: &str) -> Option<String> {
 /// The line under `section`'s heading: what its page covers.
 fn section_summary(section: SettingsSection) -> &'static str {
     match section {
+        SettingsSection::General => {
+            "How you work: what new tabs open, which agent new threads use, and the shell."
+        }
         SettingsSection::Appearance => "Theme and how the window looks.",
         SettingsSection::Interface => {
             "Fonts, pane layout, tab details, closing, focus and program status."
@@ -5904,6 +5908,7 @@ pub(super) fn chat_approval_detail(approval: ChatApproval) -> &'static str {
 /// The section bar icon of `section`.
 fn section_icon(section: SettingsSection) -> IconName {
     match section {
+        SettingsSection::General => IconName::Settings,
         SettingsSection::Appearance => IconName::Palette,
         SettingsSection::Interface => IconName::LayoutPanelLeft,
         SettingsSection::Terminal => IconName::SquareTerminal,
@@ -6281,11 +6286,11 @@ mod tests {
             groups(SettingsSection::Notifications),
             ["Delivery", "Events", "Sound"]
         );
-        // The shell choice is Windows only.
+        // The shell choice is Windows only, and General's only row group.
+        assert_eq!(groups(SettingsSection::General), ["Start"]);
         assert_eq!(
             groups(SettingsSection::Terminal),
-            ["Shell", "Font", "Dev servers", "Prompt", "Advanced"]
-                [..if cfg!(windows) { 5 } else { 4 }]
+            ["Shell", "Font", "Dev servers", "Prompt"]
         );
         assert_eq!(
             groups(SettingsSection::Chat),

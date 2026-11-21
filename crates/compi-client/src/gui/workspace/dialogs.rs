@@ -502,7 +502,7 @@ impl CompiApp {
                             div()
                                 .text_size(px(UI_SMALL_TEXT_SIZE))
                                 .text_color(muted)
-                                .child("Change it any time in Settings → Chat → New tabs."),
+                                .child("Change it any time in Settings → General → New tabs."),
                         ),
                 ),
             window,

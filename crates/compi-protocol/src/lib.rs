@@ -1899,7 +1899,9 @@ pub enum MonitorPage {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum SettingsSection {
+    /// How you work: what new tabs open, the default agent, the shell.
     #[default]
+    General,
     Appearance,
     Interface,
     Notifications,
@@ -1916,7 +1918,8 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
+        Self::General,
         Self::Appearance,
         Self::Interface,
         Self::Notifications,
@@ -1931,6 +1934,7 @@ impl SettingsSection {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::General => "General",
             Self::Appearance => "Appearance",
             Self::Interface => "Interface",
             Self::Notifications => "Notifications",
