@@ -453,7 +453,7 @@ pub(super) enum Overlay {
 /// `context_menu` and `tab_menu` (see `menus`); opening one closes the popup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Popup {
-    /// Settings → Interface → Interface font.
+    /// Settings → Appearance → Interface font.
     UiFont,
     /// Settings → Terminal → Terminal font.
     TerminalFont,

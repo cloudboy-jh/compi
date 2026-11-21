@@ -1083,16 +1083,17 @@ impl CompiApp {
 
     /// The theme section: a header line (title, search, filter, More), notices, then
     /// every theme as a tile in `columns` equal columns, under its group's label (see
-    /// `group_themes`), filling the rest of the page in its own scroll (`grid`, whose
-    /// viewport `viewport` records). With `back`, a back control leads the header (the
-    /// terminal colors page).
+    /// `group_themes`), in its own scroll (`grid`, whose viewport `viewport` records).
+    /// On the terminal colors page (`terminal_page`) a back control leads the header and
+    /// the grid fills the rest of the page; on Appearance the grid is
+    /// `THEME_GRID_HEIGHT` tall, with the page's other cards below it.
     pub(super) fn render_theme_section(
         &self,
         row: &RowCx,
         search: &Entity<gpui_component::input::InputState>,
         (grid, viewport): (&ScrollHandle, AnyElement),
         columns: usize,
-        back: bool,
+        terminal_page: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let Some(catalog) = &self.theme_catalog else {
@@ -1134,7 +1135,7 @@ impl CompiApp {
             .items_center()
             .gap_x_3()
             .gap_y_2()
-            .when(back, |header| {
+            .when(terminal_page, |header| {
                 header.child(
                     self.settings_control(
                         row,
@@ -1307,7 +1308,8 @@ impl CompiApp {
         // No `min_h_0`: the header, notes and the grid's minimum height always fit, and a
         // short page scrolls around them.
         div()
-            .flex_1()
+            .when(terminal_page, |section| section.flex_1())
+            .when(!terminal_page, |section| section.flex_none())
             .min_w_0()
             .flex()
             .flex_col()
@@ -1317,8 +1319,8 @@ impl CompiApp {
             .child(
                 div()
                     .relative()
-                    .flex_1()
-                    .min_h(px(160.0))
+                    .when(terminal_page, |area| area.flex_1().min_h(px(160.0)))
+                    .when(!terminal_page, |area| area.h(px(THEME_GRID_HEIGHT)))
                     .child(
                         div()
                             .id("theme-grid")
@@ -1572,6 +1574,8 @@ const THEME_TILE_GAP: f32 = 12.0;
 const THEME_GRID_MAX_COLUMNS: usize = 4;
 /// Between a group's label and its first row of tiles.
 const THEME_GROUP_LABEL_GAP: f32 = 8.0;
+/// The height of the theme grid's own scroll on the Appearance page, above its cards.
+const THEME_GRID_HEIGHT: f32 = 320.0;
 
 /// How many columns the theme grid has `width` pixels across: as many tiles of the
 /// minimum width as fit, at least one and at most four. They share the row.

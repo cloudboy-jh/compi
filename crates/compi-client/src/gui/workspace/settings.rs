@@ -8,13 +8,13 @@
 //! persists with the pane; the search, scroll and keyboard highlight are this
 //! window's.
 //!
-//! A pane draws a one-line header (title, section icons, search). A section's page
-//! opens with its heading: its name and a line on what it covers, with the header rows
-//! (the scope switch, Monitor's Open as pane) at its right end. Then come its cards of
-//! rows, each under its group's label. The Appearance page and Advanced's terminal
-//! colors page end in the theme grid (`catalog`), which fills the pane and previews on
-//! the real panes until the Apply / Cancel bar decides. Monitor's page is Overview's
-//! cards, drawn on the page itself.
+//! A pane draws a one-line header (title, section icons in groups split by dividers,
+//! search). A section's page opens with its heading: its name and a line on what it
+//! covers, with the header rows (the scope switch, Monitor's Open as pane) at its right
+//! end. Then come its cards of rows, each under its group's label. The theme grid
+//! (`catalog`) leads the Appearance page in a scroll of its own and fills Advanced's
+//! terminal colors page; it previews on the real panes until the Apply / Cancel bar
+//! decides. Monitor's page is Overview's cards, drawn on the page itself.
 use super::catalog::{CatalogTarget, GridStep};
 use super::chat::SECONDARY_KEY;
 use super::project_settings::{PROJECTS_ROW, ProjectControl, ProjectFields, ProjectPart};
@@ -36,7 +36,9 @@ pub(super) const THEME_ROW: &str = "theme";
 /// Narrower than this, a pane stacks its rows: a row's control goes below its title.
 const STACKED_PANE_WIDTH: f32 = 520.0;
 /// Narrower than this, the header drops its title so the section icons fit.
-const HEADER_TITLE_MIN_WIDTH: f32 = 500.0;
+const HEADER_TITLE_MIN_WIDTH: f32 = 510.0;
+/// The room a divider between groups of section icons takes, its gap included.
+const STRIP_DIVIDER_WIDTH: f32 = 9.0;
 /// The height of the header line, and of each line of section icons when they wrap.
 const HEADER_HEIGHT: f32 = 44.0;
 /// The width of a picture tile (pane density, new tabs, an agent).
@@ -474,7 +476,7 @@ const fn metadata_row(
         "Tab details",
         row(
             id,
-            SettingsSection::Interface,
+            SettingsSection::Appearance,
             title,
             description,
             "tab caption metadata",
@@ -496,7 +498,7 @@ const fn status_row(
         "Program status",
         row(
             id,
-            SettingsSection::Interface,
+            SettingsSection::Notifications,
             title,
             description,
             "osc 7501 blocked failed working done idle",
@@ -508,7 +510,7 @@ const fn status_row(
 
 /// Every setting, in section order and, within a section, in display order.
 static ROWS: &[Row] = &[
-    // General: how you work. Its three rows are the page, with no group label.
+    // General: how you work. Its rows are the page, with no group label.
     row(
         "new-tab",
         SettingsSection::General,
@@ -539,479 +541,22 @@ static ROWS: &[Row] = &[
             |app, row, cx| app.render_shell_row(row, cx),
         ),
     ),
-    // Agents: every agent and where it is installed, then how they ask, then each one's
-    // own.
-    grouped(
-        "Programs",
-        page_row(
-            AGENTS_ROW,
-            SettingsSection::Agents,
-            "Agents",
-            "Every agent Compi chats with: where it is installed, its version, and how to install it.",
-            "installed install version program windows wsl ubuntu linux distribution default not installed npm bun",
-            |app| app.agent_stops(),
-            |app, row, _, cx| app.render_agents_page(row, cx),
-        ),
-    ),
-    grouped(
-        "Permissions",
-        row(
-            "chat-approval",
-            SettingsSection::Agents,
-            "Approvals",
-            "How the agent asks before it runs tools. Applies to new chats and chats that start again.",
-            "approval permission ask allow edits everything yolo tools agent",
-            |_| vec![SettingsAction::Select(Popup::ChatApproval)],
-            |app, row, cx| app.render_chat_approval_row(row, cx),
-        ),
-    ),
-    grouped(
-        "OMP",
-        row(
-            "chat-agents-bar",
-            SettingsSection::Agents,
-            "Agents bar",
-            "While OMP's sub-agents run, list them above the message box.",
-            "sub-agents subagents task tasks running agent omp",
-            |_| vec![SettingsAction::ToggleChatAgentsBar],
-            |app, row, cx| {
-                app.render_toggle_row(
-                    row,
-                    app.config.chat_agents_bar,
-                    SettingsAction::ToggleChatAgentsBar,
-                    row_description("chat-agents-bar"),
-                    cx,
-                )
-            },
-        ),
-    ),
-    // Appearance; Quick Appearance shows these too.
-    in_header(row(
-        "scope",
-        SettingsSection::Appearance,
-        "Scope",
-        "Change the global defaults or only this window.",
-        "global window override",
-        |_| vec![SettingsAction::Scope],
-        |app, row, cx| app.render_scope_row(row, cx),
-    )),
-    grouped(
-        "Window",
-        row(
-            "transparency",
-            SettingsSection::Appearance,
-            "Transparent background",
-            "Let the desktop show through the window.",
-            "opacity translucent glass",
-            |_| vec![SettingsAction::ToggleTransparency],
-            |app, row, cx| {
-                app.render_toggle_row(
-                    row,
-                    app.scoped_appearance().transparent_background,
-                    SettingsAction::ToggleTransparency,
-                    row_description("transparency"),
-                    cx,
-                )
-            },
-        ),
-    ),
-    // Opacity and blur only act on a transparent background; otherwise they show
-    // greyed and the keyboard passes them by.
-    grouped(
-        "Window",
-        row(
-            "opacity",
-            SettingsSection::Appearance,
-            "Opacity",
-            "How much of the desktop shows through.",
-            "transparency translucent",
-            |app| {
-                if app.scoped_appearance().transparent_background {
-                    vec![SettingsAction::Opacity]
-                } else {
-                    Vec::new()
-                }
-            },
-            |app, row, cx| app.render_opacity_row(row, cx),
-        ),
-    ),
-    grouped(
-        "Window",
-        row(
-            "blur",
-            SettingsSection::Appearance,
-            "Blur background",
-            "Soften what's behind the window.",
-            "transparency translucent glass acrylic",
-            |app| {
-                if app.scoped_appearance().transparent_background {
-                    vec![SettingsAction::ToggleBlur]
-                } else {
-                    Vec::new()
-                }
-            },
-            |app, row, cx| {
-                let appearance = app.scoped_appearance();
-                let blurred = appearance.background_effect == BackgroundEffect::Blurred;
-                if appearance.transparent_background {
-                    app.render_toggle_row(
-                        row,
-                        blurred,
-                        SettingsAction::ToggleBlur,
-                        row_description("blur"),
-                        cx,
-                    )
-                } else {
-                    app.settings_row(
-                        row.title,
-                        "Needs a transparent background.".into(),
-                        div()
-                            .opacity(0.45)
-                            .child(controls::switch((row.row, 0_usize), blurred).label(row.title))
-                            .into_any_element(),
-                        false,
-                    )
-                }
-            },
-        ),
-    ),
-    shown_when(
-        |app| app.settings_scope == SettingsScope::Window,
-        grouped(
-            "Window",
-            row(
-                "window-overrides",
-                SettingsSection::Appearance,
-                "Window overrides",
-                "Reset this window's appearance to the global defaults.",
-                "reset scope",
-                |_| vec![SettingsAction::ResetWindowAppearance],
-                |app, row, cx| {
-                    app.render_button_row(
-                        row,
-                        "Reset this window's appearance to the global defaults.".into(),
-                        "Use global defaults",
-                        SettingsAction::ResetWindowAppearance,
-                        false,
-                        cx,
-                    )
-                },
-            ),
-        ),
-    ),
-    // The theme grid; on the Appearance page it fills the rest of the pane under its
-    // own header line.
-    grouped(
-        "Theme",
-        row(
-            THEME_ROW,
-            SettingsSection::Appearance,
-            "Current theme",
-            "The color theme of the interface and terminals.",
-            "colors color scheme dark light catalog browse favorites",
-            |app| {
-                if app
-                    .theme_catalog
-                    .as_ref()
-                    .is_some_and(|catalog| catalog.target == CatalogTarget::Both)
-                {
-                    theme_grid_stops()
-                } else {
-                    vec![SettingsAction::AllThemes(CatalogTarget::Both)]
-                }
-            },
-            |app, row, cx| app.render_theme_row(row, cx),
-        ),
-    ),
-    // Interface.
-    grouped(
-        "Text",
-        row(
-            "ui-font",
-            SettingsSection::Interface,
-            "Interface font",
-            "Sidebar, tabs, menus and Settings.",
-            "typeface family ui",
-            |_| vec![SettingsAction::Select(Popup::UiFont)],
-            |app, row, cx| {
-                app.settings_row(
-                    row.title,
-                    row_description(row.row).into(),
-                    app.render_font_select(row, Popup::UiFont, cx),
-                    row.compact,
-                )
-            },
-        ),
-    ),
-    grouped(
-        "Layout",
-        row(
-            "density",
-            SettingsSection::Interface,
-            "Pane density",
-            "Rounded panes with gaps between them, or edge to edge.",
-            "comfy compact gaps spacing islands",
-            |_| vec![SettingsAction::Density],
-            |app, row, cx| app.render_density_row(row, cx),
-        ),
-    ),
-    grouped(
-        "Layout",
-        row(
-            "sidebar-width",
-            SettingsSection::Interface,
-            "Sidebar width",
-            "Drag the sidebar's edge to resize it, or reset it to its default width.",
-            "reset",
-            |_| vec![SettingsAction::ResetSidebar],
-            |app, row, cx| {
-                app.settings_row(
-                    row.title,
-                    row_description(row.row).into(),
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .child(app.settings_value(format!("{:.0} px", app.sidebar_width)))
-                        .child(app.settings_button(
-                            row,
-                            0,
-                            "Reset width",
-                            SettingsAction::ResetSidebar,
-                            cx,
-                        ))
-                        .into_any_element(),
-                    row.compact,
-                )
-            },
-        ),
-    ),
-    grouped(
-        "Layout",
-        row(
-            "window-layout",
-            SettingsSection::Interface,
-            "Window layout",
-            "Resets this window's layout without changing your tabs.",
-            "reset",
-            |_| vec![SettingsAction::ResetLayout],
-            |app, row, cx| {
-                app.render_button_row(
-                    row,
-                    row_description(row.row).into(),
-                    "Reset layout",
-                    SettingsAction::ResetLayout,
-                    false,
-                    cx,
-                )
-            },
-        ),
-    ),
-    metadata_row(
-        "metadata-directory",
-        "Directory",
-        "Show the current directory reported by the shell.",
-        |_| vec![SettingsAction::Metadata(0)],
-        |app, row, cx| app.render_metadata_row(row, 0, cx),
-    ),
-    metadata_row(
-        "metadata-process",
-        "Active process",
-        "Show the terminal foreground process, not the launcher.",
-        |_| vec![SettingsAction::Metadata(1)],
-        |app, row, cx| app.render_metadata_row(row, 1, cx),
-    ),
-    metadata_row(
-        "metadata-git",
-        "Git branch and changes",
-        "Show branch and change state in the terminal's environment.",
-        |_| vec![SettingsAction::Metadata(2)],
-        |app, row, cx| app.render_metadata_row(row, 2, cx),
-    ),
-    metadata_row(
-        "metadata-dimensions",
-        "Dimensions",
-        "Show terminal columns and rows.",
-        |_| vec![SettingsAction::Metadata(3)],
-        |app, row, cx| app.render_metadata_row(row, 3, cx),
-    ),
-    grouped(
-        "Closing",
-        row(
-            "confirm-close",
-            SettingsSection::Interface,
-            "Confirm before closing",
-            "Ask before closing a tab or pane ends its processes. Off: one click closes.",
-            "close end process prompt",
-            |_| vec![SettingsAction::ToggleConfirmClose],
-            |app, row, cx| {
-                app.render_toggle_row(
-                    row,
-                    app.config.confirm_close,
-                    SettingsAction::ToggleConfirmClose,
-                    row_description("confirm-close"),
-                    cx,
-                )
-            },
-        ),
-    ),
-    grouped(
-        "Focus",
-        row(
-            "focus-indicator",
-            SettingsSection::Interface,
-            "Focus indicator",
-            "How the focused pane is marked: marker, outline, dim or none.",
-            "marker outline dim focused pane",
-            |_| vec![SettingsAction::FocusIndicator],
-            |app, row, cx| app.render_focus_indicator_row(row, cx),
-        ),
-    ),
-    status_row(
-        "status-tabs",
-        "Tabs",
-        "Show what programs report on each tab: blocked, failed, working, done or idle.",
-        |_| vec![SettingsAction::ProgramStatus(0)],
-        |app, row, cx| app.render_status_row(row, 0, cx),
-    ),
-    status_row(
-        "status-panes",
-        "Panes",
-        "Show it on each pane's top edge and floating title strip.",
-        |_| vec![SettingsAction::ProgramStatus(1)],
-        |app, row, cx| app.render_status_row(row, 1, cx),
-    ),
-    status_row(
-        "status-sidebar",
-        "Sidebar and palette",
-        "Show it as a dot on each sidebar card, and first in each palette tab's status line.",
-        |_| vec![SettingsAction::ProgramStatus(2)],
-        |app, row, cx| app.render_status_row(row, 2, cx),
-    ),
-    // Notifications.
-    grouped(
-        "Delivery",
-        row(
-            "notification-delivery",
-            SettingsSection::Notifications,
-            "Show notifications",
-            "Where notifications appear: in Compi, from the system, or both.",
-            "notify alert toast banner system in-app automatic both",
-            |_| vec![SettingsAction::Select(Popup::NotificationDelivery)],
-            |app, row, cx| app.render_notification_delivery_row(row, cx),
-        ),
-    ),
-    grouped(
-        "Delivery",
-        row(
-            "notification-system",
-            SettingsSection::Notifications,
-            "System notifications",
-            "Whether the system shows Compi's notifications.",
-            "notify permission focus assist do not disturb windows macos",
-            |_| {
-                if crate::gui::os_notifications::SETTINGS_URL.is_some() {
-                    vec![SettingsAction::OpenNotificationSystemSettings]
-                } else {
-                    Vec::new()
-                }
-            },
-            |app, row, cx| app.render_notification_system_row(row, cx),
-        ),
-    ),
-    grouped(
-        "Delivery",
-        row(
-            "notification-test",
-            SettingsSection::Notifications,
-            "Test notification",
-            "Sends one now with these settings.",
-            "notify try check preview",
-            |_| vec![SettingsAction::TestNotification],
-            |app, row, cx| {
-                app.render_button_row(
-                    row,
-                    app.notifications
-                        .test_result()
-                        .unwrap_or(row_description("notification-test"))
-                        .to_owned(),
-                    "Send test",
-                    SettingsAction::TestNotification,
-                    false,
-                    cx,
-                )
-            },
-        ),
-    ),
-    grouped(
-        "Events",
-        row(
-            "notification-attention",
-            SettingsSection::Notifications,
-            "Needs attention",
-            "A program asks for permission, a question's answer or a sign-in.",
-            "notify blocked permission question sign in osc 7501",
-            |_| vec![SettingsAction::NotificationAttention],
-            |app, row, cx| {
-                app.render_toggle_row(
-                    row,
-                    app.config.notifications.attention,
-                    SettingsAction::NotificationAttention,
-                    row_description("notification-attention"),
-                    cx,
-                )
-            },
-        ),
-    ),
-    grouped(
-        "Events",
-        row(
-            "notification-finished",
-            SettingsSection::Notifications,
-            "Finished",
-            "A program reports its work done.",
-            "notify done complete osc 7501",
-            |_| vec![SettingsAction::NotificationFinished],
-            |app, row, cx| {
-                app.render_toggle_row(
-                    row,
-                    app.config.notifications.finished,
-                    SettingsAction::NotificationFinished,
-                    row_description("notification-finished"),
-                    cx,
-                )
-            },
-        ),
-    ),
-    grouped(
-        "Events",
-        row(
-            "notification-focused-pane",
-            SettingsSection::Notifications,
-            "Focused pane",
-            "When the pane you're in notifies too: after you stop typing, clicking or scrolling for a while.",
-            "notify idle away active focused current pane typing inactive",
-            |_| vec![SettingsAction::Select(Popup::NotificationFocusedPane)],
-            |app, row, cx| app.render_notification_focused_pane_row(row, cx),
-        ),
-    ),
-    grouped(
-        "Sound",
-        row(
-            "notification-sound",
-            SettingsSection::Notifications,
-            "Notification sound",
-            "The sound a notification plays, when the system's sound and quiet settings allow it.",
-            "notify audio chime bell play preview",
-            |app| {
-                let mut stops = vec![SettingsAction::Select(Popup::NotificationSound)];
-                if app.config.notifications.sound != crate::config::NotificationSound::Off {
-                    stops.push(SettingsAction::PlayNotificationSound);
-                }
-                stops
-            },
-            |app, row, cx| app.render_notification_sound_row(row, cx),
-        ),
+    row(
+        "confirm-close",
+        SettingsSection::General,
+        "Confirm before closing",
+        "Ask before closing a tab or pane ends its processes. Off: one click closes.",
+        "close closing end process prompt",
+        |_| vec![SettingsAction::ToggleConfirmClose],
+        |app, row, cx| {
+            app.render_toggle_row(
+                row,
+                app.config.confirm_close,
+                SettingsAction::ToggleConfirmClose,
+                row_description("confirm-close"),
+                cx,
+            )
+        },
     ),
     // Terminal.
     grouped(
@@ -1214,6 +759,52 @@ static ROWS: &[Row] = &[
             |app, row, cx| app.render_chat_open_row(row, cx),
         ),
     ),
+    // Agents: every agent and where it is installed, then how they ask, then each one's
+    // own.
+    grouped(
+        "Programs",
+        page_row(
+            AGENTS_ROW,
+            SettingsSection::Agents,
+            "Agents",
+            "Every agent Compi chats with: where it is installed, its version, and how to install it.",
+            "installed install version program windows wsl ubuntu linux distribution default not installed npm bun",
+            |app| app.agent_stops(),
+            |app, row, _, cx| app.render_agents_page(row, cx),
+        ),
+    ),
+    grouped(
+        "Permissions",
+        row(
+            "chat-approval",
+            SettingsSection::Agents,
+            "Approvals",
+            "How the agent asks before it runs tools. Applies to new chats and chats that start again.",
+            "approval permission ask allow edits everything yolo tools agent",
+            |_| vec![SettingsAction::Select(Popup::ChatApproval)],
+            |app, row, cx| app.render_chat_approval_row(row, cx),
+        ),
+    ),
+    grouped(
+        "OMP",
+        row(
+            "chat-agents-bar",
+            SettingsSection::Agents,
+            "Agents bar",
+            "While OMP's sub-agents run, list them above the message box.",
+            "sub-agents subagents task tasks running agent omp",
+            |_| vec![SettingsAction::ToggleChatAgentsBar],
+            |app, row, cx| {
+                app.render_toggle_row(
+                    row,
+                    app.config.chat_agents_bar,
+                    SettingsAction::ToggleChatAgentsBar,
+                    row_description("chat-agents-bar"),
+                    cx,
+                )
+            },
+        ),
+    ),
     // Projects.
     page_row(
         PROJECTS_ROW,
@@ -1223,6 +814,268 @@ static ROWS: &[Row] = &[
         "project projects folder repository rename name icon emoji monogram logo favicon pin pinned agent model new thread archive archived unarchive remove delete forget reveal open tab",
         |app| app.project_stops(),
         |app, row, _, cx| app.render_projects_page(row, cx),
+    ),
+    // Appearance: how Compi looks. Quick Appearance shows the scope, Window and Theme
+    // rows; see `quick_rows`.
+    in_header(row(
+        "scope",
+        SettingsSection::Appearance,
+        "Scope",
+        "Change the global defaults or only this window.",
+        "global window override",
+        |_| vec![SettingsAction::Scope],
+        |app, row, cx| app.render_scope_row(row, cx),
+    )),
+    // The theme grid; on the Appearance page it heads the page under its own header
+    // line, in a scroll of its own.
+    grouped(
+        "Theme",
+        row(
+            THEME_ROW,
+            SettingsSection::Appearance,
+            "Current theme",
+            "The color theme of the interface and terminals.",
+            "colors color scheme dark light catalog browse favorites",
+            |app| {
+                if app
+                    .theme_catalog
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.target == CatalogTarget::Both)
+                {
+                    theme_grid_stops()
+                } else {
+                    vec![SettingsAction::AllThemes(CatalogTarget::Both)]
+                }
+            },
+            |app, row, cx| app.render_theme_row(row, cx),
+        ),
+    ),
+    grouped(
+        "Window",
+        row(
+            "transparency",
+            SettingsSection::Appearance,
+            "Transparent background",
+            "Let the desktop show through the window.",
+            "opacity translucent glass",
+            |_| vec![SettingsAction::ToggleTransparency],
+            |app, row, cx| {
+                app.render_toggle_row(
+                    row,
+                    app.scoped_appearance().transparent_background,
+                    SettingsAction::ToggleTransparency,
+                    row_description("transparency"),
+                    cx,
+                )
+            },
+        ),
+    ),
+    // Opacity and blur only act on a transparent background; otherwise they show
+    // greyed and the keyboard passes them by.
+    grouped(
+        "Window",
+        row(
+            "opacity",
+            SettingsSection::Appearance,
+            "Opacity",
+            "How much of the desktop shows through.",
+            "transparency translucent",
+            |app| {
+                if app.scoped_appearance().transparent_background {
+                    vec![SettingsAction::Opacity]
+                } else {
+                    Vec::new()
+                }
+            },
+            |app, row, cx| app.render_opacity_row(row, cx),
+        ),
+    ),
+    grouped(
+        "Window",
+        row(
+            "blur",
+            SettingsSection::Appearance,
+            "Blur background",
+            "Soften what's behind the window.",
+            "transparency translucent glass acrylic",
+            |app| {
+                if app.scoped_appearance().transparent_background {
+                    vec![SettingsAction::ToggleBlur]
+                } else {
+                    Vec::new()
+                }
+            },
+            |app, row, cx| {
+                let appearance = app.scoped_appearance();
+                let blurred = appearance.background_effect == BackgroundEffect::Blurred;
+                if appearance.transparent_background {
+                    app.render_toggle_row(
+                        row,
+                        blurred,
+                        SettingsAction::ToggleBlur,
+                        row_description("blur"),
+                        cx,
+                    )
+                } else {
+                    app.settings_row(
+                        row.title,
+                        "Needs a transparent background.".into(),
+                        div()
+                            .opacity(0.45)
+                            .child(controls::switch((row.row, 0_usize), blurred).label(row.title))
+                            .into_any_element(),
+                        false,
+                    )
+                }
+            },
+        ),
+    ),
+    shown_when(
+        |app| app.settings_scope == SettingsScope::Window,
+        grouped(
+            "Window",
+            row(
+                "window-overrides",
+                SettingsSection::Appearance,
+                "Window overrides",
+                "Reset this window's appearance to the global defaults.",
+                "reset scope",
+                |_| vec![SettingsAction::ResetWindowAppearance],
+                |app, row, cx| {
+                    app.render_button_row(
+                        row,
+                        "Reset this window's appearance to the global defaults.".into(),
+                        "Use global defaults",
+                        SettingsAction::ResetWindowAppearance,
+                        false,
+                        cx,
+                    )
+                },
+            ),
+        ),
+    ),
+    grouped(
+        "Text",
+        row(
+            "ui-font",
+            SettingsSection::Appearance,
+            "Interface font",
+            "Sidebar, tabs, menus and Settings.",
+            "typeface family ui",
+            |_| vec![SettingsAction::Select(Popup::UiFont)],
+            |app, row, cx| {
+                app.settings_row(
+                    row.title,
+                    row_description(row.row).into(),
+                    app.render_font_select(row, Popup::UiFont, cx),
+                    row.compact,
+                )
+            },
+        ),
+    ),
+    grouped(
+        "Layout",
+        row(
+            "density",
+            SettingsSection::Appearance,
+            "Pane density",
+            "Rounded panes with gaps between them, or edge to edge.",
+            "comfy compact gaps spacing islands",
+            |_| vec![SettingsAction::Density],
+            |app, row, cx| app.render_density_row(row, cx),
+        ),
+    ),
+    grouped(
+        "Layout",
+        row(
+            "sidebar-width",
+            SettingsSection::Appearance,
+            "Sidebar width",
+            "Drag the sidebar's edge to resize it, or reset it to its default width.",
+            "reset",
+            |_| vec![SettingsAction::ResetSidebar],
+            |app, row, cx| {
+                app.settings_row(
+                    row.title,
+                    row_description(row.row).into(),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(app.settings_value(format!("{:.0} px", app.sidebar_width)))
+                        .child(app.settings_button(
+                            row,
+                            0,
+                            "Reset width",
+                            SettingsAction::ResetSidebar,
+                            cx,
+                        ))
+                        .into_any_element(),
+                    row.compact,
+                )
+            },
+        ),
+    ),
+    grouped(
+        "Layout",
+        row(
+            "window-layout",
+            SettingsSection::Appearance,
+            "Window layout",
+            "Resets this window's layout without changing your tabs.",
+            "reset",
+            |_| vec![SettingsAction::ResetLayout],
+            |app, row, cx| {
+                app.render_button_row(
+                    row,
+                    row_description(row.row).into(),
+                    "Reset layout",
+                    SettingsAction::ResetLayout,
+                    false,
+                    cx,
+                )
+            },
+        ),
+    ),
+    metadata_row(
+        "metadata-directory",
+        "Directory",
+        "Show the current directory reported by the shell.",
+        |_| vec![SettingsAction::Metadata(0)],
+        |app, row, cx| app.render_metadata_row(row, 0, cx),
+    ),
+    metadata_row(
+        "metadata-process",
+        "Active process",
+        "Show the terminal foreground process, not the launcher.",
+        |_| vec![SettingsAction::Metadata(1)],
+        |app, row, cx| app.render_metadata_row(row, 1, cx),
+    ),
+    metadata_row(
+        "metadata-git",
+        "Git branch and changes",
+        "Show branch and change state in the terminal's environment.",
+        |_| vec![SettingsAction::Metadata(2)],
+        |app, row, cx| app.render_metadata_row(row, 2, cx),
+    ),
+    metadata_row(
+        "metadata-dimensions",
+        "Dimensions",
+        "Show terminal columns and rows.",
+        |_| vec![SettingsAction::Metadata(3)],
+        |app, row, cx| app.render_metadata_row(row, 3, cx),
+    ),
+    grouped(
+        "Focus",
+        row(
+            "focus-indicator",
+            SettingsSection::Appearance,
+            "Focus indicator",
+            "How the focused pane is marked: marker, outline, dim or none.",
+            "marker outline dim focused pane",
+            |_| vec![SettingsAction::FocusIndicator],
+            |app, row, cx| app.render_focus_indicator_row(row, cx),
+        ),
     ),
     // Keyboard.
     page_row(
@@ -1234,6 +1087,152 @@ static ROWS: &[Row] = &[
         // The commands the pane's search leaves; see `CompiApp::command_stops`.
         |_| Vec::new(),
         |app, row, _, cx| app.render_commands_page(row, cx),
+    ),
+    // Notifications: when and where Compi tells you, then where program status shows.
+    grouped(
+        "Delivery",
+        row(
+            "notification-delivery",
+            SettingsSection::Notifications,
+            "Show notifications",
+            "Where notifications appear: in Compi, from the system, or both.",
+            "notify alert toast banner system in-app automatic both",
+            |_| vec![SettingsAction::Select(Popup::NotificationDelivery)],
+            |app, row, cx| app.render_notification_delivery_row(row, cx),
+        ),
+    ),
+    grouped(
+        "Delivery",
+        row(
+            "notification-system",
+            SettingsSection::Notifications,
+            "System notifications",
+            "Whether the system shows Compi's notifications.",
+            "notify permission focus assist do not disturb windows macos",
+            |_| {
+                if crate::gui::os_notifications::SETTINGS_URL.is_some() {
+                    vec![SettingsAction::OpenNotificationSystemSettings]
+                } else {
+                    Vec::new()
+                }
+            },
+            |app, row, cx| app.render_notification_system_row(row, cx),
+        ),
+    ),
+    grouped(
+        "Delivery",
+        row(
+            "notification-test",
+            SettingsSection::Notifications,
+            "Test notification",
+            "Sends one now with these settings.",
+            "notify try check preview",
+            |_| vec![SettingsAction::TestNotification],
+            |app, row, cx| {
+                app.render_button_row(
+                    row,
+                    app.notifications
+                        .test_result()
+                        .unwrap_or(row_description("notification-test"))
+                        .to_owned(),
+                    "Send test",
+                    SettingsAction::TestNotification,
+                    false,
+                    cx,
+                )
+            },
+        ),
+    ),
+    grouped(
+        "Events",
+        row(
+            "notification-attention",
+            SettingsSection::Notifications,
+            "Needs attention",
+            "A program asks for permission, a question's answer or a sign-in.",
+            "notify blocked permission question sign in osc 7501",
+            |_| vec![SettingsAction::NotificationAttention],
+            |app, row, cx| {
+                app.render_toggle_row(
+                    row,
+                    app.config.notifications.attention,
+                    SettingsAction::NotificationAttention,
+                    row_description("notification-attention"),
+                    cx,
+                )
+            },
+        ),
+    ),
+    grouped(
+        "Events",
+        row(
+            "notification-finished",
+            SettingsSection::Notifications,
+            "Finished",
+            "A program reports its work done.",
+            "notify done complete osc 7501",
+            |_| vec![SettingsAction::NotificationFinished],
+            |app, row, cx| {
+                app.render_toggle_row(
+                    row,
+                    app.config.notifications.finished,
+                    SettingsAction::NotificationFinished,
+                    row_description("notification-finished"),
+                    cx,
+                )
+            },
+        ),
+    ),
+    grouped(
+        "Events",
+        row(
+            "notification-focused-pane",
+            SettingsSection::Notifications,
+            "Focused pane",
+            "When the pane you're in notifies too: after you stop typing, clicking or scrolling for a while.",
+            "notify idle away active focused current pane typing inactive",
+            |_| vec![SettingsAction::Select(Popup::NotificationFocusedPane)],
+            |app, row, cx| app.render_notification_focused_pane_row(row, cx),
+        ),
+    ),
+    grouped(
+        "Sound",
+        row(
+            "notification-sound",
+            SettingsSection::Notifications,
+            "Notification sound",
+            "The sound a notification plays, when the system's sound and quiet settings allow it.",
+            "notify audio chime bell play preview",
+            |app| {
+                let mut stops = vec![SettingsAction::Select(Popup::NotificationSound)];
+                if app.config.notifications.sound != crate::config::NotificationSound::Off {
+                    stops.push(SettingsAction::PlayNotificationSound);
+                }
+                stops
+            },
+            |app, row, cx| app.render_notification_sound_row(row, cx),
+        ),
+    ),
+    status_row(
+        "status-tabs",
+        "Tabs",
+        "Show what programs report on each tab: blocked, failed, working, done or idle.",
+        |_| vec![SettingsAction::ProgramStatus(0)],
+        |app, row, cx| app.render_status_row(row, 0, cx),
+    ),
+    status_row(
+        "status-panes",
+        "Panes",
+        "Show it on each pane's top edge and floating title strip.",
+        |_| vec![SettingsAction::ProgramStatus(1)],
+        |app, row, cx| app.render_status_row(row, 1, cx),
+    ),
+    status_row(
+        "status-sidebar",
+        "Sidebar and palette",
+        "Show it as a dot on each sidebar card, and first in each palette tab's status line.",
+        |_| vec![SettingsAction::ProgramStatus(2)],
+        |app, row, cx| app.render_status_row(row, 2, cx),
     ),
     // Monitor.
     in_header(row(
@@ -1589,6 +1588,12 @@ fn rows_for(section: SettingsSection, query: &str) -> impl Iterator<Item = &'sta
     })
 }
 
+/// Whether Quick Appearance shows `row`: Appearance's scope, Window and Theme rows.
+fn quick(row: &Row) -> bool {
+    row.section == SettingsSection::Appearance
+        && (row.header || matches!(row.group, Some("Window" | "Theme")))
+}
+
 /// The commands (indices in `commands::REGISTRY`) the command list shows for the
 /// lowercased `query`: those it matches, or all of them when it matches none (the
 /// list itself matched) or there is none.
@@ -1661,26 +1666,29 @@ fn agent_places(distribution: Option<&str>, install: Option<&AgentInstall>) -> V
 fn section_summary(section: SettingsSection) -> &'static str {
     match section {
         SettingsSection::General => {
-            "How you work: what new tabs open, which agent new threads use, and the shell."
+            "How you work: what new tabs open, which agent new threads use, the shell, and \
+             closing."
         }
-        SettingsSection::Appearance => "Theme and how the window looks.",
-        SettingsSection::Interface => {
-            "Fonts, pane layout, tab details, closing, focus and program status."
-        }
-        SettingsSection::Notifications => "When and where Compi tells you a program needs you.",
         SettingsSection::Terminal => "Starting folder, font, dev servers, prompt and shell.",
+        SettingsSection::Chat => "How agent chats look and behave.",
         SettingsSection::Agents => {
             "Every agent: where it is installed and its version, and how agents ask before \
              they run tools."
         }
-        SettingsSection::Chat => "How agent chats look and behave.",
         SettingsSection::Projects => {
             "Pick a project to set its name, icon and pin, what its new threads start with, \
              or to archive or remove it."
         }
+        SettingsSection::Appearance => {
+            "Theme, window, interface font, pane layout, tab details and focus."
+        }
         SettingsSection::Keyboard => {
             "Click a shortcut, then press the new keys. Escape cancels; Backspace leaves the \
              command without one."
+        }
+        SettingsSection::Notifications => {
+            "When and where Compi tells you a program needs you, and where program status \
+             shows."
         }
         SettingsSection::Monitor => "This computer's processes and what they use.",
         SettingsSection::Updates => "Compi's version, what's new and how it updates.",
@@ -1850,11 +1858,14 @@ impl CompiApp {
             .collect()
     }
 
-    /// The Appearance rows Quick Appearance shows now.
+    /// The Appearance rows Quick Appearance shows now: the scope and Window, then the
+    /// theme's way on to Settings.
     fn quick_rows(&self) -> Vec<&'static Row> {
-        rows_for(SettingsSection::Appearance, "")
-            .filter(|row| (row.shown)(self))
-            .collect()
+        let mut rows: Vec<_> = rows_for(SettingsSection::Appearance, "")
+            .filter(|row| quick(row) && (row.shown)(self))
+            .collect();
+        rows.sort_by_key(|row| row.id == THEME_ROW);
+        rows
     }
 
     /// The keyboard order where `host` draws.
@@ -3527,9 +3538,10 @@ impl CompiApp {
     }
 
     /// The header line of the Settings pane `pane_id`: the title, the section icons
-    /// (the current one lit: drawn in the accent, filled and underlined) and the search
-    /// icon; or while searching, the title and the search field in their place. Too
-    /// narrow for every icon on one line, the icons wrap onto lines of their own.
+    /// (the current one lit: drawn in the accent, filled and underlined) with a thin
+    /// divider between their groups, and the search icon; or while searching, the title
+    /// and the search field in their place. Too narrow for every icon on one line, the
+    /// icons wrap onto lines of their own, without dividers.
     fn render_settings_header(
         &self,
         pane_id: &PaneId,
@@ -3542,7 +3554,12 @@ impl CompiApp {
         let titled = width >= HEADER_TITLE_MIN_WIDTH;
         // The icons' room: the pane less the padding, the search icon and the gaps.
         let strip_room = width - 32.0 - 24.0 - 12.0;
-        let strip_width = SettingsSection::ALL.len() as f32 * 28.0 + 4.0;
+        let dividers = SettingsSection::ALL
+            .into_iter()
+            .filter(|section| opens_strip_group(*section))
+            .count();
+        let strip_width =
+            SettingsSection::ALL.len() as f32 * 28.0 + 4.0 + dividers as f32 * STRIP_DIVIDER_WIDTH;
         let wrapped = !titled && strip_room < strip_width;
         let line_height = if wrapped { 34.0 } else { HEADER_HEIGHT };
         let header = div()
@@ -3588,7 +3605,17 @@ impl CompiApp {
         let entries = SettingsSection::ALL
             .into_iter()
             .enumerate()
-            .map(|(index, section)| {
+            .flat_map(|(index, section)| {
+                let divider = (!wrapped && opens_strip_group(section)).then(|| {
+                    div()
+                        .flex_none()
+                        .h(px(line_height))
+                        .mx(px(2.0))
+                        .flex()
+                        .items_center()
+                        .child(div().w(px(1.0)).h(px(16.0)).bg(color(colors.border)))
+                        .into_any_element()
+                });
                 let active = pane.section == section;
                 let focused = self.settings.section_ring
                     && self.settings.focus.as_ref()
@@ -3619,7 +3646,7 @@ impl CompiApp {
                 }));
                 // The entry fills its line's height: the icon centred, its ring clear of
                 // the edges, and the underline on the line's bottom edge.
-                div()
+                let entry = div()
                     .relative()
                     .flex_none()
                     .h(px(line_height))
@@ -3641,6 +3668,8 @@ impl CompiApp {
                                 .bg(color(colors.accent)),
                         )
                     })
+                    .into_any_element();
+                divider.into_iter().chain([entry])
             });
         let open = pane_id.clone();
         header
@@ -6230,9 +6259,10 @@ impl CompiApp {
     }
 
     /// A Settings pane: the header line, then the section's page, the search results
-    /// or the terminal colors page, and the theme preview's bar at the foot. Pages with
-    /// the theme grid (Appearance, terminal colors) fill the pane, the grid taking the
-    /// height left in its own scroll; the others scroll as a column of cards.
+    /// or the terminal colors page, and the theme preview's bar at the foot. The terminal
+    /// colors page fills the pane, the grid taking the height left in its own scroll;
+    /// Appearance leads with the grid, its own scroll a fixed height, and the others are
+    /// a column of cards. Each page scrolls as a whole.
     pub(super) fn render_settings_pane(
         &self,
         pane_id: &PaneId,
@@ -6283,45 +6313,58 @@ impl CompiApp {
                 terminal_page,
                 cx,
             );
-            // No `min_h_0`: the page is at least its cards plus the grid's minimum, so a
-            // short pane scrolls the page instead of drawing past its bottom.
-            let mut page = div().flex_1().min_w_0().flex().flex_col().gap_6();
-            if !terminal_page {
+            let page = div().flex_1().min_w_0().flex().flex_col().gap_6();
+            let page = if terminal_page {
+                // No `min_h_0`: the page is at least the grid's minimum, so a short pane
+                // scrolls the page instead of drawing past its bottom.
+                page.child(grid)
+            } else {
+                // Appearance: the heading, the theme grid, then the other groups' cards.
                 let (header, rows): (Vec<_>, Vec<_>) = rows
                     .into_iter()
                     .filter(|row| row.id != THEME_ROW)
                     .partition(|row| row.header);
-                page = page
-                    .child(div().flex_none().child(self.render_settings_heading(
-                        &host,
-                        pane.section,
-                        &header,
-                        cx,
-                    )))
-                    .children(
-                        self.render_settings_cards(&host, &rows, false, stacked, page_width, cx)
-                            .into_iter()
-                            .map(|card| div().flex_none().child(card)),
-                    );
-            }
-            // Short panes scroll the whole page; the grid keeps a usable height.
+                page.child(div().flex_none().child(self.render_settings_heading(
+                    &host,
+                    pane.section,
+                    &header,
+                    cx,
+                )))
+                .child(grid)
+                .children(
+                    self.render_settings_cards(&host, &rows, false, stacked, page_width, cx)
+                        .into_iter()
+                        .map(|card| div().flex_none().child(card)),
+                )
+            };
+            // Appearance's page scrolls on the pane's scroll, so the keyboard brings its
+            // cards into view; the terminal colors page keeps the page it came from's.
             div()
-                .id("settings-theme-page")
                 .relative()
-                .flex_1()
-                .min_h_0()
                 .min_w_0()
                 .flex()
-                .flex_col()
-                .overflow_y_scroll()
-                .px(px(margin))
-                .py_5()
+                .min_h_0()
+                .flex_1()
                 .child(
-                    page.w_full()
-                        .max_w(px(PAGE_MAX_WIDTH))
-                        .mx_auto()
-                        .child(grid),
+                    div()
+                        .id("settings-theme-page")
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .overflow_y_scroll()
+                        .when(!terminal_page, |scroll| {
+                            scroll.track_scroll(&pane.scroll.handle)
+                        })
+                        .px(px(margin))
+                        .py_5()
+                        .child(page.w_full().max_w(px(PAGE_MAX_WIDTH)).mx_auto()),
                 )
+                .when(!terminal_page, |page| {
+                    page.child(self.settings_scroll_viewport(host.clone(), false, cx))
+                })
                 .into_any_element()
         } else {
             let body = if searching && rows.is_empty() {
@@ -6555,18 +6598,30 @@ pub(super) fn chat_approval_detail(approval: ChatApproval) -> &'static str {
 fn section_icon(section: SettingsSection) -> IconName {
     match section {
         SettingsSection::General => IconName::Settings,
-        SettingsSection::Agents => IconName::Bot,
-        SettingsSection::Appearance => IconName::Palette,
-        SettingsSection::Interface => IconName::LayoutPanelLeft,
         SettingsSection::Terminal => IconName::SquareTerminal,
+        SettingsSection::Chat => IconName::MessageSquare,
+        SettingsSection::Agents => IconName::Bot,
+        SettingsSection::Projects => IconName::FolderCog,
+        SettingsSection::Appearance => IconName::Palette,
         SettingsSection::Keyboard => IconName::Keyboard,
+        SettingsSection::Notifications => IconName::Bell,
         SettingsSection::Monitor => IconName::Gauge,
         SettingsSection::Updates => IconName::CircleArrowDown,
         SettingsSection::Advanced => IconName::SlidersHorizontal,
-        SettingsSection::Notifications => IconName::Bell,
-        SettingsSection::Chat => IconName::MessageSquare,
-        SettingsSection::Projects => IconName::FolderCog,
     }
+}
+
+/// Whether a divider leads `section` in the section strip, which runs General |
+/// Terminal, Chat, Agents, Projects | Appearance | Keyboard, Notifications | Monitor,
+/// Updates, Advanced.
+fn opens_strip_group(section: SettingsSection) -> bool {
+    matches!(
+        section,
+        SettingsSection::Terminal
+            | SettingsSection::Appearance
+            | SettingsSection::Keyboard
+            | SettingsSection::Monitor
+    )
 }
 
 /// A group's label: the line above its card, or a heading inside one. Quiet, so a page
@@ -6674,18 +6729,61 @@ mod tests {
             ids(""),
             [
                 "scope",
+                THEME_ROW,
                 "transparency",
                 "opacity",
                 "blur",
                 "window-overrides",
-                THEME_ROW
+                "ui-font",
+                "density",
+                "sidebar-width",
+                "window-layout",
+                "metadata-directory",
+                "metadata-process",
+                "metadata-git",
+                "metadata-dimensions",
+                "focus-indicator"
             ]
         );
         assert_eq!(ids("   "), ids(""));
+        // Quick Appearance shows the scope, Window and Theme rows of the page.
+        let shown: Vec<_> = rows_for(SettingsSection::Appearance, "")
+            .filter(|row| quick(row))
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "scope",
+                THEME_ROW,
+                "transparency",
+                "opacity",
+                "blur",
+                "window-overrides"
+            ]
+        );
         let keyboard: Vec<_> = rows_for(SettingsSection::Keyboard, "")
             .map(|row| row.id)
             .collect();
         assert_eq!(keyboard, [COMMANDS_ROW]);
+    }
+
+    #[test]
+    fn the_section_strip_runs_in_groups() {
+        let strip: Vec<_> = SettingsSection::ALL
+            .into_iter()
+            .flat_map(|section| {
+                opens_strip_group(section)
+                    .then_some("|")
+                    .into_iter()
+                    .chain([section.label()])
+            })
+            .collect();
+        assert_eq!(
+            strip.join(" "),
+            "General | Terminal Chat Agents Projects | Appearance | Keyboard Notifications \
+             | Monitor Updates Advanced"
+        );
     }
 
     #[test]
@@ -6694,12 +6792,12 @@ mod tests {
         assert_eq!(
             ids("font"),
             [
-                "ui-font",
                 "terminal-font",
                 "font-size",
                 "file-text-size",
                 "custom-typography",
                 "chat-text-size",
+                "ui-font",
                 COMMANDS_ROW
             ]
         );
@@ -6883,9 +6981,9 @@ mod tests {
             })
         );
         // The scope switch sits on the page's heading line, so it comes first in its
-        // sections, ahead of their first group: Window, and Colors in Advanced.
+        // sections, ahead of their first group: Theme, and Colors in Advanced.
         for (section, group) in [
-            (SettingsSection::Appearance, "Window"),
+            (SettingsSection::Appearance, "Theme"),
             (SettingsSection::Advanced, "Colors"),
         ] {
             let mut rows = rows_for(section, "");
@@ -6915,6 +7013,7 @@ mod tests {
                 "new-tab",
                 "chat-agent",
                 "shell",
+                "confirm-close",
                 PROJECTS_ROW,
                 COMMANDS_ROW,
                 MONITOR_ROW,
@@ -6938,21 +7037,13 @@ mod tests {
             }
             groups
         };
-        assert_eq!(groups(SettingsSection::Appearance), ["Window", "Theme"]);
         assert_eq!(
-            groups(SettingsSection::Interface),
-            [
-                "Text",
-                "Layout",
-                "Tab details",
-                "Closing",
-                "Focus",
-                "Program status"
-            ]
+            groups(SettingsSection::Appearance),
+            ["Theme", "Window", "Text", "Layout", "Tab details", "Focus"]
         );
         assert_eq!(
             groups(SettingsSection::Notifications),
-            ["Delivery", "Events", "Sound"]
+            ["Delivery", "Events", "Sound", "Program status"]
         );
         // General draws no group label; its shell choice is Windows only.
         assert!(rows_for(SettingsSection::General, "").all(|row| row.group.is_none()));

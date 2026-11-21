@@ -92,7 +92,8 @@ use std::fmt;
 // `ListThreads` (`Threads`, `ThreadInfo`), `DeleteThread`, and the mutation `OpenThread`.
 // Tabs and threads belong to a project (`Project`, `WorkspaceTab::project`,
 // `ThreadInfo::project`), with `ProjectIcon` and `SearchProjectFiles`. Settings gains
-// Projects, General and Agents sections, and `ListAgentInstalls` (`AgentInstalls`) says
+// Projects, General and Agents sections and folds Interface into Appearance ("interface"
+// still loads as Appearance), and `ListAgentInstalls` (`AgentInstalls`) says
 // where each agent is installed on the PC, with its versions. A launch profile's Windows
 // shell can be automatic (`WindowsShell::Automatic`): the daemon starts WSL in a Linux
 // folder and Windows PowerShell in a Windows one, and keeps the shell it picked on the
@@ -1907,18 +1908,20 @@ pub enum MonitorPage {
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum SettingsSection {
-    /// How you work: what new tabs open, the default agent, the shell.
+    /// How you work: what new tabs open, the default agent, the shell, closing.
     #[default]
     General,
-    /// Every agent: where it is installed, and how agents ask before running tools.
-    Agents,
-    Appearance,
-    Interface,
-    Notifications,
     Terminal,
     Chat,
+    /// Every agent: where it is installed, and how agents ask before running tools.
+    Agents,
     Projects,
+    /// How Compi looks: theme, window, interface font, layout, tab details, focus.
+    /// "interface", the section it took in, still loads as it.
+    #[serde(alias = "interface")]
+    Appearance,
     Keyboard,
+    Notifications,
     /// Monitor's Overview. Saved as "performance", the section's name before it
     /// became Monitor, so older workspace files still load.
     #[serde(rename = "performance")]
@@ -1928,16 +1931,15 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 11] = [
         Self::General,
-        Self::Agents,
-        Self::Appearance,
-        Self::Interface,
-        Self::Notifications,
         Self::Terminal,
         Self::Chat,
+        Self::Agents,
         Self::Projects,
+        Self::Appearance,
         Self::Keyboard,
+        Self::Notifications,
         Self::Monitor,
         Self::Updates,
         Self::Advanced,
@@ -1946,14 +1948,13 @@ impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
             Self::General => "General",
-            Self::Agents => "Agents",
-            Self::Appearance => "Appearance",
-            Self::Interface => "Interface",
-            Self::Notifications => "Notifications",
             Self::Terminal => "Terminal",
             Self::Chat => "Chat",
+            Self::Agents => "Agents",
             Self::Projects => "Projects",
+            Self::Appearance => "Appearance",
             Self::Keyboard => "Keyboard",
+            Self::Notifications => "Notifications",
             Self::Monitor => "Monitor",
             Self::Updates => "Updates",
             Self::Advanced => "Advanced",
@@ -3046,6 +3047,22 @@ mod content_tests {
             monitor
         );
         assert_eq!(SettingsSection::Monitor.label(), "Monitor");
+    }
+
+    #[test]
+    fn the_interface_section_opens_appearance() {
+        let saved = serde_json::json!({"kind": "settings", "section": "interface"});
+        let appearance = PaneContent::Settings(SettingsContent {
+            section: SettingsSection::Appearance,
+        });
+        assert_eq!(
+            serde_json::from_value::<PaneContent>(saved).unwrap(),
+            appearance
+        );
+        assert_eq!(
+            serde_json::to_value(&appearance).unwrap()["section"],
+            "appearance"
+        );
     }
 
     #[test]

@@ -119,7 +119,7 @@ icon = { kind = "monogram", text = "S", color = 2 } # one or two letters or numb
 
 ## Pane density
 
-**Settings → Interface → Pane density** chooses how terminal panes sit in every window, independent of themes, prompts and transparency:
+**Settings → Appearance → Pane density** chooses how terminal panes sit in every window, independent of themes, prompts and transparency:
 
 - **Comfy** (default): each pane is a rounded island with an 8 px corner radius, separated from its neighbours and the window edge by 6 px gutters. The gutters use a slightly darker shade of the terminal background, or show the window material when the background is translucent. The header has no rule under it, and dragging a gutter resizes the split. The workspace sidebar is an island too; drag the gap beside it to resize it, or double-click the gap to restore its default width.
 - **Compact**: panes touch, separated by one-pixel seams, and the sidebar sits flush against the window edge, for the most terminal space.
@@ -128,7 +128,7 @@ When more than one pane is visible, the focused pane is marked as set under **Fo
 
 ## Tab details
 
-**Settings → Interface → Tab details** writes independent global caption/hover preferences:
+**Settings → Appearance → Tab details** writes independent global caption/hover preferences:
 
 ```toml
 [metadata]
@@ -142,7 +142,7 @@ A manual tab label takes precedence over automatic names. Enabled fields follow 
 
 ## Program status
 
-**Settings → Interface → Program status** chooses where Compi shows what programs report through OSC 7501. Each place can be turned off on its own; status is still followed, so turning one back on shows the current state at once.
+**Settings → Notifications → Program status** chooses where Compi shows what programs report through OSC 7501. Each place can be turned off on its own; status is still followed, so turning one back on shows the current state at once.
 
 ```toml
 [program_status]
@@ -166,7 +166,7 @@ focused_pane_after = 30 # seconds without a key press, click or scroll in Compi 
 
 ## Closing tabs and panes
 
-Closing a tab (its ×, **Close terminal tab**) or a pane (**Close pane**) ends its processes in one click. **Settings → Interface → Confirm before closing** asks first instead; Enter closes and Esc cancels. To keep a tab's processes running, hide it instead.
+Closing a tab (its ×, **Close terminal tab**) or a pane (**Close pane**) ends its processes in one click. **Settings → General → Confirm before closing** asks first instead; Enter closes and Esc cancels. To keep a tab's processes running, hide it instead.
 
 ```toml
 [workspace]
@@ -177,7 +177,7 @@ Removing a whole workspace and restarting the daemon always ask. The `compi` CLI
 
 ## Focus indicator
 
-**Settings → Interface → Focus indicator** chooses how the focused pane stands out when more than one pane is visible:
+**Settings → Appearance → Focus indicator** chooses how the focused pane stands out when more than one pane is visible:
 
 - **Marker** (default): a short accent bar on the middle of the pane's bottom edge, plus an accent outline that fades within 0.8 s whenever focus moves to a pane.
 - **Outline**: a permanent accent outline.

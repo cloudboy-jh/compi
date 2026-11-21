@@ -139,15 +139,20 @@ fn wanted(
 ) -> Result<PaneContent, CliError> {
     Ok(if command == "settings" {
         let section = match name {
-            Some(name) => SettingsSection::ALL
-                .into_iter()
-                .find(|section| section_name(*section) == name.to_ascii_lowercase())
-                .ok_or_else(|| {
-                    CliError::usage(format!(
-                        "unknown Settings section {name}; use one of {}",
-                        SettingsSection::ALL.map(section_name).join(", ")
-                    ))
-                })?,
+            Some(name) => {
+                let lower = name.to_ascii_lowercase();
+                SettingsSection::ALL
+                    .into_iter()
+                    .find(|section| section_name(*section) == lower)
+                    // Interface, the section Appearance took in, opens it.
+                    .or((lower == "interface").then_some(SettingsSection::Appearance))
+                    .ok_or_else(|| {
+                        CliError::usage(format!(
+                            "unknown Settings section {name}; use one of {}",
+                            SettingsSection::ALL.map(section_name).join(", ")
+                        ))
+                    })?
+            }
             None => current
                 .and_then(PaneContent::settings)
                 .map(|settings| settings.section)
@@ -211,6 +216,10 @@ mod tests {
         assert_eq!(
             wanted("settings", Some("chat"), None, None).unwrap(),
             settings(SettingsSection::Chat)
+        );
+        assert_eq!(
+            wanted("settings", Some("Interface"), None, None).unwrap(),
+            settings(SettingsSection::Appearance)
         );
         assert_eq!(
             wanted(

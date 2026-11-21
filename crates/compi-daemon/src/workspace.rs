@@ -5974,7 +5974,7 @@ mod tests {
         let (actor, effects, _, _) = running_terminal();
         let before = actor.snapshot().unwrap();
         let session_id = before.sessions[0].id.clone();
-        let content = settings_content(SettingsSection::Interface);
+        let content = settings_content(SettingsSection::Notifications);
         let receipt = mutate_current(
             &actor,
             "settings-tab",
@@ -6668,7 +6668,7 @@ mod tests {
                 WorkspaceMutation::CreateContentTab {
                     session_id: session_id.clone(),
                     label: format!("t{index}"),
-                    content: settings_content(SettingsSection::Interface),
+                    content: settings_content(SettingsSection::Notifications),
                 },
             )
             .unwrap();
@@ -6820,7 +6820,7 @@ mod tests {
             WorkspaceMutation::CreateContentTab {
                 session_id: other_session,
                 label: String::new(),
-                content: settings_content(SettingsSection::Interface),
+                content: settings_content(SettingsSection::Notifications),
             },
         )
         .unwrap()
@@ -6898,7 +6898,7 @@ mod tests {
             WorkspaceMutation::CreateContentTab {
                 session_id: other_session,
                 label: String::new(),
-                content: settings_content(SettingsSection::Interface),
+                content: settings_content(SettingsSection::Notifications),
             },
         )
         .unwrap()
@@ -6993,7 +6993,7 @@ mod tests {
                     WorkspaceMutation::CreateContentTab {
                         session_id: other.clone(),
                         label: format!("o{index}"),
-                        content: settings_content(SettingsSection::Interface),
+                        content: settings_content(SettingsSection::Notifications),
                     },
                 )
                 .unwrap()
