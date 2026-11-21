@@ -17,12 +17,12 @@
 //! decides. Monitor's page is Overview's cards, drawn on the page itself.
 use super::catalog::{CatalogTarget, GridStep};
 use super::chat::SECONDARY_KEY;
-use super::project_settings::{PROJECTS_ROW, ProjectControl, ProjectFields, ProjectPart};
+use super::project_settings::{PROJECTS_ROW, ProjectControl, ProjectFields};
 use super::*;
 use crate::config::{ChatEnter, ChatOpen, DevServer, NewTab};
 use crate::gui::controls::IconName;
 use compi_protocol::chat::{AgentInstall, AgentInstalls, AgentProgram, ChatApproval, ChatHarness};
-use compi_protocol::{PaneContent, SettingsContent, SettingsSection, WindowsShell};
+use compi_protocol::{PaneContent, Project, SettingsContent, SettingsSection, WindowsShell};
 use gpui::Entity;
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -299,13 +299,10 @@ pub(in crate::gui) struct SettingsUi {
     /// The agent whose install command was copied last, until its card is looked up
     /// again.
     install_copied: Option<ChatHarness>,
-    /// The project selected on the Projects page, its detail open, by `project_key`.
-    pub(super) project_selected: Option<String>,
+    /// The Projects detail page, or `None` for the saved-project list.
+    pub(super) project_selected: Option<Project>,
     /// The Projects page lists its archived projects.
     pub(super) archived_open: bool,
-    /// The Projects page was shown in the last frame; showing it anew selects the
-    /// current tab's project.
-    pub(super) projects_shown: bool,
 }
 
 /// What a row's renderer needs: where it is drawn and how.
@@ -810,8 +807,8 @@ static ROWS: &[Row] = &[
         PROJECTS_ROW,
         SettingsSection::Projects,
         "Projects",
-        "Each project's name, icon and pin, the agent and model its new threads start with, and archiving or removing it.",
-        "project projects folder repository rename name icon emoji monogram logo favicon pin pinned agent model new thread archive archived unarchive remove delete forget reveal open tab",
+        "Add projects and manage their names, icons, pins, thread defaults, and archives.",
+        "project projects add clone folder repository rename name icon emoji monogram logo favicon pin pinned agent model new thread archive archived restore remove delete forget",
         |app| app.project_stops(),
         |app, row, _, cx| app.render_projects_page(row, cx),
     ),
@@ -1675,10 +1672,7 @@ fn section_summary(section: SettingsSection) -> &'static str {
             "Every agent: where it is installed and its version, and how agents ask before \
              they run tools."
         }
-        SettingsSection::Projects => {
-            "Pick a project to set its name, icon and pin, what its new threads start with, \
-             or to archive or remove it."
-        }
+        SettingsSection::Projects => "Saved folders and their settings.",
         SettingsSection::Appearance => {
             "Theme, window, interface font, pane layout, tab details and focus."
         }
@@ -2085,6 +2079,7 @@ impl CompiApp {
         if self.overlay.is_some() {
             self.dismiss_overlay();
         }
+        self.reset_projects_page();
         self.popup = None;
         // Asked while the pane Settings opens from still has the keyboard.
         self.read_chat_agents(cx);
@@ -2514,11 +2509,7 @@ impl CompiApp {
                 ..
             }) => ui.projects.search_focus(cx),
             Some(Stop::Control {
-                action:
-                    SettingsAction::Project(ProjectControl {
-                        part: ProjectPart::Name,
-                        ..
-                    }),
+                action: SettingsAction::Project(ProjectControl::Name),
                 ..
             }) => ui.projects.name_focus(cx),
             Some(_) => ui.focus.clone(),
@@ -2638,9 +2629,8 @@ impl CompiApp {
         }
     }
 
-    /// Escape in a Settings pane's controls: a waiting theme preview is cancelled, else
-    /// the theme list closes, else the highlight goes up to the section shown, and from
-    /// there the keyboard goes back to the terminal.
+    /// Escape cancels a theme preview or leaves a detail page first. Otherwise it
+    /// moves the highlight to the section strip, then returns to the terminal.
     pub(super) fn settings_escape(&mut self, pane_id: &PaneId) {
         let host = SettingsHost::Pane(pane_id.clone());
         if self.theme_bar_shown(pane_id) {
@@ -2649,6 +2639,10 @@ impl CompiApp {
         } else if self.theme_list_shown(pane_id) {
             self.close_theme_list();
             self.focus_theme_origin(pane_id);
+        } else if self.settings.project_selected.is_some()
+            && self.settings_pane_shows(pane_id, SettingsSection::Projects)
+        {
+            self.back_to_projects(host);
         } else if self
             .settings
             .focus
@@ -2947,17 +2941,11 @@ impl CompiApp {
             (
                 "left" | "right",
                 Some(Stop::Control {
-                    action:
-                        SettingsAction::Project(
-                            control @ ProjectControl {
-                                part: ProjectPart::Agent,
-                                ..
-                            },
-                        ),
+                    action: SettingsAction::Project(ProjectControl::Agent),
                     ..
                 }),
             ) => {
-                self.step_project_agent(control, key.key == "right", false, cx);
+                self.step_project_agent(key.key == "right", false, cx);
                 current
             }
             ("tab", _) => step(&order, current, !modifiers.shift),
@@ -3002,6 +2990,12 @@ impl CompiApp {
             }
             ("enter" | "space", Some(Stop::Control { action, .. })) => {
                 self.activate_settings_action(action, window, cx);
+                if matches!(action, SettingsAction::Project(_))
+                    && self.settings.focus.as_ref().map(|focus| focus.stop) != current
+                {
+                    // The project control moved the highlight to a different stop.
+                    return true;
+                }
                 current
             }
             _ => return false,
@@ -3024,6 +3018,7 @@ impl CompiApp {
             // The current section again: back from the theme list.
             self.close_theme_list();
         }
+        self.reset_projects_page();
         let Some(pane) = self.settings.panes.get_mut(pane_id) else {
             return;
         };
@@ -3036,6 +3031,12 @@ impl CompiApp {
             pane.search
                 .update(cx, |search, cx| search.set_value("", window, cx));
         }
+    }
+
+    fn reset_projects_page(&mut self) {
+        self.settings.project_selected = None;
+        self.settings.archived_open = false;
+        self.close_project_model_picker();
     }
 
     pub(super) fn activate_settings_action(
@@ -6223,7 +6224,7 @@ impl CompiApp {
             let continued = previous.replace((first.section, first.group))
                 == Some((first.section, first.group));
             let label: Option<SharedString> = match (search, first.group) {
-                _ if continued => None,
+                _ if continued || first.id == PROJECTS_ROW => None,
                 (true, Some(group)) => Some(format!("{} · {group}", first.section.label()).into()),
                 (true, None) => Some(first.section.label().into()),
                 (false, group) => group.map(SharedString::from),
@@ -6381,7 +6382,10 @@ impl CompiApp {
                 self.render_settings_cards(&host, &rows, true, stacked, page_width, cx)
             } else {
                 let (header, rows): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| row.header);
-                let mut body = vec![self.render_settings_heading(&host, pane.section, &header, cx)];
+                let mut body = Vec::new();
+                if pane.section != SettingsSection::Projects {
+                    body.push(self.render_settings_heading(&host, pane.section, &header, cx));
+                }
                 body.extend(
                     self.render_settings_cards(&host, &rows, false, stacked, page_width, cx),
                 );

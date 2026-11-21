@@ -959,6 +959,50 @@ impl DaemonClient {
         }
     }
 
+    /// Available environments and their absolute home folders on this daemon.
+    pub fn project_environments(&mut self) -> Result<Vec<(ContentEnvironment, Option<String>)>> {
+        match self.request_bounded(ClientMessage::ProjectEnvironments, Duration::from_secs(20))? {
+            ServerMessage::ProjectEnvironments { environments } => Ok(environments),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Validate an existing absolute folder and resolve the project it belongs to.
+    pub fn resolve_project_folder(
+        &mut self,
+        environment: ContentEnvironment,
+        path: String,
+    ) -> Result<Project> {
+        match self.request_bounded(
+            ClientMessage::ResolveProjectFolder { environment, path },
+            Duration::from_secs(30),
+        )? {
+            ServerMessage::ProjectResolved { project } => Ok(project),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
+    /// Clone a Git repository on this daemon. `destination` is the final absolute path,
+    /// including the new directory's name; it must not exist yet.
+    pub fn clone_project(
+        &mut self,
+        environment: ContentEnvironment,
+        url: String,
+        destination: String,
+    ) -> Result<Project> {
+        match self.request_bounded(
+            ClientMessage::CloneProject {
+                environment,
+                url,
+                destination,
+            },
+            Duration::from_secs(165),
+        )? {
+            ServerMessage::ProjectResolved { project } => Ok(project),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
     /// The icon image `project`'s folder holds, if it holds one.
     pub fn project_icon(&mut self, project: Project) -> Result<Option<ProjectIconImage>> {
         match self.request_bounded(

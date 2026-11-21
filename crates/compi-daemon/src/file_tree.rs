@@ -375,27 +375,7 @@ pub(crate) fn resolve_root(path: &str, distribution: Option<&str>) -> Result<Roo
 #[cfg(windows)]
 pub(crate) fn resolve_root(path: &str, distribution: Option<&str>) -> Result<Root> {
     let segments = wsl_segments(path)?;
-    // Explicit distributions are attached to the surface; their WSL2 status
-    // need only be checked once. Never cache the default: it can change while
-    // this daemon has terminals belonging to different distributions.
-    static SELECTED: LazyLock<Mutex<std::collections::HashSet<String>>> =
-        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
-    let name = if let Some(name) = distribution {
-        validate_distribution(name)?;
-        let mut selected = SELECTED
-            .lock()
-            .map_err(|_| "WSL distribution cache lock was poisoned")?;
-        if !selected.contains(name) {
-            compi_protocol::wsl::directory_distribution(Some(name))?;
-            selected.insert(name.to_owned());
-        }
-        name.to_owned()
-    } else {
-        // The native registry lookup avoids a WSL CLI process on the common path.
-        let name = compi_protocol::wsl::directory_distribution(None)?;
-        validate_distribution(&name)?;
-        name
-    };
+    let name = wsl_directory_distribution(distribution)?;
     let mut host = PathBuf::from(r"\\wsl.localhost");
     host.push(&name);
     for segment in &segments {
@@ -411,6 +391,31 @@ pub(crate) fn resolve_root(path: &str, distribution: Option<&str>) -> Result<Roo
         shell,
         distribution: Some(name),
     })
+}
+
+#[cfg(windows)]
+pub(crate) fn wsl_directory_distribution(distribution: Option<&str>) -> Result<String> {
+    // Explicit distributions are attached to the surface; their WSL2 status
+    // need only be checked once. Never cache the default: it can change while
+    // this daemon has terminals belonging to different distributions.
+    static SELECTED: LazyLock<Mutex<std::collections::HashSet<String>>> =
+        LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+    if let Some(name) = distribution {
+        validate_distribution(name)?;
+        let mut selected = SELECTED
+            .lock()
+            .map_err(|_| "WSL distribution cache lock was poisoned")?;
+        if !selected.contains(name) {
+            compi_protocol::wsl::directory_distribution(Some(name))?;
+            selected.insert(name.to_owned());
+        }
+        Ok(name.to_owned())
+    } else {
+        // The native registry lookup avoids a WSL CLI process on the common path.
+        let name = compi_protocol::wsl::directory_distribution(None)?;
+        validate_distribution(&name)?;
+        Ok(name)
+    }
 }
 
 /// Resolve an absolute native Windows path: a drive path such as `C:\folder` or a UNC share.

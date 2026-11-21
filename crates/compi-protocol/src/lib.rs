@@ -97,7 +97,8 @@ use std::fmt;
 // where each agent is installed on the PC, with its versions. A launch profile's Windows
 // shell can be automatic (`WindowsShell::Automatic`): the daemon starts WSL in a Linux
 // folder and Windows PowerShell in a Windows one, and keeps the shell it picked on the
-// surface.
+// surface. `ProjectEnvironments`, `ResolveProjectFolder` and `CloneProject` let a client
+// add existing or newly cloned projects on the daemon without opening a pane.
 pub const PROTOCOL_VERSION: u32 = 41;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
@@ -323,6 +324,19 @@ pub enum ClientMessage {
         surface_id: SurfaceId,
         root: String,
         query: String,
+    },
+    /// Available project environments and their home folders on this daemon.
+    ProjectEnvironments,
+    /// Validate an existing absolute folder and resolve the project it belongs to.
+    ResolveProjectFolder {
+        environment: ContentEnvironment,
+        path: String,
+    },
+    /// Clone into a new, absolute destination directory in the specified environment.
+    CloneProject {
+        environment: ContentEnvironment,
+        url: String,
+        destination: String,
     },
     /// The image a project's folder holds for its icon (a favicon or logo), answered by
     /// `ProjectIconFound`.
@@ -635,6 +649,13 @@ pub enum ServerMessage {
     },
     DirectorySearched {
         entries: Vec<SearchEntry>,
+    },
+    ProjectEnvironments {
+        /// Environments and their absolute home folders, when known.
+        environments: Vec<(ContentEnvironment, Option<String>)>,
+    },
+    ProjectResolved {
+        project: Project,
     },
     ProjectIconFound {
         #[serde(default, skip_serializing_if = "Option::is_none")]

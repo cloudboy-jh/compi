@@ -2,6 +2,10 @@
 //! started, else that folder), the icon image the folder holds, and an index of its files
 //! that fuzzy searches answer from.
 
+mod checkout;
+
+pub(crate) use checkout::environments;
+
 use crate::content_files::{self, Failure};
 use crate::file_tree::{self, Root};
 use compi_protocol::{ContentEnvironment, ErrorCode, ImageFormat, Project, ProjectIconImage};
@@ -75,47 +79,99 @@ const SKIPPED_FOLDERS: [&str; 3] = [".git", "node_modules", "target"];
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_RESULTS: usize = 100;
 
+type RootCache = HashMap<(ContentEnvironment, String), (Instant, Option<Project>)>;
+static ROOTS: LazyLock<Mutex<RootCache>> = LazyLock::new(Mutex::default);
+
 /// The project `folder`, an absolute folder of `environment`, belongs to: the nearest of
 /// it and its ancestors holding `.git` (a repository's folder, or the file of a worktree or
 /// submodule), else the folder itself. `None` when `folder` is not an absolute folder this
 /// host can reach there. Answers are remembered for a minute.
 pub(crate) fn project_of(environment: &ContentEnvironment, folder: &str) -> Option<Project> {
-    type Cache = HashMap<(ContentEnvironment, String), (Instant, Option<Project>)>;
-    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Mutex::default);
-    let key = (environment.clone(), folder.to_owned());
-    if let Some((at, project)) = CACHE.lock().get(&key)
+    let folder = normalized(environment, folder)?;
+    let key = (environment.clone(), folder);
+    if let Some((at, project)) = ROOTS.lock().get(&key)
         && at.elapsed() < ROOT_TTL
     {
         return project.clone();
     }
-    let project = find_project(environment, folder);
-    let mut cache = CACHE.lock();
+    let project = find_project(environment, &key.1);
+    remember_project(key, project.clone());
+    project
+}
+
+fn remember_project(key: (ContentEnvironment, String), project: Option<Project>) {
+    let mut cache = ROOTS.lock();
     if cache.len() >= MAX_CACHED {
         cache.retain(|_, (at, _)| at.elapsed() < ROOT_TTL);
         if cache.len() >= MAX_CACHED {
             cache.clear();
         }
     }
-    cache.insert(key, (Instant::now(), project.clone()));
-    project
+    cache.insert(key, (Instant::now(), project));
 }
 
 fn find_project(environment: &ContentEnvironment, folder: &str) -> Option<Project> {
-    let folder = normalized(environment, folder)?;
-    let host = share_root(environment, &folder)?.host;
-    let walked = host
-        .ancestors()
-        .position(|ancestor| ancestor.join(".git").symlink_metadata().is_ok());
-    let root = decide_root(environment, &folder, walked, || match environment {
-        ContentEnvironment::Host => None,
-        ContentEnvironment::Wsl { .. } => crate::git::work_tree_of(environment, &folder)
-            .ok()
-            .flatten(),
+    let host = share_root(environment, folder);
+    if host.is_none() {
+        // The Windows file provider cannot represent every valid Linux path.
+        checkout::validate_folder(environment, folder).ok()?;
+    }
+    Some(root_of(environment, folder, host))
+}
+
+/// Validate independently of the tab cache: an added folder must exist right now.
+pub(crate) fn resolve_folder(
+    environment: &ContentEnvironment,
+    folder: &str,
+) -> Result<Project, Failure> {
+    let folder = absolute_folder(environment, folder)?;
+    checkout::validate_folder(environment, &folder)?;
+    let project = root_of(environment, &folder, share_root(environment, &folder));
+    remember_project((environment.clone(), folder), Some(project.clone()));
+    Ok(project)
+}
+
+pub(crate) fn clone_repository(
+    environment: ContentEnvironment,
+    url: &str,
+    destination: &str,
+) -> Result<Project, Failure> {
+    let root = absolute_folder(&environment, destination)?;
+    checkout::clone_repository(&environment, url, &root)?;
+    // A successful clone has its own .git, so its project root is the new folder itself.
+    let project = Project { environment, root };
+    remember_project(
+        (project.environment.clone(), project.root.clone()),
+        Some(project.clone()),
+    );
+    Ok(project)
+}
+
+fn absolute_folder(environment: &ContentEnvironment, folder: &str) -> Result<String, Failure> {
+    normalized(environment, folder).ok_or_else(|| {
+        (
+            ErrorCode::InvalidRequest,
+            "Enter an absolute folder path in the selected environment (without '..').".into(),
+        )
+    })
+}
+
+fn root_of(environment: &ContentEnvironment, folder: &str, host: Option<Root>) -> Project {
+    let walked = host.and_then(|root| {
+        root.host
+            .ancestors()
+            .position(|ancestor| ancestor.join(".git").symlink_metadata().is_ok())
     });
-    Some(Project {
+    let root = decide_root(environment, folder, walked, || match environment {
+        ContentEnvironment::Host => None,
+        ContentEnvironment::Wsl { .. } => {
+            crate::git::work_tree_of(environment, folder).ok().flatten()
+        }
+    });
+    Project {
         environment: environment.clone(),
         root,
-    })
+    }
 }
 
 /// The project root of `folder`: its ancestor `walked` components up when a walk found
@@ -858,6 +914,30 @@ mod tests {
             assert_eq!(root(&plain), plain);
         }
         assert_eq!(project_of(&host, "relative/folder"), None);
+    }
+
+    #[test]
+    fn a_project_picker_folder_has_the_tab_identity_but_must_exist_now() {
+        let folder = Folder::new();
+        let repo = folder.dir("repo");
+        folder.dir("repo/.git");
+        let nested = folder.dir("repo/src");
+        let host = ContentEnvironment::Host;
+        let tab_project = project_of(&host, &nested).unwrap();
+        assert_eq!(tab_project.root, repo);
+        assert_eq!(resolve_folder(&host, &nested).unwrap(), tab_project);
+
+        fs::remove_dir(&nested).unwrap();
+        assert_eq!(
+            resolve_folder(&host, &nested).unwrap_err().0,
+            ErrorCode::InvalidRequest
+        );
+        folder.write("repo/src", b"now a file");
+        assert_eq!(
+            resolve_folder(&host, &nested).unwrap_err().0,
+            ErrorCode::InvalidRequest
+        );
+        assert!(resolve_folder(&host, "relative").is_err());
     }
 
     #[test]

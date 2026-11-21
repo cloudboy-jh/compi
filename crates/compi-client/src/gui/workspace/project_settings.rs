@@ -3,16 +3,8 @@
 //! Settings → Projects, where you set it. Every place a project shows reads it through
 //! these helpers, so a change applies in every window at once.
 //!
-//! The page lists every project Compi knows (of open tabs, of threads, of settings) as
-//! one compact row each: its icon, name and folder, a Pinned chip, the mark of the agent
-//! its new threads start with when it picks one, and a pin button. The rows sit under
-//! Pinned, Open, Recent and Archived, which stays folded until opened; a search shows
-//! once there are more than [`SEARCH_AFTER`]. A row opens its project's detail under
-//! it, one at a time, the current tab's project when the page shows: a large icon, the
-//! name and folder with Open in new tab and Reveal folder, then the name (edited in
-//! place: Enter saves, Escape cancels), the icon, the pin, the agent and model new
-//! threads start with, and Archive and Remove from Compi. A sidebar project header's
-//! Project settings… opens its project's.
+//! Settings lists saved projects, pinned first, with archived projects folded away.
+//! A row or a sidebar's Project settings… opens a dedicated detail page.
 //!
 //! Archiving hides a project from the palette's Projects and the page's main list; its
 //! threads and settings stay. Removing it forgets its settings and its recent entry
@@ -23,14 +15,15 @@ use super::settings::{
     settings_group_label, share_config_change,
 };
 use super::*;
-use crate::config::{NewTab, ProjectSettings, project_key};
+use crate::config::{ProjectSettings, project_key};
 use crate::gui::controls::{ChipTone, IconName};
-use crate::gui::open_with;
 use compi_protocol::chat::{ChatHarness, ChatPicks};
 use compi_protocol::{ContentEnvironment, Project, SettingsSection};
 use gpui::Entity;
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// The Projects page, one row drawn as the page.
@@ -44,66 +37,28 @@ const ROW_MARK_SIZE: f32 = 16.0;
 /// Past this many projects the page offers a search.
 const SEARCH_AFTER: usize = 8;
 
-/// A control of the Projects page: a part of the row (or detail) of `project`, its
-/// place in `CompiApp::listed_projects`.
+/// The Projects page's controls. Only list rows depend on their position in the list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ProjectControl {
-    pub(super) project: usize,
-    pub(super) part: ProjectPart,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ProjectPart {
-    /// The row: opens its detail, or closes it.
-    Select,
-    /// The row's pin button.
-    RowPin,
-    OpenTab,
-    Reveal,
+pub(super) enum ProjectControl {
+    Add,
+    Select(usize),
+    Back,
     /// The name field: the keyboard goes into it.
     Name,
     ResetName,
     ChangeIcon,
     ResetIcon,
-    /// The detail's pin switch.
     Pin,
-    /// New threads' agent: Left and Right step through Default and the agents, Enter
-    /// moves to the next.
+    /// Left and Right step through the agents; Enter moves to the next.
     Agent,
-    /// New threads' model: opens the model picker.
     Model,
-    /// Archive, or Unarchive.
     Archive,
     Remove,
 }
 
-/// Where the page lists a project.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum ProjectGroup {
-    Pinned,
-    /// A tab of it is open.
-    Open,
-    Recent,
-    Archived,
-}
-
-impl ProjectGroup {
-    const ALL: [Self; 4] = [Self::Pinned, Self::Open, Self::Recent, Self::Archived];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Pinned => "Pinned",
-            Self::Open => "Open",
-            Self::Recent => "Recent",
-            Self::Archived => "Archived",
-        }
-    }
-}
-
-/// A project the Projects page lists, and the group it sits in.
 pub(super) struct ListedProject {
     pub(super) project: Project,
-    group: ProjectGroup,
+    archived: bool,
 }
 
 /// New threads' agent choices: Default (Settings → General's), then each agent.
@@ -134,34 +89,19 @@ fn project_from_key(key: &str) -> Option<Project> {
     })
 }
 
-/// The projects `open` (of open tabs) then `recent` (of threads, then of settings), each
-/// once, by group: archived ones (`flags` says `(pinned, archived)`) last, pinned ones
-/// first, then those with a tab open; in each group in the order given.
-fn listed_order(
-    open: impl IntoIterator<Item = Project>,
-    recent: impl IntoIterator<Item = Project>,
-    flags: impl Fn(&Project) -> (bool, bool),
-) -> Vec<ListedProject> {
-    let mut listed: Vec<ListedProject> = Vec::new();
-    for (project, open) in open
+/// Archived projects come last; within each section, pinned projects come first.
+fn listed_order(projects: &HashMap<String, ProjectSettings>) -> Vec<ListedProject> {
+    let mut entries: Vec<_> = projects.iter().collect();
+    entries.sort_unstable_by_key(|&(key, settings)| (settings.archived, !settings.pinned, key));
+    entries
         .into_iter()
-        .map(|project| (project, true))
-        .chain(recent.into_iter().map(|project| (project, false)))
-    {
-        if listed.iter().any(|known| known.project == project) {
-            continue;
-        }
-        let group = match flags(&project) {
-            (_, true) => ProjectGroup::Archived,
-            (true, false) => ProjectGroup::Pinned,
-            (false, false) if open => ProjectGroup::Open,
-            (false, false) => ProjectGroup::Recent,
-        };
-        listed.push(ListedProject { project, group });
-    }
-    // Stable: in each group as given.
-    listed.sort_by_key(|listed| listed.group);
-    listed
+        .filter_map(|(key, settings)| {
+            Some(ListedProject {
+                project: project_from_key(key)?,
+                archived: settings.archived,
+            })
+        })
+        .collect()
 }
 
 /// Whether every word of `query` (lowercase) is in the project's `name` or `place`.
@@ -172,11 +112,13 @@ fn project_matches(query: &str, name: &str, place: &str) -> bool {
         .all(|word| name.contains(word) || place.contains(word))
 }
 
-/// Where a project's row says it is: its folder, and the WSL distribution it is in.
-fn project_place(project: &Project) -> String {
+/// The folder and its environment, which together identify the project.
+fn project_place(project: &Project) -> Cow<'_, str> {
     match &project.environment {
-        ContentEnvironment::Host => project.root.clone(),
-        ContentEnvironment::Wsl { distribution } => format!("{} · {distribution}", project.root),
+        ContentEnvironment::Host => Cow::Borrowed(project.root.as_str()),
+        ContentEnvironment::Wsl { distribution } => {
+            Cow::Owned(format!("{} · {distribution}", project.root))
+        }
     }
 }
 
@@ -213,13 +155,11 @@ pub(super) fn remove_project_message(name: &str, threads: usize) -> String {
     )
 }
 
-/// What the page shows of the projects listed: the search when there are enough of
-/// them, then each group with a project the search matches, its projects by their place
-/// in the list; the archived ones only while their group is unfolded or searched.
+/// What the list shows, after applying its search.
 struct PageLayout {
     search: bool,
-    groups: Vec<(ProjectGroup, Vec<usize>)>,
-    /// The Archived group shows its heading only.
+    active: Vec<usize>,
+    archived: Vec<usize>,
     archived_folded: bool,
 }
 
@@ -230,8 +170,8 @@ pub(super) struct ProjectFields {
     /// The search, trimmed and lowercased.
     query: String,
     name: Entity<InputState>,
-    /// The project whose name the name field holds, by `project_key`.
-    name_for: Option<String>,
+    /// The project whose name the name field holds.
+    name_for: Option<Project>,
     _events: [Subscription; 2],
 }
 
@@ -305,17 +245,11 @@ fn project_field_events(
     let name = cx.subscribe(name, move |this, _, event: &InputEvent, cx| {
         match event {
             InputEvent::Focus => {
-                let Some(index) = this.selected_project_index() else {
-                    return;
-                };
                 this.set_settings_focus(
                     SettingsHost::Pane(named.clone()),
                     Stop::Control {
                         row: PROJECTS_ROW,
-                        action: SettingsAction::Project(ProjectControl {
-                            project: index,
-                            part: ProjectPart::Name,
-                        }),
+                        action: SettingsAction::Project(ProjectControl::Name),
                     },
                 );
             }
@@ -340,31 +274,42 @@ impl CompiApp {
             .unwrap_or_else(|| project.name().to_owned())
     }
 
-    /// Whether `project` is pinned, so it comes first among projects.
-    pub(in crate::gui) fn project_pinned(&self, project: &Project) -> bool {
-        self.project_settings(project)
-            .is_some_and(|settings| settings.pinned)
-    }
-
-    /// Whether `project` is archived, out of the palette's Projects and the page's main
-    /// list.
-    fn project_archived(&self, project: &Project) -> bool {
+    /// Whether `project` is archived and hidden from the main project list.
+    pub(super) fn project_archived(&self, project: &Project) -> bool {
         self.project_settings(project)
             .is_some_and(|settings| settings.archived)
     }
 
-    /// Saves what you set for `project` and gives it to every window; nothing set removes
-    /// its table.
+    /// Saves an edit from the icon picker or the detail page. Once edited, a project
+    /// stays saved even if this edit resets its last customization.
     pub(in crate::gui) fn set_project_settings(
+        &mut self,
+        project: &Project,
+        mut settings: ProjectSettings,
+        cx: &mut Context<Self>,
+    ) {
+        settings.saved = true;
+        self.persist_project_settings(project, settings, cx);
+    }
+
+    /// Saves (or restores) the project chosen by Add project without launching it.
+    pub(super) fn save_added_project(&mut self, project: &Project, cx: &mut Context<Self>) -> bool {
+        let mut settings = self.project_settings(project).cloned().unwrap_or_default();
+        settings.saved = true;
+        settings.archived = false;
+        self.persist_project_settings(project, settings, cx)
+    }
+
+    fn persist_project_settings(
         &mut self,
         project: &Project,
         settings: ProjectSettings,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let key = project_key(project);
         if let Err(error) = self.config.save_project_settings(&key, settings.clone()) {
             self.global_error = Some(error);
-            return;
+            return false;
         }
         share_config_change(cx, move |config| {
             if settings == ProjectSettings::default() {
@@ -373,6 +318,7 @@ impl CompiApp {
                 config.projects.insert(key.clone(), settings.clone());
             }
         });
+        true
     }
 
     /// Changes what you set for `project` with `change`, and saves it.
@@ -453,51 +399,9 @@ impl CompiApp {
         picks
     }
 
-    /// The projects Settings → Projects lists, by group (`listed_order`): of open tabs,
-    /// then of threads newest first, then any other project something is set for.
+    /// Saved projects, including those with pre-existing customizations.
     pub(super) fn listed_projects(&self) -> Vec<ListedProject> {
-        let open: Vec<Project> = self
-            .workspace
-            .iter()
-            .flat_map(|workspace| &workspace.sessions)
-            .flat_map(|session| &session.tabs)
-            .filter_map(|tab| tab.project.clone())
-            .collect();
-        let mut configured: Vec<(&String, Project)> = self
-            .config
-            .projects
-            .keys()
-            .filter_map(|key| Some((key, project_from_key(key)?)))
-            .collect();
-        configured.sort_by(|a, b| a.0.cmp(b.0));
-        let recent = self
-            .thread_projects()
-            .cloned()
-            .chain(configured.into_iter().map(|(_, project)| project));
-        listed_order(open, recent, |project| {
-            (self.project_pinned(project), self.project_archived(project))
-        })
-    }
-
-    /// The project the Projects page lists at `index`.
-    fn listed_project(&self, index: usize) -> Option<Project> {
-        self.listed_projects()
-            .into_iter()
-            .nth(index)
-            .map(|listed| listed.project)
-    }
-
-    /// Where the Projects page lists the selected project.
-    fn selected_project_index(&self) -> Option<usize> {
-        let selected = self.settings.project_selected.as_deref()?;
-        self.listed_projects()
-            .iter()
-            .position(|listed| project_key(&listed.project) == selected)
-    }
-
-    /// Whether `project`'s detail is open on the Projects page.
-    fn project_selected(&self, project: &Project) -> bool {
-        self.settings.project_selected.as_deref() == Some(project_key(project).as_str())
+        listed_order(&self.config.projects)
     }
 
     /// The Projects page's search, as `host` (else the Settings pane with the
@@ -515,82 +419,70 @@ impl CompiApp {
     fn page_layout(&self, listed: &[ListedProject], query: &str) -> PageLayout {
         let search = listed.len() > SEARCH_AFTER;
         let query = if search { query } else { "" };
-        let groups = ProjectGroup::ALL
-            .into_iter()
-            .filter_map(|group| {
-                let members: Vec<usize> = listed
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, listed)| listed.group == group)
-                    .filter(|(_, listed)| {
-                        query.is_empty()
-                            || project_matches(
-                                query,
-                                &self.project_name(&listed.project),
-                                &project_place(&listed.project),
-                            )
-                    })
-                    .map(|(index, _)| index)
-                    .collect();
-                (!members.is_empty()).then_some((group, members))
-            })
-            .collect();
+        let mut active = Vec::new();
+        let mut archived = Vec::new();
+        for (index, listed) in listed.iter().enumerate() {
+            if !query.is_empty()
+                && !project_matches(
+                    query,
+                    &self.project_name(&listed.project),
+                    &project_place(&listed.project),
+                )
+            {
+                continue;
+            }
+            if listed.archived {
+                archived.push(index);
+            } else {
+                active.push(index);
+            }
+        }
         PageLayout {
             search,
-            groups,
-            archived_folded: !self.settings.archived_open && query.is_empty(),
+            active,
+            archived,
+            archived_folded: !self.settings.archived_open,
         }
     }
 
-    /// The Projects page's keyboard order: the search, then each row and its pin
-    /// button, the open detail's controls after its row; the Archived heading before
-    /// the archived rows.
+    /// Keyboard order for the project list or its detail, never both at once.
     pub(super) fn project_stops(&self) -> Vec<SettingsAction> {
+        use ProjectControl as Control;
+        let action = SettingsAction::Project;
+        if let Some(project) = &self.settings.project_selected {
+            let settings = self.project_settings(project);
+            let mut stops = vec![action(Control::Back), action(Control::Name)];
+            if settings.is_some_and(|settings| settings.name.is_some()) {
+                stops.push(action(Control::ResetName));
+            }
+            stops.push(action(Control::ChangeIcon));
+            if settings.is_some_and(|settings| settings.icon.is_some()) {
+                stops.push(action(Control::ResetIcon));
+            }
+            stops.extend(
+                [
+                    Control::Pin,
+                    Control::Agent,
+                    Control::Model,
+                    Control::Archive,
+                    Control::Remove,
+                ]
+                .map(action),
+            );
+            return stops;
+        }
         let listed = self.listed_projects();
         let layout = self.page_layout(&listed, self.project_query(None));
-        let mut stops = Vec::new();
+        let mut stops = vec![action(Control::Add)];
         if layout.search {
             stops.push(SettingsAction::ProjectSearch);
         }
-        for (group, members) in &layout.groups {
-            if *group == ProjectGroup::Archived {
-                stops.push(SettingsAction::ArchivedProjects);
-                if layout.archived_folded {
-                    continue;
-                }
-            }
-            for &index in members {
-                let stop = |part| {
-                    SettingsAction::Project(ProjectControl {
-                        project: index,
-                        part,
-                    })
-                };
-                stops.extend([stop(ProjectPart::Select), stop(ProjectPart::RowPin)]);
-                let project = &listed[index].project;
-                if !self.project_selected(project) {
-                    continue;
-                }
-                let settings = self.project_settings(project).cloned().unwrap_or_default();
-                stops.extend([
-                    stop(ProjectPart::OpenTab),
-                    stop(ProjectPart::Reveal),
-                    stop(ProjectPart::Name),
-                ]);
-                if settings.name.is_some() {
-                    stops.push(stop(ProjectPart::ResetName));
-                }
-                stops.push(stop(ProjectPart::ChangeIcon));
-                if settings.icon.is_some() {
-                    stops.push(stop(ProjectPart::ResetIcon));
-                }
-                stops.extend([
-                    stop(ProjectPart::Pin),
-                    stop(ProjectPart::Agent),
-                    stop(ProjectPart::Model),
-                    stop(ProjectPart::Archive),
-                    stop(ProjectPart::Remove),
-                ]);
+        let select = |index| action(Control::Select(index));
+        stops.extend(layout.active.into_iter().map(select));
+        if !layout.archived.is_empty() {
+            stops.push(SettingsAction::ArchivedProjects);
+            if !layout.archived_folded {
+                stops.extend(layout.archived.into_iter().map(select));
             }
         }
         stops
@@ -603,126 +495,118 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(project) = self.listed_project(control.project) else {
+        use ProjectControl as Control;
+        match control {
+            Control::Add => {
+                self.open_add_project(true, window, cx);
+                return;
+            }
+            Control::Select(index) => {
+                if let Some(listed) = self.listed_projects().into_iter().nth(index) {
+                    self.settings.project_selected = Some(listed.project);
+                    self.focus_project_control(Control::Back);
+                }
+                return;
+            }
+            Control::Back => {
+                if let Some(host) = self.settings_focus_host() {
+                    self.back_to_projects(host);
+                }
+                return;
+            }
+            Control::Agent => {
+                self.step_project_agent(true, true, cx);
+                return;
+            }
+            _ => {}
+        }
+        let Some(project) = self.settings.project_selected.clone() else {
             return;
         };
-        match control.part {
-            ProjectPart::Select => {
-                let key = project_key(&project);
-                self.settings.project_selected =
-                    (self.settings.project_selected.as_ref() != Some(&key)).then_some(key);
-                self.close_project_model_picker();
-            }
-            ProjectPart::RowPin | ProjectPart::Pin => {
+        match control {
+            Control::Pin => {
                 self.edit_project(&project, |settings| settings.pinned = !settings.pinned, cx);
-                self.follow_moved_project(&project, control.part);
             }
-            ProjectPart::OpenTab => self.open_project_tab(&project),
-            ProjectPart::Reveal => self.reveal_project(&project, cx),
-            // The name field takes the keyboard (`settings_keyboard`).
-            ProjectPart::Name => {}
-            ProjectPart::ResetName => {
-                self.edit_project(&project, |settings| settings.name = None, cx)
+            Control::ResetName => {
+                self.edit_project(&project, |settings| settings.name = None, cx);
+                self.focus_project_control(Control::ChangeIcon);
             }
-            ProjectPart::ChangeIcon => self.open_project_icon_picker(project, window, cx),
-            ProjectPart::ResetIcon => {
-                self.edit_project(&project, |settings| settings.icon = None, cx)
+            Control::ChangeIcon => self.open_project_icon_picker(project, window, cx),
+            Control::ResetIcon => {
+                self.edit_project(&project, |settings| settings.icon = None, cx);
+                self.focus_project_control(Control::ChangeIcon);
             }
-            ProjectPart::Agent => self.step_project_agent(control, true, true, cx),
-            ProjectPart::Model => self.open_project_model_picker(&project, window, cx),
-            ProjectPart::Archive => {
+            Control::Model => self.open_project_model_picker(&project, window, cx),
+            Control::Archive => {
                 let archived = !self.project_archived(&project);
                 self.edit_project(&project, |settings| settings.archived = archived, cx);
-                // An archived project stays in view, under Archived.
-                self.settings.archived_open |= archived;
-                self.follow_moved_project(&project, control.part);
             }
-            ProjectPart::Remove => self.ask_remove_project(project, cx),
+            Control::Remove => self.ask_remove_project(project, cx),
+            _ => {}
         }
     }
 
-    /// The highlight follows `project` to its new place after pinning or archiving
-    /// moved it to another group.
-    fn follow_moved_project(&mut self, project: &Project, part: ProjectPart) {
-        let Some(index) = self
-            .listed_projects()
+    fn focus_project_control(&mut self, control: ProjectControl) {
+        if let Some(host) = self.settings_focus_host() {
+            self.set_settings_focus(
+                host,
+                Stop::Control {
+                    row: PROJECTS_ROW,
+                    action: SettingsAction::Project(control),
+                },
+            );
+        }
+    }
+
+    /// Returns to the list and moves the highlight back to the project's row.
+    pub(super) fn back_to_projects(&mut self, host: SettingsHost) {
+        let Some(project) = self.settings.project_selected.take() else {
+            return;
+        };
+        self.close_project_model_picker();
+        let listed = self.listed_projects();
+        self.settings.archived_open |= self.project_archived(&project);
+        let layout = self.page_layout(&listed, self.project_query(Some(&host)));
+        let action = layout
+            .active
             .iter()
-            .position(|listed| listed.project == *project)
-        else {
-            return;
-        };
-        let Some(host) = self.settings_focus_host() else {
-            return;
-        };
+            .chain(&layout.archived)
+            .find_map(|&index| {
+                (listed[index].project == project)
+                    .then_some(SettingsAction::Project(ProjectControl::Select(index)))
+            });
+        let action = action.unwrap_or(if layout.search {
+            SettingsAction::ProjectSearch
+        } else {
+            SettingsAction::Project(ProjectControl::Add)
+        });
         self.set_settings_focus(
             host,
             Stop::Control {
                 row: PROJECTS_ROW,
-                action: SettingsAction::Project(ProjectControl {
-                    project: index,
-                    part,
-                }),
+                action,
             },
         );
     }
 
-    /// Open in new tab: a tab at `project`'s root in the selected workspace, a thread
-    /// or a terminal as Settings → General's New tabs says.
-    fn open_project_tab(&mut self, project: &Project) {
-        let Some(session) = self.state.selected_session.clone() else {
-            self.global_error = Some("Open a workspace first".into());
-            return;
-        };
-        match self.config.new_tab.unwrap_or_default() {
-            NewTab::Chat => self.new_project_thread(session, project),
-            NewTab::Terminal => self.new_project_terminal(session, project),
-        }
-    }
-
-    /// Why Reveal folder cannot show `project`'s folder: a window on another computer,
-    /// or a folder this computer cannot reach.
-    fn reveal_refusal(&self, project: &Project) -> Option<&'static str> {
-        if self.target.is_remote() {
-            Some("Its folder is on the computer this window connects to")
-        } else if open_with::native_path(&project.environment, &project.root).is_none() {
-            Some("Its folder is not on this computer's file system")
-        } else {
-            None
-        }
-    }
-
-    /// Reveal folder: `project`'s folder in File Explorer (Finder on macOS).
-    fn reveal_project(&mut self, project: &Project, cx: &mut Context<Self>) {
-        if let Some(reason) = self.reveal_refusal(project) {
-            self.global_error = Some(reason.into());
-            return;
-        }
-        if let Some(path) = open_with::native_path(&project.environment, &project.root) {
-            self.open_natively(path, open_with::Action::Reveal, cx);
-        }
-    }
-
     /// New threads' agent from the keyboard: the next choice after the current one,
     /// `forward` or back; Enter (`wrap`) goes round, Left and Right stop at the ends.
-    pub(super) fn step_project_agent(
-        &mut self,
-        control: ProjectControl,
-        forward: bool,
-        wrap: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(project) = self.listed_project(control.project) else {
+    pub(super) fn step_project_agent(&mut self, forward: bool, wrap: bool, cx: &mut Context<Self>) {
+        let Some(project) = self.settings.project_selected.as_ref() else {
             return;
         };
         let current = self
-            .project_settings(&project)
+            .project_settings(project)
             .and_then(|settings| settings.agent);
         let at = AGENT_CHOICES
             .iter()
             .position(|agent| *agent == current)
             .unwrap_or(0);
         let next = choice_index(at, AGENT_CHOICES.len(), forward, wrap);
-        self.set_project_agent(&project, AGENT_CHOICES[next], cx);
+        if next != at {
+            let project = project.clone();
+            self.set_project_agent(&project, AGENT_CHOICES[next], cx);
+        }
     }
 
     /// New threads in `project` start with `agent` (`None`: Settings → General's). A
@@ -754,52 +638,28 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings.project_selected = Some(project_key(project));
-        // Shown now, the page keeps this selection rather than the current tab's.
-        self.settings.projects_shown = true;
-        if self.project_archived(project) {
-            self.settings.archived_open = true;
-        }
-        let stop = self
-            .listed_projects()
-            .iter()
-            .position(|listed| listed.project == *project)
-            .map(|index| Stop::Control {
-                row: PROJECTS_ROW,
-                action: SettingsAction::Project(ProjectControl {
-                    project: index,
-                    part: ProjectPart::Select,
-                }),
-            });
-        self.open_settings(Some(SettingsSection::Projects), stop, window, cx);
+        let stop = Stop::Control {
+            row: PROJECTS_ROW,
+            action: SettingsAction::Project(ProjectControl::Back),
+        };
+        self.open_settings(Some(SettingsSection::Projects), Some(stop), window, cx);
+        self.settings.project_selected = Some(project.clone());
     }
 
-    /// Before drawing: showing the page anew selects the current tab's project; each
-    /// name field holds the selected project's name unless it is being edited; the model
-    /// picker closes with the page.
+    /// Keep the name field in sync while it is not being edited.
     pub(super) fn prepare_projects_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let shown = self.settings_row_shown(PROJECTS_ROW);
-        if shown
-            && !self.settings.projects_shown
-            && let Some(project) = self.selected_project()
-        {
-            self.settings.project_selected = Some(project_key(project));
-        }
-        self.settings.projects_shown = shown;
-        if !shown {
+        let Some(project) = self
+            .settings
+            .project_selected
+            .as_ref()
+            .filter(|_| self.settings_row_shown(PROJECTS_ROW))
+        else {
             self.close_project_model_picker();
             return;
-        }
+        };
+        let name = self.project_name(project);
+        let placeholder = project.name().to_owned();
         let selected = self.settings.project_selected.clone();
-        let project = selected.as_deref().and_then(project_from_key);
-        let name = project
-            .as_ref()
-            .map(|project| self.project_name(project))
-            .unwrap_or_default();
-        let placeholder = project
-            .as_ref()
-            .map(|project| project.name().to_owned())
-            .unwrap_or_default();
         let stale: Vec<Entity<InputState>> = self
             .project_fields_each()
             .filter(|fields| !fields.name.focus_handle(cx).is_focused(window))
@@ -824,7 +684,7 @@ impl CompiApp {
             return;
         };
         let label = fields.name.read(cx).value();
-        let Some(project) = fields.name_for.as_deref().and_then(project_from_key) else {
+        let Some(project) = fields.name_for.clone() else {
             return;
         };
         self.rename_project(&project, &label, cx);
@@ -847,9 +707,8 @@ impl CompiApp {
         let (name, search) = (fields.name.clone(), fields.search.clone());
         let saved = fields
             .name_for
-            .as_deref()
-            .and_then(project_from_key)
-            .map(|project| self.project_name(&project));
+            .as_ref()
+            .map(|project| self.project_name(project));
         let searched = !fields.query.is_empty();
         let shift = key.modifiers.shift;
         if name.focus_handle(cx).is_focused(window) {
@@ -877,10 +736,8 @@ impl CompiApp {
                 let first = self.project_stops().into_iter().find(|stop| {
                     matches!(
                         stop,
-                        SettingsAction::Project(ProjectControl {
-                            part: ProjectPart::Select,
-                            ..
-                        })
+                        SettingsAction::Project(ProjectControl::Select(_))
+                            | SettingsAction::ArchivedProjects
                     )
                 });
                 if let Some(action) = first {
@@ -919,7 +776,8 @@ impl CompiApp {
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.settings_pane_shows(pane_id, SettingsSection::Projects)
-            || self.listed_projects().len() <= SEARCH_AFTER
+            || self.settings.project_selected.is_some()
+            || self.config.projects.len() <= SEARCH_AFTER
         {
             return false;
         }
@@ -1057,16 +915,27 @@ impl CompiApp {
     /// Forgets `project`: what is set for it, in every window, and each window's
     /// recent entry, recent files and folded header of it.
     fn forget_project(&mut self, project: &Project, cx: &mut Context<Self>) {
-        if self.project_selected(project) {
-            self.settings.project_selected = None;
+        if !self.persist_project_settings(project, ProjectSettings::default(), cx) {
+            return;
         }
-        self.close_project_model_picker();
-        self.set_project_settings(project, ProjectSettings::default(), cx);
         let project = project.clone();
         cx.defer(move |cx| {
             for handle in cx.windows() {
                 if let Some(typed) = handle.downcast::<CompiApp>() {
                     let _ = typed.update(cx, |app, _, cx| {
+                        for fields in app.project_fields_each() {
+                            if fields.name_for.as_ref() == Some(&project) {
+                                fields.name_for = None;
+                            }
+                        }
+                        if app.settings.project_selected.as_ref() == Some(&project) {
+                            if let Some(host @ SettingsHost::Pane(_)) = app.settings_focus_host() {
+                                app.back_to_projects(host);
+                            } else {
+                                app.settings.project_selected = None;
+                                app.close_project_model_picker();
+                            }
+                        }
                         let state = &mut app.state;
                         let files = state.project_files.len();
                         let folded = state.folded_projects.len();
@@ -1087,34 +956,41 @@ impl CompiApp {
         });
     }
 
-    /// Settings → Projects: its search once there are enough projects, then the
-    /// projects in groups, each a compact row, the selected one's detail under it.
+    /// The saved-project list or, after picking a project, its settings page.
     pub(super) fn render_projects_page(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        if let Some(project) = &self.settings.project_selected {
+            return self.render_project_detail(row, project, cx);
+        }
         let colors = *self.colors();
         let listed = self.listed_projects();
-        if listed.is_empty() {
-            return settings_card(&colors)
-                .px_4()
-                .child(
-                    self.settings_row(
-                        "No projects yet",
-                        "A project is the folder a tab or thread works in: its Git repository's \
-                     top folder, else the folder itself. Projects show here once you work in one."
-                            .into(),
-                        div().into_any_element(),
-                        row.compact,
-                    ),
-                )
-                .into_any_element();
-        }
+        let add = self.settings_control(
+            row,
+            SettingsAction::Project(ProjectControl::Add),
+            controls::text_button("settings-add-project", "Add project…")
+                .header()
+                .icon(IconName::Plus),
+            cx,
+        );
+        let heading = div()
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .justify_between()
+            .gap_x_3()
+            .gap_y_2()
+            .child(
+                div()
+                    .text_size(px(18.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Projects"),
+            )
+            .child(add);
         let fields = match &row.host {
             SettingsHost::Pane(pane) => self.page_project_fields(Some(pane)),
             SettingsHost::Quick => None,
         };
-        let layout = self.page_layout(
-            &listed,
-            fields.map_or("", |fields| fields.query.as_str()),
-        );
+        let layout = self.page_layout(&listed, fields.map_or("", |fields| fields.query.as_str()));
         let search = fields.filter(|_| layout.search).map(|fields| {
             let focused = self.settings_focused(row, SettingsAction::ProjectSearch);
             div()
@@ -1129,53 +1005,53 @@ impl CompiApp {
                 )
                 .child(self.settings_focus_anchor(focused, cx))
         });
-        let groups = layout.groups.iter().map(|(group, members)| {
-            let folded = *group == ProjectGroup::Archived && layout.archived_folded;
-            let heading = if *group == ProjectGroup::Archived {
-                self.render_archived_heading(row, members.len(), folded, cx)
-            } else {
-                settings_group_label(group.label(), &colors).into_any_element()
-            };
-            let card = (!folded).then(|| {
-                settings_card(&colors).children(members.iter().enumerate().map(
-                    |(at, &index)| {
-                        let project = &listed[index].project;
-                        let selected = self.project_selected(project);
-                        div()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .when(at > 0, |line| {
-                                line.border_t_1().border_color(color(colors.border))
-                            })
-                            .child(self.render_project_row(row, index, project, selected, cx))
-                            .when(selected, |line| {
-                                line.child(self.render_project_detail(row, index, project, cx))
-                            })
-                    },
-                ))
-            });
+        let list = |members: &[usize]| {
+            settings_card(&colors).children(members.iter().enumerate().map(|(at, &index)| {
+                div()
+                    .min_w_0()
+                    .when(at > 0, |line| {
+                        line.border_t_1().border_color(color(colors.border))
+                    })
+                    .child(self.render_project_row(row, index, &listed[index].project, cx))
+            }))
+        };
+        let archived = (!layout.archived.is_empty()).then(|| {
             div()
                 .min_w_0()
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(heading)
-                .children(card)
+                .child(self.render_archived_heading(
+                    row,
+                    layout.archived.len(),
+                    layout.archived_folded,
+                    cx,
+                ))
+                .when(!layout.archived_folded, |section| {
+                    section.child(list(&layout.archived))
+                })
         });
-        let empty = (layout.groups.is_empty()).then(|| {
+        let empty = layout.active.is_empty().then(|| {
             div()
                 .text_color(color(modal_text_color(colors.muted, &colors)))
-                .child("No project matches the search.")
+                .child(if listed.is_empty() {
+                    "Add a folder or clone a repository to save your first project."
+                } else if layout.archived.is_empty() {
+                    "No projects match the search."
+                } else {
+                    "No active projects."
+                })
         });
         div()
             .min_w_0()
             .flex()
             .flex_col()
             .gap_6()
+            .child(heading)
             .children(search)
-            .children(groups)
+            .children((!layout.active.is_empty()).then(|| list(&layout.active)))
             .children(empty)
+            .children(archived)
             .into_any_element()
     }
 
@@ -1215,27 +1091,18 @@ impl CompiApp {
         .into_any_element()
     }
 
-    /// One project's row: its icon, name and folder (stacked when `compact`), a Pinned
-    /// chip, the mark of the agent its new threads start with when it picks one, the
-    /// pin button and the chevron of its detail. A click opens or closes its detail.
+    /// A compact row opens the project's dedicated detail.
     fn render_project_row(
         &self,
         row: &RowCx,
         index: usize,
         project: &Project,
-        selected: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let settings = self.project_settings(project).cloned().unwrap_or_default();
-        let action = |part| {
-            SettingsAction::Project(ProjectControl {
-                project: index,
-                part,
-            })
-        };
-        let select = action(ProjectPart::Select);
+        let settings = self.project_settings(project);
+        let select = SettingsAction::Project(ProjectControl::Select(index));
         let focused = self.settings_focused(row, select);
         let name = div()
             .min_w_0()
@@ -1253,7 +1120,7 @@ impl CompiApp {
             .text_size(px(UI_SMALL_TEXT_SIZE))
             .line_height(px(UI_SMALL_LINE_HEIGHT))
             .text_color(muted)
-            .child(project_place(project));
+            .child(project_place(project).into_owned());
         let text = div()
             .min_w_0()
             .flex_1()
@@ -1262,7 +1129,7 @@ impl CompiApp {
             .when(!row.compact, |text| text.items_baseline().gap_2())
             .child(name)
             .child(place);
-        let agent = settings.agent.map(|agent| {
+        let agent = settings.and_then(|settings| settings.agent).map(|agent| {
             div()
                 .id(("project-agent", index))
                 .flex_none()
@@ -1277,21 +1144,6 @@ impl CompiApp {
                     None,
                 ))
         });
-        let pin = self.settings_control(
-            row,
-            action(ProjectPart::RowPin),
-            controls::icon_button(
-                ("project-row-pin", index),
-                if settings.pinned {
-                    IconName::PinOff
-                } else {
-                    IconName::Pin
-                },
-                if settings.pinned { "Unpin" } else { "Pin" },
-            )
-            .detail("Pinned projects come first in the sidebar, the palette and here"),
-            cx,
-        );
         let hover = blend_rgb(colors.surface, colors.foreground, 0.04);
         div()
             .id(("project-row", index))
@@ -1304,9 +1156,6 @@ impl CompiApp {
             .items_center()
             .gap_3()
             .cursor_pointer()
-            .when(selected, |line| {
-                line.bg(color(blend_rgb(colors.surface, colors.foreground, 0.06)))
-            })
             .hover(move |style| style.bg(color(hover)))
             .on_click(self.settings_click(row, select, cx))
             .child(
@@ -1315,19 +1164,11 @@ impl CompiApp {
                     .child(self.project_icon(Some(project), ROW_ICON_SIZE)),
             )
             .child(text)
-            .when(settings.pinned && !row.compact, |line| {
+            .when(settings.is_some_and(|settings| settings.pinned), |line| {
                 line.child(controls::chip("Pinned", ChipTone::Neutral))
             })
             .children(agent)
-            .child(pin)
-            .child(controls::glyph(
-                if selected {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                },
-                muted,
-            ))
+            .child(controls::glyph(IconName::ChevronRight, muted))
             .when(focused, |line| {
                 line.child(
                     div()
@@ -1341,38 +1182,24 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// The selected project's detail, under its row: a large icon, its name and folder
-    /// with Open in new tab and Reveal folder, then its Name, Icon, Pin and New threads
-    /// rows, and Archive and Remove from Compi.
+    /// The project's settings, independent of its place in the list.
     fn render_project_detail(
         &self,
         row: &RowCx,
-        index: usize,
         project: &Project,
         cx: &Context<Self>,
     ) -> AnyElement {
+        use ProjectControl as Control;
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let settings = self.project_settings(project).cloned().unwrap_or_default();
-        let action = |part| {
-            SettingsAction::Project(ProjectControl {
-                project: index,
-                part,
-            })
-        };
-        let button = |part, id: &'static str, label: &'static str| {
-            self.settings_control(
-                row,
-                action(part),
-                controls::text_button((id, index), label).header(),
-                cx,
-            )
-        };
+        let defaults = ProjectSettings::default();
+        let settings = self.project_settings(project).unwrap_or(&defaults);
+        let action = SettingsAction::Project;
         let reset = |part, id: &'static str, back: String| {
             self.settings_control(
                 row,
                 action(part),
-                controls::text_button((id, index), "Reset")
+                controls::text_button(id, "Reset")
                     .header()
                     .ghost()
                     .detail(back),
@@ -1383,78 +1210,52 @@ impl CompiApp {
         let line = |child: AnyElement| {
             div()
                 .min_w_0()
+                .px_4()
                 .border_t_1()
                 .border_color(color(colors.border))
                 .child(child)
         };
 
-        // The head: the icon, name and folder, and where to go from here.
-        let reveal = self.settings_control(
+        let back = self.settings_control(
             row,
-            action(ProjectPart::Reveal),
-            controls::text_button(("project-reveal", index), "Reveal folder")
+            action(Control::Back),
+            controls::text_button("projects-back", "Back to projects")
                 .header()
-                .icon(IconName::FolderOpen)
-                .detail(open_with::REVEAL_LABEL)
-                .disabled_because(self.reveal_refusal(project)),
-            cx,
-        );
-        let open = self.settings_control(
-            row,
-            action(ProjectPart::OpenTab),
-            controls::text_button(("project-open-tab", index), "Open in new tab")
-                .header()
-                .icon(IconName::Plus)
-                .detail(match self.config.new_tab.unwrap_or_default() {
-                    NewTab::Chat => "A new thread at its folder, as New tabs is Chat first",
-                    NewTab::Terminal => "A terminal at its folder, as New tabs is Terminal first",
-                }),
+                .ghost()
+                .icon(IconName::ChevronLeft),
             cx,
         );
         let head = div()
             .min_w_0()
             .flex()
-            .flex_wrap()
             .items_center()
-            .gap_x_3()
-            .gap_y_2()
+            .gap_3()
+            .child(
+                div()
+                    .flex_none()
+                    .child(self.project_icon(Some(project), DETAIL_ICON_SIZE)),
+            )
             .child(
                 div()
                     .min_w_0()
-                    .flex_1()
                     .flex()
-                    .items_center()
-                    .gap_3()
+                    .flex_col()
+                    .gap(px(2.0))
                     .child(
                         div()
-                            .flex_none()
-                            .child(self.project_icon(Some(project), DETAIL_ICON_SIZE)),
+                            .truncate()
+                            .text_size(px(18.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(self.project_name(project)),
                     )
                     .child(
                         div()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(16.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(self.project_name(project)),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                                    .text_color(muted)
-                                    .child(project_place(project)),
-                            ),
+                            .truncate()
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .text_color(muted)
+                            .child(project_place(project).into_owned()),
                     ),
-            )
-            .child(buttons().flex_none().child(open).child(reveal));
+            );
 
         // Name: edited in place; Reset back to the folder's name.
         let name_field = match &row.host {
@@ -1462,7 +1263,7 @@ impl CompiApp {
             SettingsHost::Quick => None,
         }
         .map(|fields| {
-            let focused = self.settings_focused(row, action(ProjectPart::Name));
+            let focused = self.settings_focused(row, action(Control::Name));
             div()
                 .relative()
                 .w(px(220.0))
@@ -1481,17 +1282,17 @@ impl CompiApp {
             None => "Its folder's name. Type another; Enter saves, Escape puts it back.".to_owned(),
         };
         let name_controls = buttons()
+            .children(name_field)
             .when(settings.name.is_some(), |controls| {
                 controls.child(reset(
-                    ProjectPart::ResetName,
+                    Control::ResetName,
                     "project-reset-name",
                     format!("Back to {}", project.name()),
                 ))
             })
-            .children(name_field)
             .into_any_element();
 
-        // Icon: what shows now, Reset back to Automatic, and Change icon….
+        // Icon: what shows now, Change icon…, and Reset back to Automatic.
         let icon_controls = buttons()
             .child(
                 div()
@@ -1499,27 +1300,28 @@ impl CompiApp {
                     .mr_1()
                     .child(self.project_icon(Some(project), 24.0)),
             )
+            .child(self.settings_control(
+                row,
+                action(Control::ChangeIcon),
+                controls::text_button("project-change-icon", "Change icon…").header(),
+                cx,
+            ))
             .when(settings.icon.is_some(), |controls| {
                 controls.child(reset(
-                    ProjectPart::ResetIcon,
+                    Control::ResetIcon,
                     "project-reset-icon",
                     "Back to Automatic".to_owned(),
                 ))
             })
-            .child(button(
-                ProjectPart::ChangeIcon,
-                "project-change-icon",
-                "Change icon…",
-            ))
             .into_any_element();
 
         // Pin.
-        let pin_action = action(ProjectPart::Pin);
+        let pin_action = action(Control::Pin);
         let pin_focused = self.settings_focused(row, pin_action);
         let pin_row = row.clone();
         let pin = controls::highlight(
             pin_focused,
-            controls::switch(("project-pin", index), settings.pinned)
+            controls::switch("project-pin", settings.pinned)
                 .label("Pin")
                 .on_toggle(cx.listener(move |this, _: &bool, window, cx| {
                     this.focus_settings_control(&pin_row, pin_action);
@@ -1552,7 +1354,7 @@ impl CompiApp {
         let picked = project.clone();
         let agent = self.render_tiles(
             row,
-            (index, action(ProjectPart::Agent)),
+            (0, action(Control::Agent)),
             tiles,
             Rc::new(move |this, choice, _, cx| {
                 this.set_project_agent(&picked, AGENT_CHOICES[choice], cx);
@@ -1567,7 +1369,7 @@ impl CompiApp {
                 default_agent.name()
             ),
         };
-        let model_action = action(ProjectPart::Model);
+        let model_action = action(Control::Model);
         let model_focused = self.settings_focused(row, model_action);
         let model_row = row.clone();
         let model = controls::highlight(
@@ -1593,11 +1395,11 @@ impl CompiApp {
         // Archive, and Remove from Compi.
         let archive = self.settings_control(
             row,
-            action(ProjectPart::Archive),
+            action(Control::Archive),
             controls::text_button(
-                ("project-archive", index),
+                "project-archive",
                 if settings.archived {
-                    "Unarchive"
+                    "Restore"
                 } else {
                     "Archive"
                 },
@@ -1612,8 +1414,8 @@ impl CompiApp {
         );
         let remove = self.settings_control(
             row,
-            action(ProjectPart::Remove),
-            controls::text_button(("project-remove", index), "Remove from Compi…")
+            action(Control::Remove),
+            controls::text_button("project-remove", "Remove from Compi…")
                 .header()
                 .danger()
                 .icon(IconName::Trash)
@@ -1622,25 +1424,13 @@ impl CompiApp {
             cx,
         );
         let ending = if settings.archived {
-            "Archived: out of the palette's Projects and the list above. Its threads and \
-             settings stay. Removing it deletes its threads too; its files stay."
+            "This project is hidden from the main list. Its threads and settings are kept."
         } else {
-            "Archiving hides it from the palette's Projects and the list above; its threads \
-             and settings stay. Removing it deletes its threads too; its files stay."
+            "Archiving hides the project from the main list but keeps its threads and settings."
         };
 
-        div()
-            .min_w_0()
-            .px_4()
-            .pt_4()
-            .pb_2()
-            .flex()
-            .flex_col()
-            .border_t_1()
-            .border_color(color(colors.border))
-            .bg(color(blend_rgb(colors.surface, colors.foreground, 0.02)))
-            .child(div().pb_3().child(head))
-            .child(line(self.settings_row(
+        let card = settings_card(&colors)
+            .child(div().px_4().child(self.settings_row(
                 "Name",
                 name_detail,
                 name_controls,
@@ -1652,16 +1442,12 @@ impl CompiApp {
                 icon_controls,
                 row.compact,
             )))
-            .child(line(
-                self.settings_row(
-                    "Pin",
-                    "Pinned projects come first in the sidebar's project headers, the palette \
-                     and this list."
-                        .to_owned(),
-                    pin,
-                    row.compact,
-                ),
-            ))
+            .child(line(self.settings_row(
+                "Pin",
+                "Pinned projects come first in the sidebar and the project list.".into(),
+                pin,
+                row.compact,
+            )))
             .child(line(self.settings_row(
                 "New threads' agent",
                 agent_detail,
@@ -1683,7 +1469,15 @@ impl CompiApp {
                 ending.to_owned(),
                 buttons().child(archive).child(remove).into_any_element(),
                 row.compact,
-            )))
+            )));
+        div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(div().flex().child(back))
+            .child(head)
+            .child(card)
             .into_any_element()
     }
 }
@@ -1715,40 +1509,66 @@ mod tests {
     }
 
     #[test]
-    fn projects_list_once_each_as_pinned_open_recent_then_archived() {
-        let (a, b, c, d, e) = (host("/a"), host("/b"), host("/c"), host("/d"), host("/e"));
-        let listed = listed_order(
-            [a.clone(), b.clone(), a.clone(), e.clone()],
-            [c.clone(), b.clone(), d.clone()],
-            |project| match project.root.as_str() {
-                "/b" | "/d" => (true, false),
-                // Archived wins over pinned and open.
-                "/e" => (true, true),
-                _ => (false, false),
-            },
-        );
-        let order: Vec<(&str, ProjectGroup)> = listed
+    fn saved_projects_list_pinned_first_and_archived_last() {
+        let saved: HashMap<_, _> = [
+            (
+                "host:/a",
+                ProjectSettings {
+                    saved: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "host:/b",
+                ProjectSettings {
+                    pinned: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "host:/c",
+                ProjectSettings {
+                    name: Some("Custom".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "host:/d",
+                ProjectSettings {
+                    pinned: true,
+                    archived: true,
+                    ..Default::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(key, settings)| (key.to_owned(), settings))
+        .collect();
+        let listed = listed_order(&saved);
+        let order: Vec<_> = listed
             .iter()
-            .map(|listed| (listed.project.root.as_str(), listed.group))
+            .map(|listed| (listed.project.root.as_str(), listed.archived))
             .collect();
         assert_eq!(
             order,
-            [
-                ("/b", ProjectGroup::Pinned),
-                ("/d", ProjectGroup::Pinned),
-                ("/a", ProjectGroup::Open),
-                ("/c", ProjectGroup::Recent),
-                ("/e", ProjectGroup::Archived),
-            ]
+            [("/b", false), ("/a", false), ("/c", false), ("/d", true)]
         );
     }
 
     #[test]
     fn the_search_matches_every_word_in_the_name_or_folder() {
         assert!(project_matches("compi", "Compi app", "/home/me/proj/compi"));
-        assert!(project_matches("app proj", "Compi app", "/home/me/proj/compi"));
+        assert!(project_matches(
+            "app proj",
+            "Compi app",
+            "/home/me/proj/compi"
+        ));
         assert!(project_matches("ubuntu", "site", "/srv/site · Ubuntu"));
-        assert!(!project_matches("app web", "Compi app", "/home/me/proj/compi"));
+        assert!(!project_matches(
+            "app web",
+            "Compi app",
+            "/home/me/proj/compi"
+        ));
         assert!(project_matches("", "anything", "/x"));
     }
 

@@ -1,45 +1,19 @@
-//! The window's sidebar, with T3 Code's rounded cards and search bar in Compi's own
-//! look. At the top, the search with New workspace, New tab and New thread beside it.
-//! Under it, each workspace as a plain label that folds, over its cards: one per open
-//! tab. At the bottom, a row of equal icon buttons across the sidebar, with the update
-//! button last while a release is on offer.
+//! Saved projects and open tabs. The sidebar shows a project even with no tabs.
+//! Tabs whose projects aren't saved or are archived stay reachable under Loose tabs.
+//! Workspace and tab layouts are independent of this presentation.
 //!
-//! Cards keep their workspace's tab order, pinned tabs first in the order they were
-//! pinned; nothing reorders them on its own. When a workspace's cards belong to two or
-//! more projects (cards without a project count as one more), they gather under a
-//! one-line header per project: pinned projects (Settings → Projects) first, then in the
-//! order each project's first card comes. A header shows the project's name (the one
-//! set in Settings → Projects, else its folder's), folds its project's cards and,
-//! folded, shows one dot for the most urgent of them.
-//! Headers and cards sit at one indent: this is a list of cards, never a file tree.
-//! The window's state keeps what is folded.
-//!
-//! A card shows the project's icon and folder with how long ago its status changed,
-//! the chat's or the tab's title, whether a chat or a terminal is in it, and one dot
-//! for what its programs most need the user for. A chat card's title is the chat's
-//! while this window watches it, else the one the daemon's thread list gives, asked
-//! for off the UI thread when the workspace changes.
-//!
-//! New workspace makes "Workspace N" at once and renames its label in place: Enter
-//! keeps the name typed, Escape the default. Dragging a card onto another workspace's
-//! label or cards moves the tab to the end of that workspace. A card, a project header
-//! and a workspace label each have a menu on right-click, as T3 Code's thread, folder
-//! and project rows do.
-//!
-//! Typing in the search shows only the cards whose title, folder or project matches,
-//! without headers; with the search holding the keyboard, Up and Down move through
-//! them, Enter opens one, Escape clears the search and F2 renames the tab. Ctrl+1–9
-//! (Cmd+1–9 on macOS) open the first nine cards shown, skipping folded workspaces and
-//! projects.
+//! Search matches project names, folders and tab titles. Ctrl+1–9 (Cmd+1–9 on
+//! macOS) open the first nine cards shown, skipping folded sections.
 use super::*;
 use crate::chat::{age_label, now_ms, thread_title};
 use crate::gui::controls::{IconName, MenuEntry, menu_item};
 use compi_protocol::chat::{ChatContent, ChatHarness, ThreadInfo};
 use compi_protocol::program_status::ProgramState;
 use compi_protocol::{MutationReceipt, PaneContent, Project, TabPlacement, WorkspaceSession};
-use gpui::{DragMoveEvent, Entity, Render, img};
+use gpui::{Entity, img};
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
+use std::collections::HashMap;
 
 /// The cards Go to sidebar card 1–9 reach.
 const SHORTCUT_CARDS: usize = 9;
@@ -68,10 +42,6 @@ pub(in crate::gui) struct SidebarUi {
     rename: Option<LabelRename>,
     /// The workspace New workspace asked for, until the daemon answers.
     creating: Option<NewWorkspace>,
-    /// The other workspace a dragged card is over, with the list row it is over.
-    drop_target: Option<(SessionId, usize)>,
-    /// Where the list shows, as last seen while a card is dragged.
-    list_bounds: Option<Bounds<Pixels>>,
 }
 
 impl SidebarUi {
@@ -97,8 +67,6 @@ impl SidebarUi {
             listing_due: true,
             rename: None,
             creating: None,
-            drop_target: None,
-            list_bounds: None,
         }
     }
 
@@ -125,37 +93,6 @@ struct LabelRename {
 struct NewWorkspace {
     /// The tab Move to workspace › New workspace… moves into it.
     moving: Option<TabId>,
-}
-
-/// A tab's card dragged toward another workspace; it draws itself under the pointer.
-#[derive(Clone)]
-struct CardDrag {
-    tab: TabId,
-    session: SessionId,
-    title: String,
-    background: u32,
-    foreground: u32,
-    border: u32,
-}
-
-impl Render for CardDrag {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .max_w(px(240.0))
-            .px_2p5()
-            .py_1p5()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(color(self.border))
-            .bg(color(self.background))
-            .shadow_md()
-            .text_size(px(UI_SMALL_TEXT_SIZE))
-            .text_color(color(self.foreground))
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .text_ellipsis()
-            .child(self.title.clone())
-    }
 }
 
 /// One card as the sidebar draws it: one tab.
@@ -200,9 +137,8 @@ fn card_note(card: &SidebarCard, now: u64) -> Option<String> {
     card.changed_ms.map(|then| age_label(then, now))
 }
 
-/// One project's cards in a workspace.
+/// A saved project's cards, or Loose tabs.
 struct ProjectSection {
-    /// `None` for the cards without a project.
     project: Option<Project>,
     folded: bool,
     cards: Vec<SidebarCard>,
@@ -218,38 +154,6 @@ impl ProjectSection {
     }
 }
 
-/// One workspace's label and the cards under it that the search matches.
-struct SidebarGroup {
-    session: SessionId,
-    label: String,
-    selected: bool,
-    folded: bool,
-    /// Its cards by project; one section while searching or when they share a project.
-    sections: Vec<ProjectSection>,
-}
-
-impl SidebarGroup {
-    /// Its sections show project headers: its cards span two or more projects.
-    fn headed(&self) -> bool {
-        self.sections.len() > 1
-    }
-
-    fn card_count(&self) -> usize {
-        self.sections
-            .iter()
-            .map(|section| section.cards.len())
-            .sum()
-    }
-
-    /// What its programs most need the user for, shown on its label while folded.
-    fn state(&self) -> Option<ProgramState> {
-        self.sections
-            .iter()
-            .filter_map(ProjectSection::state)
-            .max_by_key(|state| crate::program_status::urgency(*state))
-    }
-}
-
 /// A workspace's cards in order: pinned tabs in the order pinned, then the other tabs
 /// in the workspace's order.
 fn card_order(tabs: &[TabId], pinned: &[TabId]) -> Vec<TabId> {
@@ -261,42 +165,41 @@ fn card_order(tabs: &[TabId], pinned: &[TabId]) -> Vec<TabId> {
         .collect()
 }
 
-/// `cards` by project: `pinned` projects first, then in the order each project's first
-/// card comes, each keeping the order the cards came in; the cards without a project
-/// make one more.
-fn project_sections<T>(
-    cards: impl IntoIterator<Item = T>,
-    project: impl Fn(&T) -> Option<&Project>,
-    pinned: impl Fn(&Project) -> bool,
-) -> Vec<(Option<Project>, Vec<T>)> {
-    let mut sections: Vec<(Option<Project>, Vec<T>)> = Vec::new();
-    for card in cards {
-        let key = project(&card);
-        match sections.iter_mut().find(|(known, _)| known.as_ref() == key) {
-            Some((_, section)) => section.push(card),
-            None => {
-                let key = key.cloned();
-                sections.push((key, vec![card]));
-            }
-        }
-    }
-    // Stable: the pinned keep their order, as do the others.
-    sections.sort_by_key(|(project, _)| !project.as_ref().is_some_and(&pinned));
-    sections
-}
-
-/// How many cards a workspace shows of those whose `projects` are given, one per
-/// card: all of them, or under project headers, those of the projects not `folded`.
-fn shown_count(projects: &[Option<&Project>], folded: impl Fn(Option<&Project>) -> bool) -> usize {
-    let sections = project_sections(projects.iter().copied(), |project| *project, |_| false);
-    if sections.len() < 2 {
-        return projects.len();
-    }
-    sections
+/// Group tabs by the saved list, preserving that list's order and each tab's order.
+/// Unregistered and archived projects have no section and their tabs remain reachable.
+fn project_sections(
+    projects: Vec<Project>,
+    cards: impl IntoIterator<Item = SidebarCard>,
+    folded: impl Fn(Option<&Project>) -> bool,
+) -> Vec<ProjectSection> {
+    let indices: HashMap<_, _> = projects
         .iter()
-        .filter(|(project, _)| !folded(project.as_ref()))
-        .map(|(_, cards)| cards.len())
-        .sum()
+        .enumerate()
+        .map(|(index, project)| (project, index))
+        .collect();
+    let mut sections: Vec<_> = (0..=projects.len()).map(|_| Vec::new()).collect();
+    let loose = projects.len();
+    for card in cards {
+        let index = card
+            .project
+            .as_ref()
+            .and_then(|project| indices.get(project))
+            .copied()
+            .unwrap_or(loose);
+        sections[index].push(card);
+    }
+    projects
+        .into_iter()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .zip(sections)
+        .filter(|(project, cards)| project.is_some() || !cards.is_empty())
+        .map(|(project, cards)| ProjectSection {
+            folded: folded(project.as_ref()),
+            project,
+            cards,
+        })
+        .collect()
 }
 
 /// Whether every word of `query` (lowercase) is in one of `fields`.
@@ -307,57 +210,31 @@ fn matches_query(query: &str, fields: &[&str]) -> bool {
         .all(|word| fields.iter().any(|field| field.contains(word)))
 }
 
-/// Whether `groups` are listed for a search: every group shows its matching cards,
-/// folded or not, without project headers.
 fn searching(query: &str) -> bool {
     !query.is_empty()
 }
 
-/// The cards shown, top to bottom: while searching every match, otherwise the cards of
-/// the workspaces and projects that are not folded.
-fn shown_cards(groups: &[SidebarGroup], searching: bool) -> impl Iterator<Item = &SidebarCard> {
-    groups
+/// Search temporarily expands matching sections.
+fn shown_cards(sections: &[ProjectSection]) -> impl Iterator<Item = &SidebarCard> {
+    sections
         .iter()
-        .filter(move |group| searching || !group.folded)
-        .flat_map(|group| {
-            let headed = group.headed();
-            group
-                .sections
-                .iter()
-                .filter(move |section| !(headed && section.folded))
-                .flat_map(|section| &section.cards)
-        })
+        .filter(|section| !section.folded)
+        .flat_map(|section| &section.cards)
 }
 
-/// The row of the sidebar's list that shows card `shown` (an index into
-/// [`shown_cards`]): each group is its label, then its cards under their project
-/// headers, or a placeholder when it shows none.
-fn card_row(groups: &[SidebarGroup], searching: bool, shown: usize) -> Option<usize> {
+/// Every section has one header; folded sections show no cards.
+fn card_row(sections: &[ProjectSection], mut shown: usize) -> Option<usize> {
     let mut row = 0;
-    let mut card = 0;
-    for group in groups {
+    for section in sections {
         row += 1;
-        if group.folded && !searching {
+        if section.folded {
             continue;
         }
-        if group.sections.is_empty() {
-            row += 1;
-            continue;
+        if shown < section.cards.len() {
+            return Some(row + shown);
         }
-        let headed = group.headed();
-        for section in &group.sections {
-            if headed {
-                row += 1;
-                if section.folded {
-                    continue;
-                }
-            }
-            if shown < card + section.cards.len() {
-                return Some(row + shown - card);
-            }
-            row += section.cards.len();
-            card += section.cards.len();
-        }
+        row += section.cards.len();
+        shown -= section.cards.len();
     }
     None
 }
@@ -481,30 +358,6 @@ impl ProjectAction {
     }
 }
 
-/// What a row of a workspace label's menu does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkspaceAction {
-    Rename,
-    NewTerminal,
-    NewThread,
-    Fold,
-    Unfold,
-    Close,
-}
-
-impl WorkspaceAction {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Rename => "Rename…",
-            Self::NewTerminal => "New terminal",
-            Self::NewThread => "New thread",
-            Self::Fold => "Fold",
-            Self::Unfold => "Unfold",
-            Self::Close => "Close workspace…",
-        }
-    }
-}
-
 /// A sidebar menu's rows, top to bottom: an action with why it is unavailable, or
 /// `None` for a separator.
 type MenuRows<A> = Vec<Option<(A, Option<&'static str>)>>;
@@ -552,43 +405,15 @@ fn card_menu_rows(
     rows
 }
 
-/// A project header's menu, as T3 Code's folder header has it: New terminal here, New
-/// thread here and Copy path, all at the project's root, then Project settings…; all
-/// unavailable for the cards without a project.
-fn project_menu_rows(project: Option<&Project>) -> MenuRows<ProjectAction> {
-    let reason = project
-        .is_none()
-        .then_some("These tabs belong to no project");
+fn project_menu_rows(has_workspace: bool) -> MenuRows<ProjectAction> {
+    let reason = (!has_workspace).then_some("Open a workspace first");
     vec![
         Some((ProjectAction::NewTerminal, reason)),
         Some((ProjectAction::NewThread, reason)),
         None,
-        Some((ProjectAction::CopyPath, reason)),
+        Some((ProjectAction::CopyPath, None)),
         None,
-        Some((ProjectAction::Settings, reason)),
-    ]
-}
-
-/// A workspace label's menu: Rename…, New terminal, New thread, Fold or Unfold, and
-/// Close workspace…. A thread starts from a pane, so an `empty` workspace starts none.
-fn workspace_menu_rows(folded: bool, empty: bool) -> MenuRows<WorkspaceAction> {
-    let fold = if folded {
-        WorkspaceAction::Unfold
-    } else {
-        WorkspaceAction::Fold
-    };
-    vec![
-        Some((WorkspaceAction::Rename, None)),
-        None,
-        Some((WorkspaceAction::NewTerminal, None)),
-        Some((
-            WorkspaceAction::NewThread,
-            empty.then_some("A thread starts from a tab; open one here first"),
-        )),
-        None,
-        Some((fold, None)),
-        None,
-        Some((WorkspaceAction::Close, None)),
+        Some((ProjectAction::Settings, None)),
     ]
 }
 
@@ -606,64 +431,42 @@ fn menu_entries<A>(
 }
 
 impl CompiApp {
-    /// The sidebar's groups, each with the cards the search matches, by project; while
-    /// searching, only groups with a match, their cards in one section.
-    fn sidebar_groups(&self) -> Vec<SidebarGroup> {
-        let Some(workspace) = &self.workspace else {
-            return Vec::new();
-        };
+    fn sidebar_sections(&self) -> Vec<ProjectSection> {
         let query = &self.sidebar.query;
         let searching = searching(query);
-        let selected_session = self
-            .state
-            .selected_session(workspace)
-            .map(|session| session.id.clone());
-        let selected_tab = self.selected_tab().map(|tab| tab.id.clone());
-        workspace
-            .sessions
+        let projects = self
+            .listed_projects()
+            .into_iter()
+            .map(|listed| listed.project)
+            .filter(|project| !self.project_archived(project))
+            .collect();
+        let selected = self.selected_tab().map(|tab| &tab.id);
+        let cards = self
+            .workspace
             .iter()
-            .filter_map(|session| {
-                let tabs: Vec<TabId> = session.tabs.iter().map(|tab| tab.id.clone()).collect();
-                let cards: Vec<SidebarCard> = card_order(&tabs, &self.state.pinned_tabs)
+            .flat_map(|workspace| &workspace.sessions)
+            .flat_map(|session| {
+                let tabs: Vec<_> = session.tabs.iter().map(|tab| tab.id.clone()).collect();
+                card_order(&tabs, &self.state.pinned_tabs)
                     .into_iter()
-                    .filter_map(|id| {
+                    .filter_map(move |id| {
                         let tab = session.tabs.iter().find(|tab| tab.id == id)?;
-                        Some(self.tab_card(&session.id, tab, selected_tab.as_ref()))
+                        Some(self.tab_card(&session.id, tab, selected))
                     })
-                    .filter(|card| card.matches(query))
-                    .collect();
-                let sections = if searching {
-                    if cards.is_empty() {
-                        return None;
-                    }
-                    vec![ProjectSection {
-                        project: None,
-                        folded: false,
-                        cards,
-                    }]
-                } else {
-                    project_sections(
-                        cards,
-                        |card| card.project.as_ref(),
-                        |project| self.project_pinned(project),
-                    )
-                    .into_iter()
-                    .map(|(project, cards)| ProjectSection {
-                        folded: self.state.project_folded(&session.id, project.as_ref()),
-                        project,
-                        cards,
-                    })
-                    .collect()
-                };
-                Some(SidebarGroup {
-                    session: session.id.clone(),
-                    label: session.label.clone(),
-                    selected: selected_session.as_ref() == Some(&session.id),
-                    folded: self.state.workspace_folded(&session.id),
-                    sections,
-                })
             })
-            .collect()
+            .filter(|card| !searching || card.matches(query));
+        let mut sections = project_sections(projects, cards, |project| {
+            !searching && self.state.project_folded(project)
+        });
+        if searching {
+            sections.retain(|section| {
+                !section.cards.is_empty()
+                    || section.project.as_ref().is_some_and(|project| {
+                        matches_query(query, &[&self.project_name(project), &project.root])
+                    })
+            });
+        }
+        sections
     }
 
     fn tab_card(
@@ -764,31 +567,24 @@ impl CompiApp {
 
     /// How many cards Go to sidebar card 1–9 reach.
     pub(super) fn sidebar_card_count(&self) -> usize {
-        let query = &self.sidebar.query;
-        if searching(query) {
-            let groups = self.sidebar_groups();
-            return shown_cards(&groups, true).take(SHORTCUT_CARDS).count();
+        if searching(&self.sidebar.query) {
+            return shown_cards(&self.sidebar_sections())
+                .take(SHORTCUT_CARDS)
+                .count();
         }
-        // Without a search, counting the cards needs none of their titles.
-        let Some(workspace) = &self.workspace else {
-            return 0;
-        };
-        workspace
-            .sessions
+        self.workspace
             .iter()
-            .filter(|session| !self.state.workspace_folded(&session.id))
-            .map(|session| {
-                let projects: Vec<Option<&Project>> = session
-                    .tabs
-                    .iter()
-                    .map(|tab| tab.project.as_ref())
-                    .collect();
-                shown_count(&projects, |project| {
-                    self.state.project_folded(&session.id, project)
-                })
+            .flat_map(|workspace| &workspace.sessions)
+            .flat_map(|session| &session.tabs)
+            .filter(|tab| {
+                let saved = tab.project.as_ref().filter(|project| {
+                    self.project_settings(project)
+                        .is_some_and(|settings| !settings.archived)
+                });
+                !self.state.project_folded(saved)
             })
-            .sum::<usize>()
-            .min(SHORTCUT_CARDS)
+            .take(SHORTCUT_CARDS)
+            .count()
     }
 
     /// Go to sidebar card `number` (1-based), counted among the cards shown.
@@ -798,8 +594,8 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let groups = self.sidebar_groups();
-        let tab = shown_cards(&groups, searching(&self.sidebar.query))
+        let sections = self.sidebar_sections();
+        let tab = shown_cards(&sections)
             .nth(number.saturating_sub(1))
             .map(|card| card.tab.clone());
         if let Some(tab) = tab {
@@ -828,16 +624,6 @@ impl CompiApp {
         );
     }
 
-    /// Shows workspace `session`, as picking it in Switch workspace does.
-    fn select_workspace(&mut self, session: &SessionId, window: &Window) {
-        if let Some(workspace) = &self.workspace {
-            self.state.select_session(workspace, session);
-        }
-        self.sync_visible_views();
-        self.save_state();
-        self.rebuild_layout(window, true);
-    }
-
     /// New workspace: makes "Workspace N" at once and renames its label in place; with
     /// `moving`, moves that tab into it once it is there.
     fn new_workspace(
@@ -863,7 +649,7 @@ impl CompiApp {
             return;
         }
         self.sidebar.creating = Some(NewWorkspace { moving });
-        // A search would hide the new, empty workspace.
+        // Keep the pending name field visible.
         self.clear_sidebar_search(window, cx);
         self.start_label_rename(None, label, window, cx);
         self.sidebar.scroll.scroll_to_bottom();
@@ -991,14 +777,6 @@ impl CompiApp {
         self.apply_label_rename(cx);
     }
 
-    /// The projects of the threads last listed, newest first, repeats included.
-    pub(super) fn thread_projects(&self) -> impl Iterator<Item = &Project> {
-        self.sidebar
-            .threads
-            .iter()
-            .filter_map(|thread| thread.project.as_ref())
-    }
-
     /// Takes the daemon's thread list; a chat's title may now match the search.
     pub(super) fn sidebar_threads_listed(&mut self, threads: Vec<ThreadInfo>) {
         self.sidebar.threads = threads;
@@ -1007,8 +785,7 @@ impl CompiApp {
 
     fn clamp_sidebar_highlight(&mut self) {
         if let Some(highlight) = self.sidebar.highlight {
-            let groups = self.sidebar_groups();
-            let count = shown_cards(&groups, searching(&self.sidebar.query)).count();
+            let count = shown_cards(&self.sidebar_sections()).count();
             self.sidebar.highlight = (count > 0).then(|| highlight.min(count - 1));
         }
     }
@@ -1096,8 +873,8 @@ impl CompiApp {
         let searching = searching(&self.sidebar.query);
         match key.key.as_str() {
             "up" | "down" => {
-                let groups = self.sidebar_groups();
-                let count = shown_cards(&groups, searching).count();
+                let sections = self.sidebar_sections();
+                let count = shown_cards(&sections).count();
                 if count == 0 {
                     return true;
                 }
@@ -1108,22 +885,28 @@ impl CompiApp {
                     (Some(at), _) => at.saturating_sub(1),
                 };
                 self.sidebar.highlight = Some(next);
-                if let Some(row) = card_row(&groups, searching, next) {
+                if let Some(row) = card_row(&sections, next) {
                     self.sidebar.scroll.scroll_to_item(row);
                 }
                 true
             }
             "enter" => {
-                let groups = self.sidebar_groups();
+                let sections = self.sidebar_sections();
                 let tab = self
                     .sidebar
                     .highlight
                     .or(searching.then_some(0))
-                    .and_then(|at| shown_cards(&groups, searching).nth(at))
+                    .and_then(|at| shown_cards(&sections).nth(at))
                     .map(|card| card.tab.clone());
                 if let Some(tab) = tab {
                     self.clear_sidebar_search(window, cx);
                     self.open_card(tab, window, cx);
+                } else if searching
+                    && sections.len() == 1
+                    && let Some(project) = &sections[0].project
+                {
+                    self.clear_sidebar_search(window, cx);
+                    self.open_project_settings(project, window, cx);
                 }
                 true
             }
@@ -1136,11 +919,11 @@ impl CompiApp {
                 true
             }
             "f2" => {
-                let groups = self.sidebar_groups();
+                let sections = self.sidebar_sections();
                 let tab = self
                     .sidebar
                     .highlight
-                    .and_then(|at| shown_cards(&groups, searching).nth(at))
+                    .and_then(|at| shown_cards(&sections).nth(at))
                     .map(|card| card.tab.clone())
                     .or_else(|| self.selected_tab().map(|tab| tab.id.clone()));
                 if let Some(id) = tab {
@@ -1160,14 +943,8 @@ impl CompiApp {
             .update(cx, |search, cx| search.set_value("", window, cx));
     }
 
-    fn toggle_sidebar_fold(&mut self, session: &SessionId) {
-        self.state.toggle_workspace_folded(session);
-        self.save_state();
-        self.sidebar.highlight = None;
-    }
-
-    fn toggle_project_fold(&mut self, session: &SessionId, project: Option<&Project>) {
-        self.state.toggle_project_folded(session, project);
+    fn toggle_project_fold(&mut self, project: Option<&Project>) {
+        self.state.toggle_project_folded(project);
         self.save_state();
         self.sidebar.highlight = None;
     }
@@ -1279,93 +1056,41 @@ impl CompiApp {
         entries
     }
 
-    /// Right-click on a workspace's label (`workspace_menu_rows`).
-    fn open_workspace_menu(
-        &mut self,
-        session: SessionId,
-        position: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some((label, empty)) = self.workspace.as_ref().and_then(|workspace| {
-            let found = workspace
-                .sessions
-                .iter()
-                .find(|known| known.id == session)?;
-            Some((found.label.clone(), found.tabs.is_empty()))
-        }) else {
-            return;
-        };
-        let rows = workspace_menu_rows(self.state.workspace_folded(&session), empty);
-        let entries = menu_entries(rows, |action, reason| {
-            let session = session.clone();
-            let label = label.clone();
-            menu_item(
-                action.label(),
-                cx.listener(move |this, _, window, cx| {
-                    match action {
-                        WorkspaceAction::Rename => {
-                            this.start_label_rename(
-                                Some(session.clone()),
-                                label.clone(),
-                                window,
-                                cx,
-                            );
-                        }
-                        WorkspaceAction::NewTerminal => {
-                            this.select_workspace(&session, window);
-                            this.execute(Command::NewTerminalTab, window, cx);
-                        }
-                        WorkspaceAction::NewThread => {
-                            this.select_workspace(&session, window);
-                            this.execute(Command::OpenChat, window, cx);
-                        }
-                        WorkspaceAction::Fold | WorkspaceAction::Unfold => {
-                            this.toggle_sidebar_fold(&session);
-                        }
-                        WorkspaceAction::Close => this.remove_workspace(session.clone()),
-                    }
-                    cx.notify();
-                }),
-            )
-            .disabled_because(reason)
-            .into()
-        });
-        self.open_menu(position, Anchor::TopLeft, entries, window, cx);
-    }
-
-    /// Right-click on a project header of workspace `session` (`project_menu_rows`).
+    /// Project actions keep the workspace selection separate from the project folder.
     fn open_project_menu(
         &mut self,
-        session: SessionId,
-        project: Option<Project>,
+        project: Project,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let rows = project_menu_rows(project.as_ref());
+        let session = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| self.state.selected_session(workspace))
+            .map(|session| session.id.clone());
+        let rows = project_menu_rows(session.is_some());
         let entries = menu_entries(rows, |action, reason| {
             if action == ProjectAction::CopyPath {
-                let root = project.as_ref().map(|project| project.root.clone());
-                return copy_entry(action.label(), root, reason);
+                return copy_entry(action.label(), Some(project.root.clone()), reason);
             }
             let (session, project) = (session.clone(), project.clone());
             menu_item(
                 action.label(),
                 cx.listener(move |this, _, window, cx| {
-                    if let Some(project) = &project {
-                        match action {
-                            ProjectAction::NewTerminal => {
-                                this.new_project_terminal(session.clone(), project);
+                    match action {
+                        ProjectAction::NewTerminal => {
+                            if let Some(session) = &session {
+                                this.new_project_terminal(session.clone(), &project);
                             }
-                            ProjectAction::NewThread => {
-                                this.new_project_thread(session.clone(), project);
-                            }
-                            ProjectAction::Settings => {
-                                this.open_project_settings(project, window, cx);
-                            }
-                            ProjectAction::CopyPath => {}
                         }
+                        ProjectAction::NewThread => {
+                            if let Some(session) = &session {
+                                this.new_project_thread(session.clone(), &project);
+                            }
+                        }
+                        ProjectAction::Settings => this.open_project_settings(&project, window, cx),
+                        ProjectAction::CopyPath => {}
                     }
                     cx.notify();
                 }),
@@ -1379,11 +1104,13 @@ impl CompiApp {
     /// New terminal here: a new tab of workspace `session` whose shell starts at the
     /// project's root, in the project's WSL distribution for a WSL project.
     pub(super) fn new_project_terminal(&mut self, session: SessionId, project: &Project) {
-        let distribution = match &project.environment {
-            compi_protocol::ContentEnvironment::Wsl { distribution } => Some(distribution.clone()),
-            compi_protocol::ContentEnvironment::Host => None,
+        use compi_protocol::{ContentEnvironment, WindowsShell};
+        let windows_shell = match &project.environment {
+            ContentEnvironment::Wsl { .. } => Some(WindowsShell::Wsl),
+            host if self.windows_paths(host) => Some(WindowsShell::PowerShell),
+            _ => None,
         };
-        self.mutate_in(
+        self.mutate_with_launch(
             WorkspaceMutation::CreateTab {
                 session_id: session,
                 label: String::new(),
@@ -1392,7 +1119,20 @@ impl CompiApp {
                 working_directory: Some(project.root.clone()),
             },
             true,
-            distribution,
+            |launch| {
+                if let Some(shell) = windows_shell {
+                    let profile = &mut launch.profile;
+                    if profile.windows_shell.for_directory(Some(&project.root)) != shell {
+                        profile.executable = None;
+                        profile.args.clear();
+                    }
+                    profile.windows_shell = shell;
+                    profile.distribution = match &project.environment {
+                        ContentEnvironment::Wsl { distribution } => Some(distribution.clone()),
+                        ContentEnvironment::Host => None,
+                    };
+                }
+            },
         );
     }
 
@@ -1462,18 +1202,6 @@ impl CompiApp {
                             .pb_2()
                             .overflow_y_scroll()
                             .track_scroll(&self.sidebar.scroll)
-                            // Where the list shows, so a card dragged over the search
-                            // or the bottom row lights no row scrolled under them.
-                            .on_drag_move(cx.listener(
-                                |this, event: &DragMoveEvent<CardDrag>, _, cx| {
-                                    this.sidebar.list_bounds = Some(event.bounds);
-                                    if !event.bounds.contains(&event.event.position)
-                                        && this.sidebar.drop_target.take().is_some()
-                                    {
-                                        cx.notify();
-                                    }
-                                },
-                            ))
                             .children(self.render_sidebar_rows(cx)),
                     )
                     .children(self.render_whats_new_card(cx))
@@ -1530,7 +1258,7 @@ impl CompiApp {
     ) -> impl IntoElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        let new_workspace_reason = Command::CreateWorkspace.disabled_reason(context);
+        let add_project_reason = self.workspace.is_none().then_some("Not connected");
         div()
             .flex_none()
             .px_2()
@@ -1554,19 +1282,18 @@ impl CompiApp {
                     ),
             )
             .child(
-                // One click: the workspace is there at once, its name ready to type.
                 self.sidebar_button_face(
-                    "sidebar-new-workspace",
+                    "sidebar-add-project",
                     IconName::FolderPlus,
-                    self.command_title("New workspace", Command::CreateWorkspace),
-                    new_workspace_reason,
+                    "Add project…".to_owned(),
+                    add_project_reason,
                     false,
                     false,
                 )
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .when(new_workspace_reason.is_none(), |button| {
+                .when(add_project_reason.is_none(), |button| {
                     button.on_click(cx.listener(|this, _, window, cx| {
-                        this.new_workspace(None, window, cx);
+                        this.open_add_project(false, window, cx);
                         cx.stop_propagation();
                     }))
                 }),
@@ -1764,121 +1491,69 @@ impl CompiApp {
         .into_any_element()
     }
 
-    /// Makes list row `row` of workspace `session` a place to drop a dragged card: a
-    /// card of another workspace lights `session`'s label while over it, and moves its
-    /// tab there when dropped.
-    fn drop_zone(
-        &self,
-        element: Stateful<Div>,
-        session: &SessionId,
-        row: usize,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
-        let (over, drop) = (session.clone(), session.clone());
-        element
-            .on_drag_move(
-                cx.listener(move |this, event: &DragMoveEvent<CardDrag>, _, cx| {
-                    let position = event.event.position;
-                    let inside = event.bounds.contains(&position)
-                        && this
-                            .sidebar
-                            .list_bounds
-                            .is_some_and(|list| list.contains(&position))
-                        && event.drag(cx).session != over;
-                    let current = this.sidebar.drop_target.as_ref().map(|(_, at)| *at);
-                    if inside && current != Some(row) {
-                        this.sidebar.drop_target = Some((over.clone(), row));
-                        cx.notify();
-                    } else if !inside && current == Some(row) {
-                        this.sidebar.drop_target = None;
-                        cx.notify();
-                    }
-                }),
-            )
-            .on_drop(cx.listener(move |this, drag: &CardDrag, _, cx| {
-                this.sidebar.drop_target = None;
-                this.move_tab_to_workspace(&drag.tab, &drop);
-                cx.notify();
-            }))
+    /// Bring the added (or already saved) project into view without starting work.
+    pub(super) fn reveal_sidebar_project(
+        &mut self,
+        project: &Project,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.clear_sidebar_search(window, cx);
+        if self.state.project_folded(Some(project)) {
+            self.toggle_project_fold(Some(project));
+        }
+        let mut row = 0;
+        for section in self.sidebar_sections() {
+            if section.project.as_ref() == Some(project) {
+                let scroll = self.sidebar.scroll.clone();
+                window.on_next_frame(move |_, _| scroll.scroll_to_item(row));
+                break;
+            }
+            row += 1 + if section.folded {
+                0
+            } else {
+                section.cards.len()
+            };
+        }
+        cx.notify();
     }
 
-    /// The list's rows: each workspace's label, then its cards under their project
-    /// headers, or a line saying it has none; last, the label of a workspace New
-    /// workspace is making.
     fn render_sidebar_rows(&self, cx: &Context<Self>) -> Vec<AnyElement> {
         let colors = *self.colors();
-        let muted = modal_text_color(colors.muted, &colors);
-        let searching = searching(&self.sidebar.query);
-        let groups = self.sidebar_groups();
+        let sections = self.sidebar_sections();
         let now = now_ms();
-        let drop_target = self
-            .sidebar
-            .drop_target
-            .as_ref()
-            .filter(|_| cx.has_active_drag())
-            .map(|(session, _)| session);
         let mut rows = Vec::new();
         let mut shown = 0;
-        for group in groups {
-            let open = searching || !group.folded;
-            let target = drop_target == Some(&group.session);
-            rows.push(self.render_workspace_label(rows.len(), &group, open, target, cx));
-            if !open {
-                continue;
-            }
-            if group.sections.is_empty() {
-                let session = group.session.clone();
-                let row = rows.len();
-                let placeholder = div()
-                    .id(("sidebar-empty", row))
-                    .mx_2()
-                    .px_2p5()
-                    .py_1()
-                    .rounded(px(8.0))
+        if sections.is_empty() {
+            rows.push(
+                div()
+                    .px_4()
+                    .py_2()
                     .text_size(px(UI_SMALL_TEXT_SIZE))
-                    .text_color(color(muted))
-                    .cursor_pointer()
-                    .hover(move |style| {
-                        style.bg(color(blend_rgb(colors.surface, colors.foreground, 0.05)))
+                    .text_color(color(modal_text_color(colors.muted, &colors)))
+                    .child(if searching(&self.sidebar.query) {
+                        "No matches"
+                    } else {
+                        "No projects or open tabs"
                     })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.select_workspace(&session, window);
-                        cx.notify();
-                    }))
-                    .child("No tabs");
-                rows.push(
-                    self.drop_zone(placeholder, &group.session, row, cx)
-                        .into_any_element(),
-                );
+                    .into_any_element(),
+            );
+        }
+        for section in sections {
+            rows.push(
+                self.render_project_header(rows.len(), &section, cx)
+                    .into_any_element(),
+            );
+            if section.folded {
                 continue;
             }
-            let headed = group.headed();
-            for section in group.sections {
-                if headed {
-                    let row = rows.len();
-                    let header = self.render_project_header(row, &group.session, &section, cx);
-                    rows.push(
-                        self.drop_zone(header, &group.session, row, cx)
-                            .into_any_element(),
-                    );
-                    if section.folded {
-                        continue;
-                    }
-                }
-                for card in section.cards {
-                    let highlighted = self.sidebar.highlight == Some(shown);
-                    let row = rows.len();
-                    rows.push(self.render_card(shown, row, card, highlighted, now, cx));
-                    shown += 1;
-                }
+            for card in section.cards {
+                let highlighted = self.sidebar.highlight == Some(shown);
+                rows.push(self.render_card(shown, card, highlighted, now, cx));
+                shown += 1;
             }
         }
-        if let Some(rename) = self
-            .sidebar
-            .rename
-            .as_ref()
-            .filter(|rename| rename.session.is_none())
-        {
+        if let Some(rename) = &self.sidebar.rename {
             rows.push(
                 div()
                     .id("sidebar-new-workspace-label")
@@ -1896,103 +1571,6 @@ impl CompiApp {
             );
         }
         rows
-    }
-
-    /// A workspace's label: it folds the workspace, has the workspace's menu on
-    /// right-click and lights while a card of another workspace is dragged over it or
-    /// its rows (`target`). Folded, it shows how many cards are under it.
-    fn render_workspace_label(
-        &self,
-        row: usize,
-        group: &SidebarGroup,
-        open: bool,
-        target: bool,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let colors = *self.colors();
-        let muted = modal_text_color(colors.muted, &colors);
-        let count = group.card_count();
-        let renaming = self
-            .sidebar
-            .rename
-            .as_ref()
-            .filter(|rename| rename.session.as_ref() == Some(&group.session));
-        let (fold, menu) = (group.session.clone(), group.session.clone());
-        let label = div()
-            .id(("sidebar-group", row))
-            .mx_2()
-            .mt_2()
-            .px_1()
-            .py_1()
-            .rounded(px(6.0))
-            .flex()
-            .items_center()
-            .gap_2()
-            .text_size(px(UI_MICRO_TEXT_SIZE))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(color(if target {
-                colors.accent
-            } else if group.selected || renaming.is_some() {
-                colors.foreground
-            } else {
-                muted
-            }))
-            .when(target, |label| label.bg(color(colors.accent).opacity(0.14)))
-            .map(|label| match renaming {
-                Some(rename) => label.child(self.render_label_input(rename, cx)),
-                None => label
-                    .cursor_pointer()
-                    .hover(move |style| style.text_color(color(colors.foreground)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_sidebar_fold(&fold);
-                        cx.notify();
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            this.open_workspace_menu(menu.clone(), event.position, window, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(group.label.clone()),
-                    )
-                    // Folded, a dot for what its cards most need and how many there are.
-                    .when_some(group.state().filter(|_| !open), |label, state| {
-                        label.child(
-                            div()
-                                .flex_none()
-                                .size(px(7.0))
-                                .rounded_full()
-                                .bg(color(self.program_state_color(state))),
-                        )
-                    })
-                    .when(!open && count > 0, |label| {
-                        label.child(
-                            div()
-                                .flex_none()
-                                .font_weight(FontWeight::NORMAL)
-                                .child(count.to_string()),
-                        )
-                    })
-                    // Down while open, right while folded, at the row's end.
-                    .child(controls::glyph(
-                        if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        },
-                        color(muted),
-                    )),
-            });
-        self.drop_zone(label, &group.session, row, cx)
-            .into_any_element()
     }
 
     /// The field renaming a workspace's label, or once confirmed, the name it is
@@ -2021,31 +1599,21 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// A project's header in a workspace whose cards span projects: its icon, name and
-    /// card count on one line, at the cards' indent, set apart by weight. It folds the
-    /// project's cards; folded, it shows one dot for the most urgent of them.
+    /// A saved project (even before a tab is open), or the Loose tabs section.
     fn render_project_header(
         &self,
         row: usize,
-        session: &SessionId,
         section: &ProjectSection,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let colors = *self.colors();
         let muted = modal_text_color(colors.muted, &colors);
-        let icon = match &section.project {
-            Some(project) => self.project_icon(Some(project), 16.0),
-            // No project: an empty tile where a project's icon would be.
-            None => div()
-                .flex_none()
-                .size(px(16.0))
-                .rounded(px(4.0))
-                .border_1()
-                .border_color(color(muted).opacity(0.6))
-                .into_any_element(),
-        };
+        let icon = section
+            .project
+            .as_ref()
+            .map(|project| self.project_icon(Some(project), 16.0));
         let name = section.project.as_ref().map_or_else(
-            || "No project".to_owned(),
+            || "Loose tabs".to_owned(),
             |project| self.project_name(project),
         );
         let tooltip = section.project.as_ref().map(|project| {
@@ -2064,8 +1632,8 @@ impl CompiApp {
                     None,
                 ))
         });
-        let (fold_session, fold_project) = (session.clone(), section.project.clone());
-        let (menu_session, menu_project) = (session.clone(), section.project.clone());
+        let fold_project = section.project.clone();
+        let menu_project = section.project.clone();
         div()
             .id(("sidebar-project", row))
             .mx_2()
@@ -2083,30 +1651,29 @@ impl CompiApp {
             } else {
                 colors.foreground
             }))
-            .cursor_pointer()
+            .when(!section.cards.is_empty(), |header| {
+                header
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_project_fold(fold_project.as_ref());
+                        cx.notify();
+                    }))
+            })
             .hover(move |style| style.bg(color(blend_rgb(colors.surface, colors.foreground, 0.05))))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_project_fold(&fold_session, fold_project.as_ref());
-                cx.notify();
-            }))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    this.open_project_menu(
-                        menu_session.clone(),
-                        menu_project.clone(),
-                        event.position,
-                        window,
-                        cx,
-                    );
-                    cx.stop_propagation();
-                }),
-            )
+            .when_some(menu_project, |header, project| {
+                header.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        this.open_project_menu(project.clone(), event.position, window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+            })
             .when_some(
                 tooltip.filter(|_| self.context_menu.is_none()),
                 |header, tooltip| header.tooltip(tooltip),
             )
-            .child(icon)
+            .children(icon)
             .child(
                 div()
                     .flex_1()
@@ -2117,7 +1684,7 @@ impl CompiApp {
                     .child(name),
             )
             .children(dot)
-            .when(section.folded, |header| {
+            .when(section.folded && !section.cards.is_empty(), |header| {
                 header.child(
                     div()
                         .flex_none()
@@ -2127,20 +1694,36 @@ impl CompiApp {
                         .child(section.cards.len().to_string()),
                 )
             })
-            .child(controls::glyph(
-                if section.folded {
-                    IconName::ChevronRight
-                } else {
-                    IconName::ChevronDown
-                },
-                color(muted),
-            ))
+            .when(!section.cards.is_empty(), |header| {
+                header.child(controls::glyph(
+                    if section.folded {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    },
+                    color(muted),
+                ))
+            })
+            .when_some(section.project.clone(), |header, project| {
+                header.child(
+                    controls::icon_button(
+                        ("sidebar-project-actions", row),
+                        IconName::Ellipsis,
+                        "Project actions",
+                    )
+                    .on_click(cx.listener(
+                        move |this, event: &ClickEvent, window, cx| {
+                            this.open_project_menu(project.clone(), event.position(), window, cx);
+                            cx.stop_propagation();
+                        },
+                    )),
+                )
+            })
     }
 
     fn render_card(
         &self,
         index: usize,
-        row: usize,
         card: SidebarCard,
         highlighted: bool,
         now: u64,
@@ -2148,16 +1731,6 @@ impl CompiApp {
     ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        // A card can be dragged onto another workspace.
-        let drag = CardDrag {
-            tab: card.tab.clone(),
-            session: card.session.clone(),
-            title: card.title.clone(),
-            background: colors.surface,
-            foreground: colors.foreground,
-            border: colors.accent,
-        };
-        let session = card.session.clone();
         let (open, rename) = (card.tab.clone(), card.tab.clone());
         let (menu_tab, menu_session) = (card.tab.clone(), card.session.clone());
         let kind = if let Some(harness) = card.chat {
@@ -2205,7 +1778,7 @@ impl CompiApp {
         } else {
             None
         };
-        let element = div()
+        div()
             .id(("sidebar-card", index))
             .mx_2()
             .mb_0p5()
@@ -2246,9 +1819,6 @@ impl CompiApp {
                     cx.stop_propagation();
                 }),
             )
-            .on_drag(drag, |drag: &CardDrag, _, _, cx: &mut App| {
-                cx.new(|_| drag.clone())
-            })
             .when_some(tooltip, |card, tooltip| card.tooltip(tooltip))
             .child(
                 div()
@@ -2311,8 +1881,7 @@ impl CompiApp {
                         Some(dot) => dot.into_any_element(),
                         None => div().size(px(7.0)).into_any_element(),
                     }),
-            );
-        self.drop_zone(element, &session, row, cx)
+            )
             .into_any_element()
     }
 }
@@ -2361,35 +1930,6 @@ mod tests {
         assert_eq!(card_note(&card, now).as_deref(), Some("Draft"));
         card.draft = false;
         assert_eq!(card_note(&card, now), None);
-    }
-
-    /// A workspace whose cards are `ids`, all without a project.
-    fn group(folded: bool, ids: &[&str]) -> SidebarGroup {
-        let cards: Vec<SidebarCard> = ids.iter().map(|id| tab_card(id, None)).collect();
-        headed_group(folded, cards, &[])
-    }
-
-    /// A workspace of `cards` by project as the sidebar builds it, with the projects
-    /// in `folded_projects` folded.
-    fn headed_group(
-        folded: bool,
-        cards: Vec<SidebarCard>,
-        folded_projects: &[Option<&Project>],
-    ) -> SidebarGroup {
-        SidebarGroup {
-            session: SessionId::new("s"),
-            label: String::new(),
-            selected: false,
-            folded,
-            sections: project_sections(cards, |card| card.project.as_ref(), |_| false)
-                .into_iter()
-                .map(|(project, cards)| ProjectSection {
-                    folded: folded_projects.contains(&project.as_ref()),
-                    project,
-                    cards,
-                })
-                .collect(),
-        }
     }
 
     fn targets<'a>(cards: impl Iterator<Item = &'a SidebarCard>) -> Vec<TabId> {
@@ -2484,8 +2024,7 @@ mod tests {
 
     #[test]
     fn a_project_headers_menu_starts_work_at_its_root() {
-        let compi = project("/work/compi");
-        let rows = project_menu_rows(Some(&compi));
+        let rows = project_menu_rows(true);
         assert_eq!(
             rows,
             [
@@ -2509,46 +2048,15 @@ mod tests {
                 "Project settings…"
             ]
         );
-        // The cards without a project have no root to start at.
-        assert!(
-            project_menu_rows(None)
-                .into_iter()
-                .flatten()
-                .all(|(_, reason)| reason.is_some())
-        );
-    }
-
-    #[test]
-    fn a_workspace_labels_menu_folds_and_starts_threads_only_from_a_tab() {
-        let labels = |rows: &MenuRows<WorkspaceAction>| -> Vec<&'static str> {
-            rows.iter()
-                .map(|row| row.map_or("-", |(action, _)| action.label()))
-                .collect()
-        };
-        let open = workspace_menu_rows(false, false);
-        assert_eq!(
-            labels(&open),
-            [
-                "Rename…",
-                "-",
-                "New terminal",
-                "New thread",
-                "-",
-                "Fold",
-                "-",
-                "Close workspace…",
-            ]
-        );
-        assert!(open.iter().flatten().all(|(_, reason)| reason.is_none()));
-        let folded_empty = workspace_menu_rows(true, true);
-        assert_eq!(labels(&folded_empty)[5], "Unfold");
-        let disabled: Vec<WorkspaceAction> = folded_empty
+        let unavailable: Vec<_> = project_menu_rows(false)
             .into_iter()
             .flatten()
-            .filter(|(_, reason)| reason.is_some())
-            .map(|(action, _)| action)
+            .filter_map(|(action, reason)| reason.map(|_| action))
             .collect();
-        assert_eq!(disabled, [WorkspaceAction::NewThread]);
+        assert_eq!(
+            unavailable,
+            [ProjectAction::NewTerminal, ProjectAction::NewThread]
+        );
     }
 
     #[test]
@@ -2570,155 +2078,48 @@ mod tests {
     }
 
     #[test]
-    fn shortcuts_count_the_cards_shown_skipping_folded_workspaces() {
-        let groups = [
-            group(false, &["a", "b"]),
-            group(true, &["c"]),
-            group(false, &[]),
-            group(false, &["d"]),
-        ];
-        assert_eq!(
-            targets(shown_cards(&groups, false)),
-            tab_targets(&["a", "b", "d"])
-        );
-        // A search lists matches in folded workspaces too.
-        assert_eq!(shown_cards(&groups, true).count(), 4);
-        // Rows: label a b | label | label "No tabs" | label d.
-        assert_eq!(card_row(&groups, false, 0), Some(1));
-        assert_eq!(card_row(&groups, false, 1), Some(2));
-        assert_eq!(card_row(&groups, false, 2), Some(7));
-        assert_eq!(card_row(&groups, false, 3), None);
-        assert_eq!(card_row(&groups, true, 2), Some(4));
-    }
-
-    #[test]
-    fn project_headers_show_only_when_cards_span_two_or_more_projects() {
-        let (compi, site) = (project("/work/compi"), project("/work/site"));
-        // One project, or none at all: plain cards.
-        let one = headed_group(
-            false,
-            vec![tab_card("a", Some(&compi)), tab_card("b", Some(&compi))],
-            &[],
-        );
-        assert!(!one.headed());
-        assert!(!group(false, &["a", "b"]).headed());
-        // Cards without a project count as one more.
-        let mixed = headed_group(
-            false,
-            vec![tab_card("a", Some(&compi)), tab_card("b", None)],
-            &[],
-        );
-        assert!(mixed.headed());
-        let two = headed_group(
-            false,
-            vec![tab_card("a", Some(&compi)), tab_card("b", Some(&site))],
-            &[],
-        );
-        assert!(two.headed());
-    }
-
-    #[test]
-    fn project_headers_come_in_first_card_order_and_keep_the_cards_order() {
-        let (compi, site) = (project("/work/compi"), project("/work/site"));
-        let cards = vec![
-            tab_card("a", Some(&site)),
-            tab_card("b", None),
-            tab_card("c", Some(&compi)),
-            tab_card("d", Some(&site)),
-            tab_card("e", Some(&compi)),
-            tab_card("f", None),
-        ];
-        let group = headed_group(false, cards, &[]);
-        let sections: Vec<(Option<&str>, Vec<TabId>)> = group
-            .sections
-            .iter()
-            .map(|section| {
-                (
-                    section.project.as_ref().map(Project::name),
-                    targets(section.cards.iter()),
-                )
-            })
-            .collect();
-        assert_eq!(
-            sections,
-            [
-                (Some("site"), tab_targets(&["a", "d"])),
-                (None, tab_targets(&["b", "f"])),
-                (Some("compi"), tab_targets(&["c", "e"])),
-            ]
-        );
-        // Shortcuts count in the order shown: by project.
-        assert_eq!(
-            targets(shown_cards(&[group], false)),
-            tab_targets(&["a", "d", "b", "f", "c", "e"])
-        );
-    }
-
-    #[test]
-    fn pinned_projects_head_the_list_and_keep_their_order() {
-        let (compi, site, docs) = (
-            project("/work/compi"),
-            project("/work/site"),
-            project("/work/docs"),
-        );
-        let cards = vec![
-            tab_card("a", Some(&site)),
-            tab_card("b", None),
-            tab_card("c", Some(&compi)),
-            tab_card("d", Some(&docs)),
-        ];
+    fn saved_projects_without_tabs_stay_visible_and_unknown_tabs_are_loose() {
+        let empty = project("/work/compi");
+        let saved = project("/work/site");
+        let unsaved = project("/work/other");
         let sections = project_sections(
-            cards,
-            |card| card.project.as_ref(),
-            |project| project.root != "/work/site",
+            vec![empty.clone(), saved.clone()],
+            [
+                tab_card("home", None),
+                tab_card("site", Some(&saved)),
+                tab_card("other", Some(&unsaved)),
+            ],
+            |_| false,
         );
-        let order: Vec<Option<&str>> = sections
+        let headers: Vec<_> = sections
             .iter()
-            .map(|(project, _)| project.as_ref().map(Project::name))
+            .map(|section| section.project.as_ref())
             .collect();
-        assert_eq!(order, [Some("compi"), Some("docs"), Some("site"), None]);
+        assert_eq!(headers, [Some(&empty), Some(&saved), None]);
+        assert!(sections[0].cards.is_empty());
+        assert_eq!(
+            targets(sections[2].cards.iter()),
+            tab_targets(&["home", "other"])
+        );
+        assert_eq!(
+            targets(shown_cards(&sections)),
+            tab_targets(&["site", "home", "other"])
+        );
+        assert_eq!(card_row(&sections, 0), Some(2));
+        assert_eq!(card_row(&sections, 1), Some(4));
     }
 
     #[test]
-    fn a_folded_project_hides_its_cards_from_the_list_and_the_shortcuts() {
-        let (compi, site) = (project("/work/compi"), project("/work/site"));
-        let cards = || {
-            vec![
-                tab_card("a", Some(&compi)),
-                tab_card("b", Some(&site)),
-                tab_card("c", Some(&compi)),
-            ]
-        };
-        let groups = [
-            headed_group(false, cards(), &[Some(&compi)]),
-            group(false, &["d"]),
-        ];
-        assert_eq!(
-            targets(shown_cards(&groups, false)),
-            tab_targets(&["b", "d"])
+    fn folded_project_cards_are_skipped_by_sidebar_shortcuts() {
+        let compi = project("/work/compi");
+        let sections = project_sections(
+            vec![compi.clone()],
+            [tab_card("a", Some(&compi)), tab_card("b", None)],
+            |project| project == Some(&compi),
         );
-        // Rows: label, compi header (folded), site header, b | label, d.
-        assert_eq!(card_row(&groups, false, 0), Some(3));
-        assert_eq!(card_row(&groups, false, 1), Some(5));
-        // The quick count agrees, and a single project's fold does nothing.
-        let projects = [Some(&compi), Some(&site), Some(&compi)];
-        assert_eq!(shown_count(&projects, |project| project == Some(&compi)), 1);
-        assert_eq!(shown_count(&projects, |_| false), 3);
-        assert_eq!(
-            shown_count(&[Some(&compi), Some(&compi)], |project| project
-                == Some(&compi)),
-            2
-        );
-        // A search shows every match, without headers.
-        let searched = [SidebarGroup {
-            sections: vec![ProjectSection {
-                project: None,
-                folded: false,
-                cards: cards(),
-            }],
-            ..headed_group(true, Vec::new(), &[])
-        }];
-        assert_eq!(shown_cards(&searched, true).count(), 3);
+        assert_eq!(targets(shown_cards(&sections)), tab_targets(&["b"]));
+        assert_eq!(card_row(&sections, 0), Some(2));
+        assert_eq!(card_row(&sections, 1), None);
     }
 
     #[test]

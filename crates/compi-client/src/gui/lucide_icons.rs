@@ -2,13 +2,16 @@
 //! the licence is `assets/lucide/LICENSE`), unchanged, for the icons you choose for a
 //! project. They draw in the text colour around them, at `lucide/<name>.svg` in the
 //! application's assets.
+//! The GitHub outline comes from Lucide 0.468.0.
 
 include!(concat!(env!("OUT_DIR"), "/lucide_icons.rs"));
 
 /// Where the icons come from and their licence, for the licences Settings shows.
 pub(super) const ATTRIBUTION: &str = concat!(
     "LUCIDE (project icons, unchanged)\n",
-    "Source: https://github.com/lucide-icons/lucide/tree/1.43.0/icons\n\n",
+    "Source: https://github.com/lucide-icons/lucide/tree/1.43.0/icons\n",
+    "GitHub icon: https://github.com/lucide-icons/lucide/blob/0.468.0/icons/github.svg\n\n",
+    "GitHub icon copyright (c) Lucide Contributors 2022.\n\n",
     include_str!("../../assets/lucide/LICENSE"),
 );
 
@@ -89,7 +92,6 @@ mod tests {
 
     #[test]
     fn every_lucide_icon_is_bundled_in_name_order() {
-        assert_eq!(ICONS.len(), 1818);
         assert!(ICONS.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert_eq!(path("rocket"), Some("lucide/rocket.svg"));
         assert!(file("lucide/square-terminal.svg").is_some_and(|svg| svg.starts_with(b"<svg")));

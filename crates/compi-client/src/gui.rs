@@ -1018,6 +1018,7 @@ struct CompiApp {
     overlay_closing_since: Option<Instant>,
     /// The palette's scope chip and file search; see `workspace::palette`.
     palette: workspace::palette::PaletteState,
+    add_project: Option<workspace::add_project::AddProject>,
     /// Projects' images, asked of the daemon as their icons show; see `project_icon`.
     project_icons: project_icon::ProjectIcons,
     /// Settings panes, Quick Appearance and their keyboard highlight; see `settings`.

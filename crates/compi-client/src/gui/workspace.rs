@@ -5,6 +5,7 @@ use gpui::{
     WindowHandle,
 };
 use sha2::{Digest, Sha256};
+pub(super) mod add_project;
 pub(in crate::gui) mod arrangements;
 pub(in crate::gui) mod branches;
 pub(in crate::gui) mod browser;
@@ -437,6 +438,7 @@ pub(super) enum Overlay {
         /// Other tabs in this workspace to merge into `tab_id`, in tab order.
         merge: Vec<TabId>,
     },
+    AddProject,
     /// Choose project icon, from Settings → Projects.
     ProjectIcon(Box<project_icon_picker::IconPicker>),
     /// Remove `project` from Compi: forget what is set for it and its recent entry, and
@@ -465,6 +467,7 @@ pub(super) enum Popup {
     NotificationSound,
     /// Settings → Agents → Approvals.
     ChatApproval,
+    ProjectEnvironment,
     /// The theme list's More menu.
     CatalogMenu,
     /// The Appearance controls under the sidebar's Appearance button.
@@ -990,6 +993,7 @@ impl CompiApp {
             overlay_generation: 0,
             overlay_closing_since: None,
             palette: palette::PaletteState::default(),
+            add_project: None,
             project_icons: Default::default(),
             settings: settings::SettingsUi::default(),
             monitor: monitor::MonitorUi::default(),
@@ -1072,11 +1076,20 @@ impl CompiApp {
                 cx.notify();
             }));
         let editor_keys = cx.entity().downgrade();
+        let key_window = Window::window_handle(window).window_id();
         this.subscriptions
             .push(cx.intercept_keystrokes(move |event, window, cx| {
-                if let Some(app) = editor_keys.upgrade() {
+                if Window::window_handle(window).window_id() == key_window
+                    && let Some(app) = editor_keys.upgrade()
+                {
                     app.update(cx, |this, cx| {
-                        this.intercept_editor_key(&event.keystroke, window, cx)
+                        if this.add_project.is_some() {
+                            if this.add_project_key(&event.keystroke, window, cx) {
+                                cx.stop_propagation();
+                            }
+                        } else {
+                            this.intercept_editor_key(&event.keystroke, window, cx);
+                        }
                     });
                 }
             }));
@@ -1732,6 +1745,19 @@ impl CompiApp {
         select_created: bool,
         distribution: Option<String>,
     ) -> Option<MutationId> {
+        self.mutate_with_launch(operation, select_created, |launch| {
+            if distribution.is_some() {
+                launch.profile.distribution = distribution;
+            }
+        })
+    }
+
+    fn mutate_with_launch(
+        &mut self,
+        operation: WorkspaceMutation,
+        select_created: bool,
+        configure: impl FnOnce(&mut compi_protocol::LaunchContext),
+    ) -> Option<MutationId> {
         if self.update_quiesced.load(Ordering::Acquire) {
             return None;
         }
@@ -1744,9 +1770,7 @@ impl CompiApp {
             match &self.config.launch {
                 Ok(launch) => {
                     let mut launch = launch.clone();
-                    if distribution.is_some() {
-                        launch.profile.distribution = distribution;
-                    }
+                    configure(&mut launch);
                     Some(launch)
                 }
                 Err(error) => {
@@ -3644,6 +3668,7 @@ impl CompiApp {
     }
 
     fn finish_dismiss_overlay(&mut self) {
+        self.add_project = None;
         self.image_inspector = None;
         self.overlay = None;
         self.overlay_closing_since = None;
@@ -3714,6 +3739,11 @@ impl CompiApp {
         if self.overlay.is_some() {
             if self.overlay_closing_since.is_some() {
                 return true;
+            }
+            if matches!(self.overlay, Some(Overlay::AddProject)) {
+                // The picker handles navigation before key bindings. Other
+                // keystrokes belong to its controls, never to the terminal.
+                return false;
             }
             if self.handle_dialog_key(key, window, cx) {
                 return true;
@@ -3870,6 +3900,7 @@ impl CompiApp {
                     | Overlay::Diagnostics
                     | Overlay::ChooseNewTab
                     | Overlay::Arrangements { .. }
+                    | Overlay::AddProject
             )
         ) {
             return;
@@ -5457,7 +5488,11 @@ impl CompiApp {
                 root.child(self.render_fps_overlay())
             })
             .when(self.overlay.is_some(), |root| {
-                root.child(self.render_overlay(window, cx))
+                root.child(if let Some(picker) = &self.add_project {
+                    self.animate_overlay(self.render_add_project(picker, window, cx), true)
+                } else {
+                    self.render_overlay(window, cx)
+                })
             })
             .when_some(
                 self.drag_position

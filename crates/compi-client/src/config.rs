@@ -311,6 +311,8 @@ impl NewTab {
 /// default agent and that agent's model).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectSettings {
+    /// Explicitly added projects stay saved even with no overrides.
+    pub saved: bool,
     /// The name it goes by instead of its folder's.
     pub name: Option<String>,
     pub icon: Option<ProjectIcon>,
@@ -1356,6 +1358,7 @@ impl LoadedConfig {
                     table.remove(field);
                 }
             };
+            set("saved", settings.saved.then(|| true.into()));
             set("name", settings.name.as_deref().map(Into::into));
             set("icon", settings.icon.as_ref().map(project_icon_to_toml));
             set("pinned", settings.pinned.then(|| true.into()));
@@ -2888,6 +2891,7 @@ fn apply_projects(document: &toml::Table, loaded: &mut LoadedConfig) {
             }
         }
         for (name, slot) in [
+            ("saved", &mut settings.saved),
             ("pinned", &mut settings.pinned),
             ("archived", &mut settings.archived),
         ] {
@@ -3847,6 +3851,7 @@ mod tests {
             root: r"C:\Users\me\site".into(),
         };
         let settings = ProjectSettings {
+            saved: false,
             name: Some("Compi".into()),
             icon: Some(ProjectIcon::Lucide {
                 name: "rocket".into(),
@@ -3910,6 +3915,20 @@ mod tests {
         assert!(!text.contains("name = \"Compi\""), "{text}");
         assert!(text.contains("pinned = true"), "{text}");
         assert!(text.contains("archived = true"), "{text}");
+        let saved_only = ProjectSettings {
+            saved: true,
+            ..ProjectSettings::default()
+        };
+        loaded
+            .save_project_settings(&key, saved_only.clone())
+            .unwrap();
+        assert_eq!(
+            load(Some(&path), FontOverrides::default())
+                .projects
+                .get(&key),
+            Some(&saved_only),
+            "an added project with no overrides survives reload"
+        );
         loaded
             .save_project_settings(&key, ProjectSettings::default())
             .unwrap();

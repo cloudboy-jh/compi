@@ -91,17 +91,17 @@ thinking = "high" # the model's variant; "default" is the model's own
 
 ## Projects
 
-A project is the folder a tab or thread works in: its Git repository's top folder, else the folder itself. **Settings → Projects** lists every project as a compact row (icon, name, folder, a **Pinned** chip, the mark of the agent its new threads start with when it picks one, and a pin button) under **Pinned**, **Open** (a tab of it is open), **Recent** and **Archived** (folded until you open it). With more than 8 projects a search field filters them by name or folder; typing on the page searches too. Click a row (or press Enter on it) to open its detail under it, one at a time; the page opens on the current tab's project. The detail shows a large icon, the name and folder, **Open in new tab** (a thread or a terminal at its folder, as **Settings → General → New tabs** says) and **Reveal folder**. Right-clicking a project header in the sidebar and choosing **Project settings…** opens its detail here. Every change saves at once and applies in every window.
+A project is a saved folder in a particular environment. In a Git repository it is the repository root. **Settings → Projects** and the sidebar show the same saved projects, including projects with no open tabs. Use **Add project…** to open an existing folder or clone a Git URL. Existing project customizations are kept; folders only visited by a shell are not saved as projects. Choose a project row to edit its settings, or open **Project settings…** from its sidebar menu.
 
 - **Name** is what tabs' tooltips, the sidebar's project headers and cards, the palette's project list and a new thread's draft call the project; typing it in the palette finds the project, as its folder does. Type it in the Name field: Enter saves (so does leaving the field), Escape puts back the saved name. **Reset** (or its folder's name, or nothing) goes back to the folder's.
 - **Icon** shows the icon every place uses. **Change icon…** opens a dialog with five tabs: **Automatic** (the project's favicon or logo, else its first letter on a coloured tile), **Icons** (any Lucide icon, searched by name), **Emoji**, **Monogram** (one or two letters or numbers; icons and monograms take a colour of the terminal palette) and **Image file** (**Choose file…** takes a PNG, SVG or ICO, which Compi copies into its data folder, `project-icons/`). **Save icon** saves it; **Reset** goes back to Automatic.
-- **Pin** (the switch, or the pin button on its row) puts the project first among the sidebar's project headers, in the palette's project list and on this page.
+- **Pin** puts the project first in the sidebar and the Settings list.
 - **New threads' agent** is the agent new threads in the project start with (New thread here, New thread, a new tab, New chat, `compi chat` without `--agent`): **Default** follows **Settings → General → Default agent**, or pick **OMP**, **Claude Code**, **Codex** or **OpenCode**. Changing it clears the model.
 - **New threads' model** is a button with the model's mark and name; it opens the model picker chats use (providers on the left, a search, favourites and recent picks; Ctrl+D stars). No agent runs here, so it lists the models that agent listed last in any chat (Compi keeps them in its data folder, `listed-models.json`), plus your favourite and recent models of it; until a chat of that agent has listed them it says so ("Open a chat with OMP once to list its models"). **OMP's default** (and so on) goes back to what the agent starts on elsewhere. Picking a model while the agent is Default keeps the agent it belongs to as the project's.
-- **Archive** hides the project from the palette's Projects and from this page's main list (it moves under **Archived**); its threads and settings stay. **Unarchive** brings it back. `archived = true` in its table.
+- **Archive** hides the project from the sidebar and the main Settings list. Open tabs stay under **Loose tabs**; threads, settings and files are kept. Use **Restore** under **Archived** to bring it back.
 - **Remove from Compi…** forgets the project's settings and its place among recent projects and deletes its threads, after asking with how many ("Deletes 12 threads. Files on disk are untouched."). It is refused while a tab is open in the project, naming the tabs.
 
-Projects are kept under `[projects]`, each under its key: `host:<folder>`, or `wsl:<distribution>:<folder>` for a project in WSL. A project with nothing set has no table.
+Projects are kept under `[projects]`, each under its key: `host:<folder>`, or `wsl:<distribution>:<folder>` for a project in WSL. `saved = true` keeps a project listed even with no custom settings.
 
 ```toml
 [projects."wsl:Ubuntu:/home/me/compi"]
@@ -112,6 +112,7 @@ agent = "claude" # omp, claude or codex; unset follows [chat] agent
 model = "opus" # the agent's own name for the model; unset starts on the agent's default
 
 [projects.'host:C:\Users\me\site']
+saved = true
 icon = { kind = "monogram", text = "S", color = 2 } # one or two letters or numbers
 # icon = { kind = "emoji", emoji = "🚀" }
 # icon = { kind = "file", path = "C:\\Users\\me\\AppData\\…\\project-icons\\….png" }

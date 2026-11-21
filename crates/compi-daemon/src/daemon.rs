@@ -1262,6 +1262,41 @@ fn handle_connection(
                         Err((code, message)) => send_error(&sink, Some(request_id), code, message),
                     }
                 }
+                ClientMessage::ProjectEnvironments => match without_target(target.as_ref()) {
+                    Ok(()) => sink.send_control(&ServerControl {
+                        request_id: Some(request_id),
+                        message: ServerMessage::ProjectEnvironments {
+                            environments: crate::project::environments(),
+                        },
+                    })?,
+                    Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                },
+                ClientMessage::ResolveProjectFolder { environment, path } => {
+                    match without_target(target.as_ref())
+                        .and_then(|()| crate::project::resolve_folder(&environment, &path))
+                    {
+                        Ok(project) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ProjectResolved { project },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
+                ClientMessage::CloneProject {
+                    environment,
+                    url,
+                    destination,
+                } => {
+                    match without_target(target.as_ref()).and_then(|()| {
+                        crate::project::clone_repository(environment, &url, &destination)
+                    }) {
+                        Ok(project) => sink.send_control(&ServerControl {
+                            request_id: Some(request_id),
+                            message: ServerMessage::ProjectResolved { project },
+                        })?,
+                        Err((code, message)) => send_error(&sink, Some(request_id), code, &message),
+                    }
+                }
                 ClientMessage::ProjectIcon { project } => match without_target(target.as_ref()) {
                     Ok(()) => sink.send_control(&ServerControl {
                         request_id: Some(request_id),

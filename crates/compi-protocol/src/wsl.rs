@@ -2,9 +2,12 @@ use crate::Result;
 use crate::WorkingDirectory;
 use std::env;
 use std::fs;
+use std::io::{self, Read};
 use std::os::windows::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_PINNED, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
     FILE_ATTRIBUTE_UNPINNED,
@@ -556,7 +559,48 @@ fn run_wsl<'a>(args: impl IntoIterator<Item = &'a str>) -> std::io::Result<Outpu
     if let Some(path) = launch_path() {
         command.env("PATH", path);
     }
-    command.output()
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    fn read_pipe(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            (&mut pipe).take(128 * 1024).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        })
+    }
+    let stdout = read_pipe(child.stdout.take().expect("stdout is piped"));
+    let stderr = read_pipe(child.stderr.take().expect("stderr is piped"));
+    let timeout = || io::Error::new(io::ErrorKind::TimedOut, "WSL probe timed out");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            other => {
+                let _ = child.kill();
+                return Err(other.err().unwrap_or_else(timeout));
+            }
+        }
+    };
+    while !stdout.is_finished() || !stderr.is_finished() {
+        if Instant::now() >= deadline {
+            return Err(timeout());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let collect = |reader: thread::JoinHandle<io::Result<Vec<u8>>>| {
+        reader
+            .join()
+            .map_err(|_| io::Error::other("WSL output reader failed"))?
+    };
+    Ok(Output {
+        status,
+        stdout: collect(stdout)?,
+        stderr: collect(stderr)?,
+    })
 }
 
 fn checked_output(output: Output, context: &str) -> Result<String> {
