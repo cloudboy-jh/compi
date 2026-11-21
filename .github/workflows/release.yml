@@ -9,6 +9,10 @@ on:
         description: "Existing vMAJOR.MINOR.PATCH tag to build and draft; omit for a build-only dry run"
         required: false
         type: string
+      check_installed_update:
+        description: "Run the advisory installed Windows update check"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -112,6 +116,7 @@ jobs:
           $examples = Join-Path $PWD 'target\installer\diagnostics\debug\examples'
           .\tools\smoke-windows-distribution.ps1 -ProbePath (Join-Path $examples 'compi-probe.exe') -UpdateDriver (Join-Path $examples 'compi-update-smoke.exe')
       - name: Verify installed Setup migration and in-app update
+        if: github.event_name != 'workflow_dispatch' || inputs.check_installed_update
         # Advisory until the debug-fixture GUI attach timeout is diagnosed; evidence
         # is still uploaded. Publication signs the portable qualification only.
         continue-on-error: true
