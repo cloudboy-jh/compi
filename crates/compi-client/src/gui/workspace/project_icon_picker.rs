@@ -1,7 +1,8 @@
-//! Choose project icon, which Settings → Projects opens for a project: a Lucide icon
-//! (any of them, searched by name) or a monogram of one or two letters or numbers, each
-//! in a colour of the terminal palette, or an emoji. Choose file copies a PNG, SVG or
-//! ICO into Compi's data folder (`project-icons/`). Both save through
+//! Change icon, which Settings → Projects opens for a project, in five tabs: Automatic
+//! (the project's favicon or logo, else its first letter), a Lucide icon (any of them,
+//! searched by name), an emoji, a monogram of one or two letters or numbers (icon and
+//! monogram in a colour of the terminal palette), or an image file, which Choose file…
+//! copies into Compi's data folder (`project-icons/`). Save icon saves through
 //! `set_project_settings`, so every window shows the new icon.
 
 use super::*;
@@ -79,36 +80,55 @@ const COLOR_NAMES: [&str; 16] = [
 /// The image files Choose file takes, by extension.
 const FILE_KINDS: [&str; 3] = ["png", "svg", "ico"];
 
-/// What kind of icon the dialog makes.
+/// What kind of icon the dialog makes, one tab each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::gui) enum IconKind {
+    /// None chosen: the project's own image, else its letter.
+    Automatic,
     Icons,
     Emoji,
     Monogram,
+    /// An image file copied into Compi's data folder.
+    File,
 }
 
 impl IconKind {
-    const ALL: [Self; 3] = [Self::Icons, Self::Emoji, Self::Monogram];
+    const ALL: [Self; 5] = [
+        Self::Automatic,
+        Self::Icons,
+        Self::Emoji,
+        Self::Monogram,
+        Self::File,
+    ];
 
     fn index(self) -> usize {
         match self {
-            Self::Icons => 0,
-            Self::Emoji => 1,
-            Self::Monogram => 2,
+            Self::Automatic => 0,
+            Self::Icons => 1,
+            Self::Emoji => 2,
+            Self::Monogram => 3,
+            Self::File => 4,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
+            Self::Automatic => "Automatic",
             Self::Icons => "Icons",
             Self::Emoji => "Emoji",
             Self::Monogram => "Monogram",
+            Self::File => "Image file",
         }
+    }
+
+    /// Whether the kind has a grid the arrows move through.
+    fn grid(self) -> bool {
+        matches!(self, Self::Icons | Self::Emoji)
     }
 }
 
-/// Choose project icon's draft: what each kind would save. The shown kind's text field
-/// (the icon search, a pasted emoji, the monogram's letters) is the overlay's text.
+/// Change icon's draft: what each kind would save. The shown kind's text field (the
+/// icon search, a pasted emoji, the monogram's letters) is the overlay's text.
 #[derive(Clone)]
 pub(in crate::gui) struct IconPicker {
     project: Project,
@@ -118,8 +138,10 @@ pub(in crate::gui) struct IconPicker {
     /// The terminal palette colour (0–15) of the icon or monogram.
     color: u8,
     emoji: String,
+    /// The image file chosen, as copied into Compi's data folder.
+    file: Option<String>,
     /// The text fields of the kinds not shown, by [`IconKind::index`].
-    fields: [String; 3],
+    fields: [String; 5],
     grid: UniformListScrollHandle,
 }
 
@@ -254,7 +276,7 @@ fn picker_cell(
 }
 
 impl CompiApp {
-    /// Opens Choose project icon for `project`, starting from the icon you chose for it.
+    /// Opens Change icon for `project`, on the tab of the icon you chose for it.
     pub(in crate::gui) fn open_project_icon_picker(
         &mut self,
         project: Project,
@@ -267,19 +289,18 @@ impl CompiApp {
             .and_then(|settings| settings.icon.clone());
         let mut picker = IconPicker {
             project,
-            kind: IconKind::Icons,
+            kind: IconKind::Automatic,
             icon: DEFAULT_ICON.to_owned(),
             color: tile_color(&name) as u8,
             emoji: EMOJIS[0].0.to_owned(),
-            fields: [
-                String::new(),
-                String::new(),
-                tile_letter(&name).unwrap_or_default(),
-            ],
+            file: None,
+            fields: Default::default(),
             grid: UniformListScrollHandle::new(),
         };
+        picker.fields[IconKind::Monogram.index()] = tile_letter(&name).unwrap_or_default();
         match current {
             Some(ProjectIcon::Lucide { name, color }) => {
+                picker.kind = IconKind::Icons;
                 if lucide_icons::path(&name).is_some() {
                     picker.icon = name;
                 }
@@ -294,7 +315,11 @@ impl CompiApp {
                 picker.fields[IconKind::Monogram.index()] = text;
                 picker.color = color;
             }
-            Some(ProjectIcon::File { .. }) | None => {}
+            Some(ProjectIcon::File { path }) => {
+                picker.kind = IconKind::File;
+                picker.file = Some(path);
+            }
+            None => {}
         }
         if self.icon_color(usize::from(picker.color)).is_none() {
             picker.color = tile_color(&name) as u8;
@@ -305,22 +330,21 @@ impl CompiApp {
         cx.notify();
     }
 
-    /// Asks for a PNG, SVG or ICO image, copies it into Compi's data folder and makes it
-    /// `project`'s icon.
-    pub(in crate::gui) fn choose_project_icon_file(
-        &mut self,
-        project: Project,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let picker = cx.prompt_for_paths(gpui::PathPromptOptions {
+    /// Image file's Choose file…: asks for a PNG, SVG or ICO image and copies it into
+    /// Compi's data folder; the dialog, still open for the same project, then shows it,
+    /// for Save icon to save.
+    fn choose_icon_file(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.icon_picker().map(|picker| picker.project.clone()) else {
+            return;
+        };
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
             prompt: Some("Choose icon".into()),
         });
         cx.spawn(async move |this, cx| {
-            let source = match picker.await {
+            let source = match prompt.await {
                 Ok(Ok(Some(paths))) => paths.into_iter().next(),
                 Ok(Err(error)) => {
                     let _ = this.update(cx, |this, cx| {
@@ -345,26 +369,20 @@ impl CompiApp {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 match copied {
-                    Ok(path) => this.set_project_icon(
-                        &project,
-                        ProjectIcon::File {
-                            path: path.to_string_lossy().into_owned(),
-                        },
-                        cx,
-                    ),
+                    Ok(path) => {
+                        if let Some(picker) = this
+                            .icon_picker_mut()
+                            .filter(|picker| picker.project == project)
+                        {
+                            picker.file = Some(path.to_string_lossy().into_owned());
+                        }
+                    }
                     Err(error) => this.global_error = Some(error),
                 }
                 cx.notify();
             });
         })
         .detach();
-    }
-
-    /// Makes `icon` `project`'s, keeping the rest of what you set for it.
-    fn set_project_icon(&mut self, project: &Project, icon: ProjectIcon, cx: &mut Context<Self>) {
-        let mut settings = self.project_settings(project).cloned().unwrap_or_default();
-        settings.icon = Some(icon);
-        self.set_project_settings(project, settings, cx);
     }
 
     fn icon_picker(&self) -> Option<&IconPicker> {
@@ -381,10 +399,11 @@ impl CompiApp {
         }
     }
 
-    /// The icon the dialog would save; `None` while the monogram is not one or two
-    /// letters or numbers.
-    fn icon_choice(&self, picker: &IconPicker) -> Option<ProjectIcon> {
-        Some(match picker.kind {
+    /// The icon the dialog would save (`None`: Automatic), or why it cannot save yet: a
+    /// monogram that is not one or two letters or numbers, no image file chosen.
+    fn icon_choice(&self, picker: &IconPicker) -> Result<Option<ProjectIcon>, &'static str> {
+        Ok(Some(match picker.kind {
+            IconKind::Automatic => return Ok(None),
             IconKind::Icons => ProjectIcon::Lucide {
                 name: picker.icon.clone(),
                 color: picker.color,
@@ -393,23 +412,28 @@ impl CompiApp {
                 emoji: picker.emoji.clone(),
             },
             IconKind::Monogram => ProjectIcon::Monogram {
-                text: monogram(&self.ime_text)?,
+                text: monogram(&self.ime_text).ok_or("Enter one or two letters or numbers.")?,
                 color: picker.color,
             },
-        })
+            IconKind::File => ProjectIcon::File {
+                path: picker.file.clone().ok_or("Choose an image file first.")?,
+            },
+        }))
     }
 
-    /// Saves the dialog's icon and closes it; nothing while the monogram is not valid.
+    /// Saves the dialog's icon and closes it; nothing while it cannot save yet.
     fn save_icon_choice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(picker) = self.icon_picker() else {
             return;
         };
-        let Some(icon) = self.icon_choice(picker) else {
+        let Ok(icon) = self.icon_choice(picker) else {
             return;
         };
         let project = picker.project.clone();
         self.dismiss_overlay();
-        self.set_project_icon(&project, icon, cx);
+        let mut settings = self.project_settings(&project).cloned().unwrap_or_default();
+        settings.icon = icon;
+        self.set_project_settings(&project, settings, cx);
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -443,7 +467,7 @@ impl CompiApp {
                     picker.emoji = emoji.to_owned();
                 }
             }
-            IconKind::Monogram => {}
+            IconKind::Automatic | IconKind::Monogram | IconKind::File => {}
         }
     }
 
@@ -469,7 +493,7 @@ impl CompiApp {
                 let at = EMOJIS.iter().position(|(emoji, _)| *emoji == picker.emoji);
                 picker.emoji = EMOJIS[moved(at, EMOJIS.len())].0.to_owned();
             }
-            IconKind::Icons | IconKind::Monogram => {}
+            _ => {}
         }
     }
 
@@ -485,17 +509,18 @@ impl CompiApp {
             return false;
         };
         let columns = COLUMNS as isize;
+        let kinds = IconKind::ALL.len();
         match key.key.as_str() {
             "escape" => self.dismiss_overlay(),
             "enter" => self.save_icon_choice(window, cx),
             "tab" => {
-                let step = if key.modifiers.shift { 2 } else { 1 };
-                self.set_icon_kind(IconKind::ALL[(kind.index() + step) % 3]);
+                let step = if key.modifiers.shift { kinds - 1 } else { 1 };
+                self.set_icon_kind(IconKind::ALL[(kind.index() + step) % kinds]);
             }
-            "left" if kind != IconKind::Monogram => self.move_icon_choice(-1),
-            "right" if kind != IconKind::Monogram => self.move_icon_choice(1),
-            "up" if kind != IconKind::Monogram => self.move_icon_choice(-columns),
-            "down" if kind != IconKind::Monogram => self.move_icon_choice(columns),
+            "left" if kind.grid() => self.move_icon_choice(-1),
+            "right" if kind.grid() => self.move_icon_choice(1),
+            "up" if kind.grid() => self.move_icon_choice(-columns),
+            "down" if kind.grid() => self.move_icon_choice(columns),
             _ => return false,
         }
         cx.notify();
@@ -544,12 +569,13 @@ impl CompiApp {
     }
 
     /// A muted caption over a part of the dialog.
-    fn icon_picker_caption(&self, text: &'static str) -> AnyElement {
+    fn icon_picker_caption(&self, text: impl Into<SharedString>) -> AnyElement {
         let colors = *self.colors();
         div()
+            .min_w_0()
             .text_size(px(UI_SMALL_TEXT_SIZE))
             .text_color(color(modal_text_color(colors.muted, &colors)))
-            .child(text)
+            .child(text.into())
             .into_any_element()
     }
 
@@ -676,20 +702,22 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// Choose project icon: the icon it would save beside the kinds, then the chosen
-    /// kind's choices, then Cancel and Save icon.
+    /// Change icon: the icon it would save beside the project's name, the kinds, then
+    /// the chosen kind's choices, then Cancel and Save icon.
     pub(super) fn render_icon_picker(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let Some(picker) = self.icon_picker() else {
-            unreachable!("Choose project icon requires its overlay");
+            unreachable!("Change icon requires its overlay");
         };
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
         let (viewport_width, _) = overlay_viewport_size(window);
         let choice = self.icon_choice(picker);
-        let preview = choice
-            .as_ref()
-            .and_then(|icon| self.chosen_icon(icon, 40.0, || div().into_any_element()))
-            .unwrap_or_else(|| self.project_icon(Some(&picker.project), 40.0));
+        let preview = match &choice {
+            Ok(Some(icon)) => self.chosen_icon(icon, 40.0, || div().into_any_element()),
+            Ok(None) => Some(self.automatic_project_icon(&picker.project, 40.0)),
+            Err(_) => None,
+        }
+        .unwrap_or_else(|| self.project_icon(Some(&picker.project), 40.0));
         let kinds = IconKind::ALL.map(|kind| {
             controls::text_button(("project-icon-kind", kind.index()), kind.label())
                 .selected(picker.kind == kind)
@@ -700,6 +728,15 @@ impl CompiApp {
                 }))
         });
         let choices = match picker.kind {
+            IconKind::Automatic => div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(self.automatic_project_icon(&picker.project, 24.0))
+                .child(self.icon_picker_caption(
+                    "The project's favicon or logo, found in its folder; else its first \
+                     letter, in a colour of the theme.",
+                )),
             IconKind::Icons => div()
                 .flex()
                 .flex_col()
@@ -723,7 +760,7 @@ impl CompiApp {
                     div()
                         .text_size(px(UI_SMALL_TEXT_SIZE))
                         .text_color(color(modal_text_color(
-                            if choice.is_some() {
+                            if choice.is_ok() {
                                 colors.muted
                             } else {
                                 colors.error
@@ -732,6 +769,25 @@ impl CompiApp {
                         )))
                         .child("One or two letters or numbers."),
                 ),
+            IconKind::File => div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    controls::text_button("project-icon-file", "Choose file…")
+                        .header()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.choose_icon_file(cx);
+                            cx.notify();
+                        })),
+                )
+                .child(match &picker.file {
+                    Some(path) => self.icon_picker_caption(format!(
+                        "{}, kept in Compi's data folder.",
+                        content::file_name(path)
+                    )),
+                    None => self.icon_picker_caption("A PNG, SVG or ICO image."),
+                }),
         };
         self.render_centered_scrim(
             div()
@@ -744,7 +800,7 @@ impl CompiApp {
                 .bg(color(colors.surface))
                 .overflow_hidden()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(self.render_dialog_header("Choose project icon", cx))
+                .child(self.render_dialog_header("Change icon", cx))
                 .child(
                     div()
                         .p_4()
@@ -769,25 +825,29 @@ impl CompiApp {
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .child(self.project_name(&picker.project)),
                                         )
-                                        .child(
-                                            div()
-                                                .text_size(px(UI_SMALL_TEXT_SIZE))
-                                                .text_color(muted)
-                                                .child("An icon, an emoji or a monogram."),
-                                        ),
-                                )
+                                        .child(self.icon_picker_caption(
+                                            "Automatic, an icon, an emoji, a monogram or an image.",
+                                        )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
                                 .child(controls::segmented("project-icon-kinds", kinds)),
                         )
-                        .when(picker.kind != IconKind::Emoji, |body| {
-                            body.child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(self.icon_picker_caption("Colour"))
-                                    .child(self.render_icon_colors(picker.color, cx)),
-                            )
-                        })
+                        .when(
+                            matches!(picker.kind, IconKind::Icons | IconKind::Monogram),
+                            |body| {
+                                body.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .child(self.icon_picker_caption("Colour"))
+                                        .child(self.render_icon_colors(picker.color, cx)),
+                                )
+                            },
+                        )
                         .child(choices),
                 )
                 .child(
@@ -826,11 +886,7 @@ impl CompiApp {
                                         .header()
                                         .primary()
                                         .key("enter")
-                                        .disabled_because(
-                                            choice
-                                                .is_none()
-                                                .then_some("Enter one or two letters or numbers."),
-                                        )
+                                        .disabled_because(choice.err())
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.save_icon_choice(window, cx);
                                         })),

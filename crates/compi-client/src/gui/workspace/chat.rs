@@ -289,6 +289,21 @@ pub(in crate::gui) struct ChatUi {
     /// The agents installed in each environment, as a draft's model picker last asked;
     /// an empty list while the answer is on its way.
     agents: HashMap<ContentEnvironment, Vec<ChatHarness>>,
+    /// The models each agent listed last, in any chat of any window; Settings → Projects
+    /// offers them for a project's new threads.
+    listed: crate::listed_models::ListedModels,
+    /// The model picker of Settings → Projects' New threads, while open.
+    project_picker: Option<models::ProjectPicker>,
+}
+
+impl ChatUi {
+    /// A new window's chats, with the agents' model lists Compi kept.
+    pub(in crate::gui) fn new() -> Self {
+        Self {
+            listed: crate::listed_models::ListedModels::load(),
+            ..Self::default()
+        }
+    }
 }
 
 /// Every chat in `node` with its pane: content panes, and terminal views on either side.
@@ -1227,6 +1242,14 @@ impl CompiApp {
         if !model.slot.is_current(update.generation) {
             return;
         }
+        let lists_models = match &update.event {
+            ChatWatchEvent::Watching(_) => true,
+            ChatWatchEvent::Changed(event) => matches!(
+                event,
+                ChatEvent::Reset { .. } | ChatEvent::Options { .. } | ChatEvent::Plans { .. }
+            ),
+            ChatWatchEvent::Failed(_) => false,
+        };
         match update.event {
             ChatWatchEvent::Watching(state) => {
                 model.link = Link::Live;
@@ -1235,6 +1258,50 @@ impl CompiApp {
             ChatWatchEvent::Changed(event) => model.apply(event, cx),
             ChatWatchEvent::Failed(error) => model.link = Link::Reconnecting(error),
         }
+        if lists_models {
+            self.keep_listed_models(&update.chat, cx);
+        }
+    }
+
+    /// Keeps the models chat `chat`'s agent lists as what that agent lists, in every
+    /// window and in Compi's data folder, when they changed.
+    fn keep_listed_models(&mut self, chat: &str, cx: &mut Context<Self>) {
+        let Some(state) = self
+            .chat
+            .chats
+            .get(chat)
+            .and_then(|model| model.state.as_ref())
+        else {
+            return;
+        };
+        let Some(option) = state.option("model") else {
+            return;
+        };
+        let harness = state.harness;
+        let models = crate::listed_models::AgentModels {
+            choices: option.choices.clone(),
+            plans: state.plans.iter().map(|plan| plan.provider.clone()).collect(),
+        };
+        if !self.chat.listed.set(harness, models.clone()) {
+            return;
+        }
+        let listed = self.chat.listed.clone();
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(error) = listed.save() {
+                    eprintln!("Compi: {error}");
+                }
+            })
+            .detach();
+        cx.defer(move |cx| {
+            for handle in cx.windows() {
+                if let Some(typed) = handle.downcast::<CompiApp>() {
+                    let _ = typed.update(cx, |app, _, _| {
+                        app.chat.listed.set(harness, models.clone());
+                    });
+                }
+            }
+        });
     }
 
     /// Sends `message` about chat `chat` on a connection of its own; a failure shows in

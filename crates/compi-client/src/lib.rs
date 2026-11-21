@@ -20,6 +20,7 @@ pub mod gui;
 pub mod image_input;
 pub mod input;
 pub mod layout;
+pub mod listed_models;
 pub mod metadata;
 pub mod monitor;
 pub mod notes;

@@ -316,6 +316,9 @@ pub struct ProjectSettings {
     pub icon: Option<ProjectIcon>,
     /// Pinned projects come first in the sidebar's project headers and the palette.
     pub pinned: bool,
+    /// Archived projects leave the palette's Projects and Settings → Projects' main
+    /// list (they sit under Archived there); their threads and settings stay.
+    pub archived: bool,
     /// The agent new threads in the project start with.
     pub agent: Option<ChatHarness>,
     /// The model new threads in the project start on (the agent's own model id).
@@ -1356,6 +1359,7 @@ impl LoadedConfig {
             set("name", settings.name.as_deref().map(Into::into));
             set("icon", settings.icon.as_ref().map(project_icon_to_toml));
             set("pinned", settings.pinned.then(|| true.into()));
+            set("archived", settings.archived.then(|| true.into()));
             set("agent", settings.agent.map(|agent| agent.program().into()));
             set("model", settings.model.as_deref().map(Into::into));
         })?;
@@ -2883,15 +2887,20 @@ fn apply_projects(document: &toml::Table, loaded: &mut LoadedConfig) {
                 ),
             }
         }
-        if let Some(value) = table.get("pinned") {
-            match value.as_bool() {
-                Some(pinned) => settings.pinned = pinned,
-                None => invalid(
-                    loaded,
-                    &format!("{field}.pinned"),
-                    "true or false",
-                    "configuration",
-                ),
+        for (name, slot) in [
+            ("pinned", &mut settings.pinned),
+            ("archived", &mut settings.archived),
+        ] {
+            if let Some(value) = table.get(name) {
+                match value.as_bool() {
+                    Some(flag) => *slot = flag,
+                    None => invalid(
+                        loaded,
+                        &format!("{field}.{name}"),
+                        "true or false",
+                        "configuration",
+                    ),
+                }
             }
         }
         if let Some(value) = table.get("agent") {
@@ -3844,6 +3853,7 @@ mod tests {
                 color: 4,
             }),
             pinned: true,
+            archived: true,
             agent: Some(ChatHarness::Omp),
             model: Some("anthropic/claude-opus-5-5".into()),
         };
@@ -3899,6 +3909,7 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("name = \"Compi\""), "{text}");
         assert!(text.contains("pinned = true"), "{text}");
+        assert!(text.contains("archived = true"), "{text}");
         loaded
             .save_project_settings(&key, ProjectSettings::default())
             .unwrap();
@@ -3912,6 +3923,7 @@ mod tests {
         fs::write(
             &path,
             "version = 1\n[projects.'host:/a']\nname = ''\npinned = 'yes'\nagent = 'nonesuch'\n\
+             archived = 1\n\
              icon = { kind = 'monogram', text = 'ABC', color = 3 }\nmodel = 'm'\n\
              [projects.'host:/b']\nicon = { kind = 'lucide', name = 'rocket', color = 16 }\n\
              [projects.'host:/c']\nicon = { kind = 'sticker' }\n",
@@ -3927,7 +3939,7 @@ mod tests {
         );
         assert!(!invalid.projects.contains_key("host:/b"));
         assert!(!invalid.projects.contains_key("host:/c"));
-        assert_eq!(invalid.diagnostics.len(), 6, "{:?}", invalid.diagnostics);
+        assert_eq!(invalid.diagnostics.len(), 7, "{:?}", invalid.diagnostics);
         fs::remove_dir_all(root).ok();
     }
 

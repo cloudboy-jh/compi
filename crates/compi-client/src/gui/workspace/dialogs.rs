@@ -362,6 +362,14 @@ impl CompiApp {
                     ("Quit process", message, "Quit")
                 }
             }
+            Some(Overlay::ConfirmRemoveProject { project, threads }) => (
+                "Remove from Compi",
+                super::project_settings::remove_project_message(
+                    &self.project_name(project),
+                    threads.len(),
+                ),
+                "Remove",
+            ),
             _ => ("", String::new(), ""),
         };
         self.render_centered_scrim(
@@ -1223,6 +1231,7 @@ impl CompiApp {
                     | Overlay::ConfirmDaemonRestart { .. }
                     | Overlay::ConfirmDiscard { .. }
                     | Overlay::ConfirmQuitProcess { .. }
+                    | Overlay::ConfirmRemoveProject { .. }
             )
         ) {
             match key.key.as_str() {
@@ -1311,6 +1320,7 @@ impl CompiApp {
                 Overlay::Confirm { .. }
                     | Overlay::ConfirmDaemonRestart { .. }
                     | Overlay::ConfirmQuitProcess { .. }
+                    | Overlay::ConfirmRemoveProject { .. }
             )
         ) {
             self.render_confirmation_dialog(window, cx)

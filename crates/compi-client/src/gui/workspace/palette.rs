@@ -169,11 +169,13 @@ pub(super) struct Sources<'a> {
 }
 
 /// What Settings → Projects set for a project the palette lists: the name it goes by,
-/// else its folder's, and whether it is pinned, which lists it first.
+/// else its folder's, whether it is pinned, which lists it first, and whether it is
+/// archived, which leaves it out.
 #[derive(Default)]
 pub(super) struct ProjectLook {
     pub name: Option<String>,
     pub pinned: bool,
+    pub archived: bool,
 }
 
 #[derive(Debug)]
@@ -270,12 +272,13 @@ pub(super) fn choices(query: &str, scope: Option<Scope>, sources: &Sources) -> V
         };
         // An empty query ranks by frecency alone; only typed text is fuzzy-matched, to the
         // folder or the name its project goes by. Pinned projects come first, before the
-        // limit.
+        // limit; archived ones are left out.
         let mut found: Vec<(&str, ProjectLook)> = sources
             .projects
             .search_named(query, |path| (sources.project_look)(path).name)
             .into_iter()
             .map(|path| (path, (sources.project_look)(path)))
+            .filter(|(_, look)| !look.archived)
             .collect();
         found.sort_by_key(|(_, look)| !look.pinned);
         let rows: Vec<Row> = found
@@ -925,11 +928,11 @@ impl CompiApp {
                 project_reason: Command::NewTab.disabled_reason(&context),
                 project_look: &|path| {
                     let project = self.visited_project(path);
+                    let settings = self.project_settings(&project);
                     ProjectLook {
-                        name: self
-                            .project_settings(&project)
-                            .and_then(|settings| settings.name.clone()),
-                        pinned: self.project_pinned(&project),
+                        name: settings.and_then(|settings| settings.name.clone()),
+                        pinned: settings.is_some_and(|settings| settings.pinned),
+                        archived: settings.is_some_and(|settings| settings.archived),
                     }
                 },
                 files,
@@ -1302,11 +1305,12 @@ mod tests {
     }
 
     #[test]
-    fn pinned_projects_lead_the_list_under_the_name_they_go_by() {
+    fn pinned_projects_lead_the_list_under_the_name_they_go_by_and_archived_ones_go() {
         let projects = history(&["/a", "/b", "/c", "/d", "/e", "/f", "/g"]);
         let look = |path: &str| ProjectLook {
             name: (path == "/a").then(|| "Alpha".to_owned()),
             pinned: path == "/a" || path == "/c",
+            archived: path == "/f",
         };
         let list = |query: &str| -> Vec<(String, String)> {
             let groups = choices(
@@ -1340,6 +1344,7 @@ mod tests {
         // A renamed project matches by its name as well as its folder.
         assert_eq!(list("alph"), [row("Alpha", "/a")]);
         assert_eq!(list("/a"), [row("Alpha", "/a")]);
+        assert!(list("/f").is_empty());
     }
 
     #[test]

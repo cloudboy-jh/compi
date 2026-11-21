@@ -1378,7 +1378,7 @@ impl CompiApp {
 
     /// New terminal here: a new tab of workspace `session` whose shell starts at the
     /// project's root, in the project's WSL distribution for a WSL project.
-    fn new_project_terminal(&mut self, session: SessionId, project: &Project) {
+    pub(super) fn new_project_terminal(&mut self, session: SessionId, project: &Project) {
         let distribution = match &project.environment {
             compi_protocol::ContentEnvironment::Wsl { distribution } => Some(distribution.clone()),
             compi_protocol::ContentEnvironment::Host => None,
@@ -1398,7 +1398,7 @@ impl CompiApp {
 
     /// New thread here: a chat at the project's root with the agent its new threads
     /// start with, in a new tab of workspace `session`.
-    fn new_project_thread(&mut self, session: SessionId, project: &Project) {
+    pub(super) fn new_project_thread(&mut self, session: SessionId, project: &Project) {
         let chat = crate::chat::new_chat(
             self.new_thread_agent(Some(project)),
             project.environment.clone(),

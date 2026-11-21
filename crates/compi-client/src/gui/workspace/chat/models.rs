@@ -6,9 +6,16 @@
 //! thinking levels; picking a level, a mode or permissions closes it. Model picks are
 //! remembered per harness for its new sessions (`ChatModels`); permissions apply to this
 //! chat only. Behaviour, strip and spacing follow T3 Code's picker (decided 2026-11-19).
+//!
+//! Settings → Projects' New threads opens the same picker, without thinking levels,
+//! modes or permissions, for the model a project's new threads start on. No agent runs
+//! there to list its models, so it lists what the project's agent listed last in any
+//! chat (`ListedModels`), with the favorites and recent picks Compi remembers of it.
 use super::*;
 use crate::config::ChatModels;
 use crate::gui::model_icons;
+use crate::listed_models::AgentModels;
+use compi_protocol::Project;
 use compi_protocol::chat::{ChatChoice, ChatOption, ChatPlan};
 use gpui::{Div, Hsla, canvas, linear_color_stop, linear_gradient, svg};
 use gpui_component::{ActiveTheme as _, Icon};
@@ -72,6 +79,61 @@ pub(super) struct ModelPicker {
     /// Frames left in which the search takes the keyboard back: the popover takes it
     /// for itself a frame or two after opening.
     claim_keyboard: u8,
+}
+
+/// What a model picker picks for: chat `id`'s harness, or the new threads of the project
+/// Settings → Projects shows (one at a time, `ChatUi::project_picker`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PickerOwner {
+    Chat(String),
+    Project,
+}
+
+/// Settings → Projects' model picker for a project's new threads.
+pub(super) struct ProjectPicker {
+    project: Project,
+    /// The agent the project's new threads start with, whose models it lists.
+    harness: ChatHarness,
+    /// The models offered; `current` is the project's model, empty for the agent's own.
+    option: ChatOption,
+    plans: Vec<ChatPlan>,
+    /// No chat of the agent listed its models yet.
+    unlisted: bool,
+    picker: ModelPicker,
+}
+
+/// A model `value` no listing named, as the picker shows it: named by its ID.
+fn unlisted_choice(value: &str) -> ChatChoice {
+    ChatChoice {
+        value: value.to_owned(),
+        name: value.rsplit('/').next().unwrap_or(value).to_owned(),
+        description: None,
+        group: None,
+    }
+}
+
+/// The models a project's picker offers: what its agent listed last (`listed`), then
+/// the models Compi remembers of it that the listing lacks (favorites, recent picks,
+/// what it starts on) and the project's `current` one.
+fn project_choices(
+    listed: Option<&AgentModels>,
+    remembered: &ChatModels,
+    current: Option<&str>,
+) -> Vec<ChatChoice> {
+    let mut choices = listed.map_or_else(Vec::new, |listed| listed.choices.clone());
+    let saved = remembered
+        .favorites
+        .iter()
+        .chain(&remembered.recents)
+        .chain(&remembered.picks.model)
+        .map(String::as_str)
+        .chain(current);
+    for value in saved {
+        if !choices.iter().any(|choice| choice.value == value) {
+            choices.push(unlisted_choice(value));
+        }
+    }
+    choices
 }
 
 /// Where the composer card and the model button were last drawn, in window
@@ -542,6 +604,63 @@ impl CompiApp {
         }
     }
 
+    /// `owner`'s open picker.
+    fn owner_picker(&self, owner: &PickerOwner) -> Option<&ModelPicker> {
+        match owner {
+            PickerOwner::Chat(chat) => self.chat.chats.get(chat)?.picker.as_ref(),
+            PickerOwner::Project => self
+                .chat
+                .project_picker
+                .as_ref()
+                .map(|project| &project.picker),
+        }
+    }
+
+    fn owner_picker_mut(&mut self, owner: &PickerOwner) -> Option<&mut ModelPicker> {
+        match owner {
+            PickerOwner::Chat(chat) => self.chat.chats.get_mut(chat)?.picker.as_mut(),
+            PickerOwner::Project => self
+                .chat
+                .project_picker
+                .as_mut()
+                .map(|project| &mut project.picker),
+        }
+    }
+
+    /// What `owner`'s picker lists: the harness, its model setting and its plans.
+    fn owner_models(&self, owner: &PickerOwner) -> Option<(ChatHarness, &ChatOption, &[ChatPlan])> {
+        match owner {
+            PickerOwner::Chat(chat) => {
+                let state = self.chat.chats.get(chat)?.state.as_ref()?;
+                Some((state.harness, state.option("model")?, &state.plans))
+            }
+            PickerOwner::Project => {
+                let project = self.chat.project_picker.as_ref()?;
+                Some((project.harness, &project.option, &project.plans))
+            }
+        }
+    }
+
+    /// The settings `owner`'s picker shows: model, thinking level and mode; a project's
+    /// has only the model.
+    fn owner_options(&self, owner: &PickerOwner) -> [Option<&ChatOption>; 3] {
+        match owner {
+            PickerOwner::Chat(chat) => self
+                .chat
+                .chats
+                .get(chat)
+                .map_or([None; 3], ChatModel::picker_options),
+            PickerOwner::Project => [
+                self.chat
+                    .project_picker
+                    .as_ref()
+                    .map(|project| &project.option),
+                None,
+                None,
+            ],
+        }
+    }
+
     /// The composer row's model button: the model's mark and name, then a brain and the
     /// thinking level, opening the picker above the composer; the mode when it is not
     /// the first (Plan, say); and a shield when the chat's permissions are not the
@@ -603,10 +722,10 @@ impl CompiApp {
             cx.notify();
         });
         let keys = {
-            let (app, id) = (cx.entity().downgrade(), chat.id.clone());
+            let (app, owner) = (cx.entity().downgrade(), PickerOwner::Chat(chat.id.clone()));
             move |key: &Keystroke, window: &mut Window, cx: &mut App| {
                 if let Some(app) = app.upgrade() {
-                    app.update(cx, |this, cx| this.model_picker_key(&id, key, window, cx));
+                    app.update(cx, |this, cx| this.model_picker_key(&owner, key, window, cx));
                 }
             }
         };
@@ -735,24 +854,8 @@ impl CompiApp {
             .position(|approval| *approval == model.approval(default))
             .unwrap_or(0);
         model.menu = Some(ChatMenu::Models);
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models"));
-        let id = chat.to_owned();
-        let events = cx.subscribe_in(
-            &search,
-            window,
-            move |this, _, event: &InputEvent, window, cx| match event {
-                InputEvent::Change => {
-                    this.show_model_tab(&id, None, cx);
-                    cx.notify();
-                }
-                InputEvent::PressEnter { .. } => {
-                    this.model_picker_enter(&id, window, cx);
-                    cx.notify();
-                }
-                _ => {}
-            },
-        );
-        window.focus(&search.focus_handle(cx), cx);
+        let owner = PickerOwner::Chat(chat.to_owned());
+        let (search, events) = Self::picker_search(owner.clone(), window, cx);
         model.picker = Some(ModelPicker {
             search,
             _events: events,
@@ -765,30 +868,48 @@ impl CompiApp {
             scroll: UniformListScrollHandle::new(),
             claim_keyboard: CLAIM_FRAMES,
         });
-        self.show_model_tab(chat, Some(tab), cx);
+        self.show_model_tab(&owner, Some(tab), cx);
+    }
+
+    /// A picker's search, holding the keyboard: typing searches `owner`'s models, Enter
+    /// picks.
+    fn picker_search(
+        owner: PickerOwner,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<InputState>, Subscription) {
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search models"));
+        let events = cx.subscribe_in(
+            &search,
+            window,
+            move |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    this.show_model_tab(&owner, None, cx);
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.model_picker_enter(&owner, window, cx);
+                    cx.notify();
+                }
+                _ => {}
+            },
+        );
+        window.focus(&search.focus_handle(cx), cx);
+        (search, events)
     }
 
     /// Shows tab `tab` (or, with `None`, the search's results in the current one) with
     /// the current model highlighted when listed, else the first, in view.
-    fn show_model_tab(&mut self, chat: &str, tab: Option<PickerTab>, cx: &App) {
+    fn show_model_tab(&mut self, owner: &PickerOwner, tab: Option<PickerTab>, cx: &App) {
         if let Some(tab) = tab
-            && let Some(picker) = self
-                .chat
-                .chats
-                .get_mut(chat)
-                .and_then(|model| model.picker.as_mut())
+            && let Some(picker) = self.owner_picker_mut(owner)
         {
             picker.tab = tab;
         }
         let listed = self
-            .model_layout(chat, cx)
+            .model_layout(owner, cx)
             .map(|(layout, current)| (layout.listed(current), layout));
-        let Some(picker) = self
-            .chat
-            .chats
-            .get_mut(chat)
-            .and_then(|model| model.picker.as_mut())
-        else {
+        let Some(picker) = self.owner_picker_mut(owner) else {
             return;
         };
         picker.column = match picker.column {
@@ -809,19 +930,17 @@ impl CompiApp {
         }
     }
 
-    /// The open picker's model list for chat `chat`, and the current model's index.
-    fn model_layout(&self, chat: &str, cx: &App) -> Option<(PickerLayout, usize)> {
-        let model = self.chat.chats.get(chat)?;
-        let picker = model.picker.as_ref()?;
-        let state = model.state.as_ref()?;
-        let option = state.option("model")?;
+    /// `owner`'s open picker's model list, and the current model's index.
+    fn model_layout(&self, owner: &PickerOwner, cx: &App) -> Option<(PickerLayout, usize)> {
+        let picker = self.owner_picker(owner)?;
+        let (harness, option, plans) = self.owner_models(owner)?;
         let layout = picker_layout(
             option,
             &picker.search.read(cx).value(),
-            &state.plans,
-            &self.remembered_models(state.harness),
+            plans,
+            &self.remembered_models(harness),
             &picker.tab,
-            state.harness,
+            harness,
         );
         Some((layout, current_index(Some(option))))
     }
@@ -859,7 +978,7 @@ impl CompiApp {
     /// (Cmd+D) stars the highlighted model.
     fn model_picker_key(
         &mut self,
-        chat: &str,
+        owner: &PickerOwner,
         key: &Keystroke,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -867,13 +986,10 @@ impl CompiApp {
         if key.key == "enter" {
             // With the search holding the keyboard, its own Enter (`PressEnter`) picks.
             let searching = self
-                .chat
-                .chats
-                .get(chat)
-                .and_then(|model| model.picker.as_ref())
+                .owner_picker(owner)
                 .is_some_and(|picker| picker.search.focus_handle(cx).is_focused(window));
             if !searching {
-                self.model_picker_enter(chat, window, cx);
+                self.model_picker_enter(owner, window, cx);
                 cx.notify();
             }
             return;
@@ -885,16 +1001,12 @@ impl CompiApp {
             && !modifiers.control
             && !modifiers.alt
             && !modifiers.platform
-            && let Some(picker) = self
-                .chat
-                .chats
-                .get(chat)
-                .and_then(|model| model.picker.as_ref())
+            && let Some(picker) = self.owner_picker(owner)
         {
             let search = picker.search.clone();
             window.focus(&search.focus_handle(cx), cx);
             search.update(cx, |search, cx| search.insert(text.to_owned(), window, cx));
-            self.show_model_tab(chat, None, cx);
+            self.show_model_tab(owner, None, cx);
             cx.notify();
             return;
         }
@@ -904,29 +1016,27 @@ impl CompiApp {
             modifiers.control && !modifiers.platform
         };
         if key.key == "d" && favorite_modifier && !modifiers.alt && !modifiers.shift {
-            self.toggle_highlighted_favorite(chat, cx);
+            self.toggle_highlighted_favorite(owner, cx);
             cx.notify();
             return;
         }
-        let layout = self.model_layout(chat, cx);
-        let Some(model) = self.chat.chats.get(chat) else {
+        let layout = self.model_layout(owner, cx);
+        let Some(picker) = self.owner_picker(owner) else {
             return;
         };
-        let Some(picker) = model.picker.as_ref() else {
-            return;
-        };
-        let [models, thinking, mode] = model.picker_options();
+        let [models, thinking, mode] = self.owner_options(owner);
         let searching = !picker.search.read(cx).value().trim().is_empty();
-        let tabs = models
-            .zip(model.state.as_ref())
-            .map(|(option, state)| strip_tabs(option, &state.plans))
+        let tabs = self
+            .owner_models(owner)
+            .map(|(_, option, plans)| strip_tabs(option, plans))
             .unwrap_or_default();
+        let chat = matches!(owner, PickerOwner::Chat(_));
         let columns: Vec<PickerColumn> = [
             (models.is_some() && !searching).then_some(PickerColumn::Strip),
             models.map(|_| PickerColumn::Models),
             thinking.map(|_| PickerColumn::Thinking),
             mode.map(|_| PickerColumn::Mode),
-            Some(PickerColumn::Approval),
+            chat.then_some(PickerColumn::Approval),
         ]
         .into_iter()
         .flatten()
@@ -966,16 +1076,11 @@ impl CompiApp {
         if let (PickerColumn::Strip, Some(by)) = (column, move_by) {
             let at = tabs.iter().position(|shown| *shown == tab).unwrap_or(0);
             let next = tabs[step(at, tabs.len(), by.signum())].clone();
-            self.show_model_tab(chat, Some(next), cx);
+            self.show_model_tab(owner, Some(next), cx);
             cx.notify();
             return;
         }
-        let Some(picker) = self
-            .chat
-            .chats
-            .get_mut(chat)
-            .and_then(|model| model.picker.as_mut())
-        else {
+        let Some(picker) = self.owner_picker_mut(owner) else {
             return;
         };
         match (column, key.key.as_str(), move_by) {
@@ -1016,72 +1121,75 @@ impl CompiApp {
 
     /// Enter in the picker: in the strip, moves to the models; on a model, picks it and
     /// moves to the thinking levels; on a level, mode or permissions, picks it and closes.
-    fn model_picker_enter(&mut self, chat: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let layout = self.model_layout(chat, cx);
-        let Some(model) = self.chat.chats.get_mut(chat) else {
+    fn model_picker_enter(
+        &mut self,
+        owner: &PickerOwner,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let layout = self.model_layout(owner, cx);
+        let [models, thinking, mode] = self.owner_options(owner);
+        let Some(picker) = self.owner_picker(owner) else {
             return;
         };
-        let [models, thinking, mode] = model.picker_options();
-        let Some(picker) = model.picker.as_ref() else {
-            return;
+        let chosen = |option: Option<&ChatOption>, at: usize| {
+            let option = option?;
+            Some((option.id.clone(), option.choices.get(at)?.value.clone()))
         };
-        match picker.column {
-            PickerColumn::Strip => {
-                if let Some(picker) = model.picker.as_mut() {
+        let column = picker.column;
+        let model = layout.and_then(|(layout, _)| {
+            let listed = picker.highlight.min(layout.choices.len().checked_sub(1)?);
+            chosen(models, layout.choice(listed)?)
+        });
+        let thinking = chosen(thinking, picker.thinking);
+        let mode = chosen(mode, picker.mode);
+        let approval = crate::config::CHAT_APPROVALS.get(picker.approval).copied();
+        match (column, owner) {
+            (PickerColumn::Strip, _) => {
+                if let Some(picker) = self.owner_picker_mut(owner) {
                     picker.column = PickerColumn::Models;
                 }
             }
-            PickerColumn::Models => {
-                let Some((value, option)) = layout.and_then(|(layout, _)| {
-                    let models = models?;
-                    let listed = picker.highlight.min(layout.choices.len().checked_sub(1)?);
-                    let index = layout.choice(listed)?;
-                    Some((models.choices[index].value.clone(), models.id.clone()))
-                }) else {
-                    return;
-                };
-                self.pick_model(chat, option, value, window, cx);
+            (PickerColumn::Models, _) => {
+                if let Some((option, value)) = model {
+                    self.pick_model(owner, option, value, window, cx);
+                }
             }
-            PickerColumn::Thinking => {
-                let Some(option) = thinking else {
-                    return;
-                };
-                let Some(choice) = option.choices.get(picker.thinking) else {
-                    return;
-                };
-                let (option, value) = (option.id.clone(), choice.value.clone());
-                self.pick_thinking(chat, option, value, window, cx);
+            (PickerColumn::Thinking, PickerOwner::Chat(chat)) => {
+                if let Some((option, value)) = thinking {
+                    self.pick_thinking(chat, option, value, window, cx);
+                }
             }
-            PickerColumn::Mode => {
-                let Some(option) = mode else {
-                    return;
-                };
-                let Some(choice) = option.choices.get(picker.mode) else {
-                    return;
-                };
-                let (option, value) = (option.id.clone(), choice.value.clone());
-                self.set_chat_menu(chat, ChatMenu::Models, false);
-                self.send_chat_option(chat, option, value, window, cx);
+            (PickerColumn::Mode, PickerOwner::Chat(chat)) => {
+                if let Some((option, value)) = mode {
+                    self.set_chat_menu(chat, ChatMenu::Models, false);
+                    self.send_chat_option(chat, option, value, window, cx);
+                }
             }
-            PickerColumn::Approval => {
-                let Some(&approval) = crate::config::CHAT_APPROVALS.get(picker.approval) else {
-                    return;
-                };
-                self.pick_chat_approval(chat, approval, window, cx);
+            (PickerColumn::Approval, PickerOwner::Chat(chat)) => {
+                if let Some(approval) = approval {
+                    self.pick_chat_approval(chat, approval, window, cx);
+                }
             }
+            _ => {}
         }
     }
 
-    /// Sets the chat's model to `value`, remembers it for new sessions and recent, and
-    /// moves the keyboard to the thinking levels (closing the picker without any).
+    /// Picks model `value`. A chat changes to it, remembers it for new sessions and
+    /// recent, and moves the keyboard to the thinking levels (closing the picker without
+    /// any); a project's new threads start on it, and the picker closes.
     fn pick_model(
         &mut self,
-        chat: &str,
+        owner: &PickerOwner,
         option: String,
         value: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let PickerOwner::Chat(chat) = owner else {
+            self.pick_project_model(Some(value), cx);
+            return;
+        };
         let Some(model) = self.chat.chats.get_mut(chat) else {
             return;
         };
@@ -1096,6 +1204,15 @@ impl CompiApp {
         }
         self.send_chat_option(chat, option, value.clone(), window, cx);
         self.remember_models(harness, |models| models.picked_model(&value));
+    }
+
+    /// New threads in the picker's project start on `model` (`None`: its agent's own),
+    /// with the agent the picker lists; the picker closes.
+    fn pick_project_model(&mut self, model: Option<String>, cx: &mut Context<Self>) {
+        let Some(picker) = self.chat.project_picker.take() else {
+            return;
+        };
+        self.set_project_model(&picker.project, picker.harness, model, cx);
     }
 
     /// Sets the chat's thinking level to `value`, remembers it for new sessions, and
@@ -1147,45 +1264,33 @@ impl CompiApp {
     }
 
     /// Stars or unstars the highlighted model.
-    fn toggle_highlighted_favorite(&mut self, chat: &str, cx: &App) {
-        let layout = self.model_layout(chat, cx);
-        let Some(model) = self.chat.chats.get(chat) else {
-            return;
-        };
-        let (Some(picker), Some((layout, _))) = (model.picker.as_ref(), layout) else {
+    fn toggle_highlighted_favorite(&mut self, owner: &PickerOwner, cx: &App) {
+        let layout = self.model_layout(owner, cx);
+        let (Some(picker), Some((layout, _))) = (self.owner_picker(owner), layout) else {
             return;
         };
         if picker.column != PickerColumn::Models {
             return;
         }
         if let Some(index) = layout.choice(picker.highlight) {
-            self.toggle_favorite(chat, index, cx);
+            self.toggle_favorite(owner, index, cx);
         }
     }
 
     /// Stars or unstars model `index` (into the model setting's choices), which stays
     /// highlighted where the list now has it.
-    fn toggle_favorite(&mut self, chat: &str, index: usize, cx: &App) {
-        let Some(model) = self.chat.chats.get(chat) else {
+    fn toggle_favorite(&mut self, owner: &PickerOwner, index: usize, cx: &App) {
+        let Some((harness, option, _)) = self.owner_models(owner) else {
             return;
         };
-        let Some(value) = model.picker_options()[0]
-            .and_then(|models| models.choices.get(index))
-            .map(|choice| choice.value.clone())
-        else {
+        let Some(value) = option.choices.get(index).map(|choice| choice.value.clone()) else {
             return;
         };
-        let harness = model.harness();
         self.remember_models(harness, |models| models.toggle_favorite(&value));
-        let Some((layout, _)) = self.model_layout(chat, cx) else {
+        let Some((layout, _)) = self.model_layout(owner, cx) else {
             return;
         };
-        let Some(picker) = self
-            .chat
-            .chats
-            .get_mut(chat)
-            .and_then(|model| model.picker.as_mut())
-        else {
+        let Some(picker) = self.owner_picker_mut(owner) else {
             return;
         };
         match layout.listed(index) {
@@ -1220,40 +1325,22 @@ impl CompiApp {
             .as_ref()
             .map(|state| state.plans.as_slice())
             .unwrap_or_default();
-        let query = picker.search.read(cx).value();
-        let searching = !query.trim().is_empty();
-        let strip = models
-            .filter(|_| !searching)
-            .map(|option| self.render_model_strip(chat, option, plans, picker, cx));
+        let searching = !picker.search.read(cx).value().trim().is_empty();
+        let owner = PickerOwner::Chat(chat.id.clone());
+        let strip = models.filter(|_| !searching).map(|option| {
+            self.render_model_strip(&owner, chat.harness, option, plans, picker, Some(chat), cx)
+        });
         let list = models.map(|option| {
-            let layout = picker_layout(
-                option,
-                &query,
-                plans,
-                &remembered,
-                &picker.tab,
+            self.render_model_column(
+                &owner,
                 chat.harness,
-            );
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .child(column_header(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(controls::glyph(IconName::Search, muted))
-                        .child(
-                            div()
-                                .flex_1()
-                                .child(Input::new(&picker.search).appearance(false)),
-                        ),
-                    border,
-                ))
-                .child(self.render_model_list(chat, option, layout, picker, &remembered, cx))
+                option,
+                plans,
+                picker,
+                &remembered,
+                "No favorites or recent models yet",
+                cx,
+            )
         });
         let thinking_column = thinking.map(|option| {
             let rows = option.choices.iter().enumerate().map(|(index, choice)| {
@@ -1398,22 +1485,7 @@ impl CompiApp {
             .border_t_1()
             .border_color(border)
             .bg(shade)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
-                    .text_color(muted)
-                    .child(format!(
-                        "↑↓ move · ←→ column · ↵ pick · {} star",
-                        if cfg!(target_os = "macos") {
-                            "⌘D"
-                        } else {
-                            "Ctrl+D"
-                        }
-                    )),
-            )
+            .child(picker_footnote(picker_keys(), muted))
             .children(modes)
             .child(self.render_picker_approval(chat, model, picker, shade, cx));
         let width = if models.is_some() {
@@ -1537,14 +1609,66 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// The strip: your saved models' star, then a mark per provider, the shown one lit
-    /// with a bar; each one's tooltip names it and how it is paid.
-    fn render_model_strip(
+    /// The search over the model list, and the list: `owner`'s models of `harness`;
+    /// `empty` says why the saved tab lists none.
+    #[allow(clippy::too_many_arguments)]
+    fn render_model_column(
         &self,
-        chat: &ChatContent,
+        owner: &PickerOwner,
+        harness: ChatHarness,
         option: &ChatOption,
         plans: &[ChatPlan],
         picker: &ModelPicker,
+        remembered: &ChatModels,
+        empty: &str,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let query = picker.search.read(cx).value();
+        let layout = picker_layout(option, &query, plans, remembered, &picker.tab, harness);
+        let empty = if query.trim().is_empty() {
+            empty
+        } else {
+            "No models match"
+        };
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(column_header(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(controls::glyph(IconName::Search, muted))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Input::new(&picker.search).appearance(false)),
+                    ),
+                color(colors.border),
+            ))
+            .child(self.render_model_list(
+                owner, harness, option, layout, picker, remembered, empty, cx,
+            ))
+            .into_any_element()
+    }
+
+    /// The strip: your saved models' star, then a mark per provider, the shown one lit
+    /// with a bar; each one's tooltip names it and how it is paid. A `draft` chat's
+    /// strip leads with the agents it can start with instead.
+    #[allow(clippy::too_many_arguments)]
+    fn render_model_strip(
+        &self,
+        owner: &PickerOwner,
+        harness: ChatHarness,
+        option: &ChatOption,
+        plans: &[ChatPlan],
+        picker: &ModelPicker,
+        draft: Option<&ChatContent>,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
@@ -1559,7 +1683,7 @@ impl CompiApp {
                    name: String,
                    detail: Option<String>| {
             let selected = picker.tab == tab;
-            let id = chat.id.clone();
+            let owner = owner.clone();
             div()
                 .id(("chat-model-tab", index))
                 .relative()
@@ -1595,13 +1719,8 @@ impl CompiApp {
                     None,
                 ))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.show_model_tab(&id, Some(tab.clone()), cx);
-                    if let Some(picker) = this
-                        .chat
-                        .chats
-                        .get_mut(&id)
-                        .and_then(|model| model.picker.as_mut())
-                    {
+                    this.show_model_tab(&owner, Some(tab.clone()), cx);
+                    if let Some(picker) = this.owner_picker_mut(&owner) {
                         picker.column = PickerColumn::Models;
                         window.focus(&picker.search.focus_handle(cx), cx);
                     }
@@ -1617,8 +1736,10 @@ impl CompiApp {
         );
         // A draft can still change agent: one mark per installed agent heads the strip,
         // its own lit, another starting the draft again with that agent.
-        let agents: Vec<AnyElement> = if self.chat_draft(chat) == Some(true) {
-            self.installed_agents(&chat.environment)
+        let agents: Vec<AnyElement> = match draft.filter(|chat| self.chat_draft(chat) == Some(true))
+        {
+            Some(chat) => self
+                .installed_agents(&chat.environment)
                 .into_iter()
                 .enumerate()
                 .map(|(index, agent)| {
@@ -1655,21 +1776,20 @@ impl CompiApp {
                         ))
                         .into_any_element()
                 })
-                .collect()
-        } else {
-            Vec::new()
+                .collect(),
+            None => Vec::new(),
         };
-        let own_models = chat.harness.entry().own_models;
+        let own_models = harness.entry().own_models;
         let providers =
             providers(option, plans)
                 .into_iter()
                 .enumerate()
                 .map(|(index, provider)| {
-                    let name = provider_title(provider, chat.harness);
+                    let name = provider_title(provider, harness);
                     let icon = match (provider.and_then(model_icons::for_provider), provider) {
                         (Some(path), _) => mark(Some(path), 18.0, muted),
                         // The harness's own models: its mark, in its colours.
-                        (None, None) if own_models => img(harness_mark(chat.harness))
+                        (None, None) if own_models => img(harness_mark(harness))
                             .flex_none()
                             .size(ui_rems(18.0))
                             .into_any_element(),
@@ -1720,29 +1840,28 @@ impl CompiApp {
 
     /// The model list: models with their marks, the current one checked, favorites
     /// starred (others show the star on hover); it fades at an edge with more beyond.
+    /// With none, `empty` says why.
+    #[allow(clippy::too_many_arguments)]
     fn render_model_list(
         &self,
-        chat: &ChatContent,
+        owner: &PickerOwner,
+        harness: ChatHarness,
         option: &ChatOption,
         layout: PickerLayout,
         picker: &ModelPicker,
         remembered: &ChatModels,
+        empty: &str,
         cx: &Context<Self>,
     ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
         if layout.choices.is_empty() {
-            let empty = if picker.search.read(cx).value().trim().is_empty() {
-                "No favorites or recent models yet"
-            } else {
-                "No models match"
-            };
             return div()
                 .flex_1()
                 .px_4()
                 .pt_3()
                 .text_color(muted)
-                .child(empty)
+                .child(empty.to_owned())
                 .into_any_element();
         }
         let highlighted = (picker.column == PickerColumn::Models)
@@ -1759,7 +1878,7 @@ impl CompiApp {
         let favorites: Rc<[String]> = remembered.favorites.clone().into();
         let saved_tab = picker.tab == PickerTab::Saved;
         let current = option.current.clone();
-        let (id, setting, harness) = (chat.id.clone(), option.id.clone(), chat.harness);
+        let (owner, setting) = (owner.clone(), option.id.clone());
         let list = uniform_list(
             "chat-model-list",
             count,
@@ -1807,9 +1926,9 @@ impl CompiApp {
                                 // In the saved tab every favorite is starred, so its star
                                 // shows only on hover, as others' do everywhere.
                                 let star_shown = lit || (favorite && !saved_tab);
-                                let (pick_id, pick_setting, pick_value) =
-                                    (id.clone(), setting.clone(), choice.value.clone());
-                                let (star_chat, star_index) = (id.clone(), *index);
+                                let (pick_owner, pick_setting, pick_value) =
+                                    (owner.clone(), setting.clone(), choice.value.clone());
+                                let (star_owner, star_index) = (owner.clone(), *index);
                                 controls::menu_row(("chat-model-row", row), lit, false, cx)
                                     .group("chat-model-row")
                                     .w_full()
@@ -1853,7 +1972,7 @@ impl CompiApp {
                                                 .on_click(cx.listener(
                                                     move |this, _: &ClickEvent, _, cx| {
                                                         this.toggle_favorite(
-                                                            &star_chat, star_index, cx,
+                                                            &star_owner, star_index, cx,
                                                         );
                                                         cx.stop_propagation();
                                                         cx.notify();
@@ -1864,7 +1983,7 @@ impl CompiApp {
                                     .on_click(cx.listener(
                                         move |this, _: &ClickEvent, window, cx| {
                                             this.pick_model(
-                                                &pick_id,
+                                                &pick_owner,
                                                 pick_setting.clone(),
                                                 pick_value.clone(),
                                                 window,
@@ -1922,6 +2041,289 @@ impl CompiApp {
             })
             .into_any_element()
     }
+
+    /// Opens the model picker of Settings → Projects' New threads for `project`: the
+    /// models of the agent its new threads start with, on your saved models' tab (or the
+    /// project model's provider) with its model highlighted. Open for it already, its
+    /// search takes the keyboard again.
+    pub(in crate::gui::workspace) fn open_project_model_picker(
+        &mut self,
+        project: &Project,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(open) = &self.chat.project_picker
+            && open.project == *project
+        {
+            window.focus(&open.picker.search.focus_handle(cx), cx);
+            return;
+        }
+        let harness = self.new_thread_agent(Some(project));
+        let remembered = self.remembered_models(harness);
+        let current = self
+            .project_settings(project)
+            .and_then(|settings| settings.model.clone());
+        let listed = self.chat.listed.get(harness);
+        let option = ChatOption {
+            id: "model".to_owned(),
+            name: "Model".to_owned(),
+            category: Some("model".to_owned()),
+            choices: project_choices(listed, &remembered, current.as_deref()),
+            current: current.unwrap_or_default(),
+        };
+        let plans = listed.map_or_else(Vec::new, |listed| {
+            listed
+                .plans
+                .iter()
+                .map(|provider| ChatPlan {
+                    provider: provider.clone(),
+                    limits: Vec::new(),
+                })
+                .collect()
+        });
+        let unlisted = listed.is_none();
+        let tab = opening_tab(&option, &remembered);
+        let (search, events) = Self::picker_search(PickerOwner::Project, window, cx);
+        self.chat.project_picker = Some(ProjectPicker {
+            project: project.clone(),
+            harness,
+            option,
+            plans,
+            unlisted,
+            picker: ModelPicker {
+                search,
+                _events: events,
+                tab: tab.clone(),
+                column: PickerColumn::Models,
+                highlight: 0,
+                thinking: 0,
+                mode: 0,
+                approval: 0,
+                scroll: UniformListScrollHandle::new(),
+                claim_keyboard: CLAIM_FRAMES,
+            },
+        });
+        self.show_model_tab(&PickerOwner::Project, Some(tab), cx);
+    }
+
+    /// Closes the project model picker.
+    pub(in crate::gui::workspace) fn close_project_model_picker(&mut self) {
+        self.chat.project_picker = None;
+    }
+
+    /// The project model picker's search, while it is open.
+    pub(in crate::gui::workspace) fn project_model_search(&self) -> Option<&Entity<InputState>> {
+        self.chat
+            .project_picker
+            .as_ref()
+            .map(|project| &project.picker.search)
+    }
+
+    /// While the project model picker opens, gives its search the keyboard.
+    pub(in crate::gui::workspace) fn prepare_project_model_picker(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(picker) = self
+            .chat
+            .project_picker
+            .as_mut()
+            .map(|project| &mut project.picker)
+            && picker.claim_keyboard > 0
+        {
+            picker.claim_keyboard -= 1;
+            let search = picker.search.focus_handle(cx);
+            if !search.is_focused(window) {
+                window.focus(&search, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// New threads' model button for `project`: the model's mark and name, or its
+    /// agent's own model when none is set, opening the picker under it. `on_open` runs
+    /// first when a click opens it.
+    pub(in crate::gui::workspace) fn render_project_model_button(
+        &self,
+        project: &Project,
+        on_open: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let harness = self.new_thread_agent(Some(project));
+        let model = self
+            .project_settings(project)
+            .and_then(|settings| settings.model.as_deref());
+        let open = self
+            .chat
+            .project_picker
+            .as_ref()
+            .is_some_and(|picker| picker.project == *project);
+        let choice = model.map(|model| {
+            self.chat
+                .listed
+                .get(harness)
+                .and_then(|listed| listed.choices.iter().find(|choice| choice.value == model))
+                .cloned()
+                .unwrap_or_else(|| unlisted_choice(model))
+        });
+        let label = match &choice {
+            Some(choice) => choice.name.clone(),
+            None => format!("{}'s default", harness.name()),
+        };
+        let mut button = text_button("project-model", label)
+            .header()
+            .menu_open(open)
+            .tooltip(format!("{}'s model for new threads", harness.name()))
+            .detail(match &choice {
+                Some(choice) => choice.value.clone(),
+                None => format!("The model {} picks itself", harness.name()),
+            });
+        if let Some(path) = choice
+            .as_ref()
+            .and_then(|choice| model_mark(choice, harness))
+        {
+            button = button.icon(Icon::empty().path(path));
+        }
+        let opening = project.clone();
+        let on_open_change = cx.listener(move |this, open: &bool, window, cx| {
+            if *open {
+                on_open(this, window, cx);
+                this.open_project_model_picker(&opening, window, cx);
+            } else {
+                this.close_project_model_picker();
+            }
+            cx.notify();
+        });
+        let keys = {
+            let app = cx.entity().downgrade();
+            move |key: &Keystroke, window: &mut Window, cx: &mut App| {
+                if let Some(app) = app.upgrade() {
+                    app.update(cx, |this, cx| {
+                        this.model_picker_key(&PickerOwner::Project, key, window, cx);
+                    });
+                }
+            }
+        };
+        let content = self
+            .chat
+            .project_picker
+            .as_ref()
+            .filter(|_| open)
+            .map(|picker| self.render_project_model_picker(picker, cx));
+        let popover = controls::popover("project-model-menu", button, open)
+            .anchor(Anchor::TopRight)
+            .offset(px(GAP))
+            .on_open_change(on_open_change)
+            .on_key(keys);
+        match content {
+            Some(content) => popover.content(content).into_any_element(),
+            None => popover.into_any_element(),
+        }
+    }
+
+    /// The project model picker's popover: the strip and the searched model list, then
+    /// a footer with the keys (or that the agent never listed its models) and its
+    /// agent's own model.
+    fn render_project_model_picker(&self, project: &ProjectPicker, cx: &Context<Self>) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let picker = &project.picker;
+        let (owner, harness, name) = (PickerOwner::Project, project.harness, project.harness.name());
+        let remembered = self.remembered_models(harness);
+        let searching = !picker.search.read(cx).value().trim().is_empty();
+        let strip = (!searching).then(|| {
+            self.render_model_strip(
+                &owner,
+                harness,
+                &project.option,
+                &project.plans,
+                picker,
+                None,
+                cx,
+            )
+        });
+        let empty = if project.unlisted {
+            format!("Open a chat with {name} once to list its models.")
+        } else {
+            "No favorites or recent models yet".to_owned()
+        };
+        let list = self.render_model_column(
+            &owner,
+            harness,
+            &project.option,
+            &project.plans,
+            picker,
+            &remembered,
+            &empty,
+            cx,
+        );
+        let note = if project.unlisted {
+            format!("Only saved models: open a chat with {name} once to list them all")
+        } else {
+            picker_keys()
+        };
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(color(colors.border))
+            .bg(cx.theme().muted.opacity(0.4))
+            .child(picker_footnote(note, muted))
+            .child(
+                text_button("project-model-default", format!("{name}'s default"))
+                    .ghost()
+                    .selected(project.option.current.is_empty())
+                    .detail(format!("New threads start on the model {name} picks itself"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.pick_project_model(None, cx);
+                        cx.notify();
+                    })),
+            );
+        div()
+            .m(gpui::rems(-0.75))
+            .rounded(cx.theme().radius)
+            .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
+            .w(ui_rems(STRIP_WIDTH + LIST_WIDTH))
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .h(ui_rems(BODY_HEIGHT))
+                    .children(strip)
+                    .child(list),
+            )
+            .child(footer)
+            .into_any_element()
+    }
+}
+
+/// The picker's keys, as its footer lists them.
+fn picker_keys() -> String {
+    format!(
+        "↑↓ move · ←→ column · ↵ pick · {} star",
+        if cfg!(target_os = "macos") {
+            "⌘D"
+        } else {
+            "Ctrl+D"
+        }
+    )
+}
+
+/// A muted line at the left of a picker's footer, taking the room left.
+fn picker_footnote(text: String, muted: Hsla) -> Div {
+    div()
+        .flex_1()
+        .min_w_0()
+        .truncate()
+        .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+        .text_color(muted)
+        .child(text)
 }
 
 /// The picker's shortcut as the tooltip names it.
@@ -2010,6 +2412,43 @@ mod tests {
                 ],
             },
         ]
+    }
+
+    #[test]
+    fn a_projects_picker_lists_what_the_agent_listed_then_saved_models_it_lacks() {
+        let listed = AgentModels {
+            choices: vec![choice("anthropic/opus"), choice("openai/gpt")],
+            plans: Vec::new(),
+        };
+        let mut remembered = ChatModels::default();
+        remembered.toggle_favorite("anthropic/opus");
+        remembered.toggle_favorite("google/gemini");
+        remembered.picked_model("xai/grok");
+        let values = |choices: Vec<ChatChoice>| -> Vec<String> {
+            choices.into_iter().map(|choice| choice.value).collect()
+        };
+        assert_eq!(
+            values(project_choices(
+                Some(&listed),
+                &remembered,
+                Some("deepseek/r2")
+            )),
+            [
+                "anthropic/opus",
+                "openai/gpt",
+                "google/gemini",
+                "xai/grok",
+                "deepseek/r2"
+            ]
+        );
+        // Never listed: only what Compi remembers, named by its ID.
+        let unlisted = project_choices(None, &remembered, None);
+        assert_eq!(
+            values(unlisted.clone()),
+            ["anthropic/opus", "google/gemini", "xai/grok"]
+        );
+        assert_eq!(unlisted[1].name, "gemini");
+        assert_eq!(choice_provider(&unlisted[1]), Some("google"));
     }
 
     #[test]

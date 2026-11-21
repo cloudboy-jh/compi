@@ -356,8 +356,6 @@ pub(super) enum TextPurpose {
     /// A new group holding the tab; the name may be empty.
     NewTabGroup(TabId),
     RenameTabGroup(compi_protocol::TabGroupId),
-    /// The name a project goes by; its folder's name, or nothing, resets it.
-    RenameProject(compi_protocol::Project),
 }
 
 impl TextPurpose {
@@ -441,6 +439,12 @@ pub(super) enum Overlay {
     },
     /// Choose project icon, from Settings → Projects.
     ProjectIcon(Box<project_icon_picker::IconPicker>),
+    /// Remove `project` from Compi: forget what is set for it and its recent entry, and
+    /// delete `threads` (its threads, as listed when asked). Cancel starts focused.
+    ConfirmRemoveProject {
+        project: compi_protocol::Project,
+        threads: Vec<String>,
+    },
 }
 
 /// The popup open on a control, at most one: a select's list, a menu or a popover
@@ -465,8 +469,6 @@ pub(super) enum Popup {
     CatalogMenu,
     /// The Appearance controls under the sidebar's Appearance button.
     QuickAppearance,
-    /// Settings → Projects → New threads' model, of the card open.
-    ProjectModel,
 }
 
 pub(super) const MODAL_SCRIM_OPACITY: f32 = 0.72;
@@ -992,7 +994,7 @@ impl CompiApp {
             settings: settings::SettingsUi::default(),
             monitor: monitor::MonitorUi::default(),
             browser: browser::BrowserUi::default(),
-            chat: chat::ChatUi::default(),
+            chat: chat::ChatUi::new(),
             popup: None,
             context_menu: None,
             tab_menu: None,
@@ -3863,6 +3865,7 @@ impl CompiApp {
                 Overlay::Confirm { .. }
                     | Overlay::ConfirmDiscard { .. }
                     | Overlay::ConfirmQuitProcess { .. }
+                    | Overlay::ConfirmRemoveProject { .. }
                     | Overlay::Unsaved { .. }
                     | Overlay::Diagnostics
                     | Overlay::ChooseNewTab
@@ -4566,12 +4569,6 @@ impl CompiApp {
                         cx.notify();
                         return;
                     }
-                    TextPurpose::RenameProject(project) => {
-                        self.rename_project(&project, &label, cx);
-                        window.focus(&self.focus_handle, cx);
-                        cx.notify();
-                        return;
-                    }
                     TextPurpose::RenameTabGroup(group_id) => WorkspaceMutation::UpdateTabGroup {
                         group_id,
                         name: Some(label),
@@ -4622,6 +4619,10 @@ impl CompiApp {
             } => {
                 self.dismiss_overlay();
                 self.quit_process(source, (pid, start_time), name, force, cx);
+            }
+            Overlay::ConfirmRemoveProject { project, threads } => {
+                self.dismiss_overlay();
+                self.remove_project(project, threads, cx);
             }
             Overlay::ConfirmDaemonRestart {
                 revision, consent, ..

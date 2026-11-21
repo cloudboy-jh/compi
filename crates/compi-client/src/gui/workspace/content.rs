@@ -3200,7 +3200,7 @@ impl CompiApp {
     }
 
     /// Hands `path` to the system for `action`; a failure shows in the window.
-    fn open_natively(
+    pub(super) fn open_natively(
         &mut self,
         path: std::path::PathBuf,
         action: open_with::Action,

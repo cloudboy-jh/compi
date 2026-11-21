@@ -17,7 +17,7 @@
 //! cards, drawn on the page itself.
 use super::catalog::{CatalogTarget, GridStep};
 use super::chat::SECONDARY_KEY;
-use super::project_settings::{PROJECTS_ROW, ProjectControl, ProjectPart};
+use super::project_settings::{PROJECTS_ROW, ProjectControl, ProjectFields, ProjectPart};
 use super::*;
 use crate::config::{ChatEnter, ChatOpen, DevServer, NewTab};
 use crate::gui::controls::IconName;
@@ -176,8 +176,12 @@ pub(super) enum SettingsAction {
     PlayNotificationSound,
     OpenNotificationSystemSettings,
     TestNotification,
-    /// A control of a project's card on the Projects page.
+    /// A control of a project's row, or of its detail, on the Projects page.
     Project(ProjectControl),
+    /// The Projects page's search field, once it lists enough projects.
+    ProjectSearch,
+    /// The Projects page's Archived heading: folds or unfolds the archived projects.
+    ArchivedProjects,
 }
 
 /// Where Settings controls are drawn: a Settings pane, or Quick Appearance.
@@ -247,6 +251,8 @@ struct SettingsPane {
     grid_columns: std::cell::Cell<usize>,
     _events: gpui::Subscription,
     _theme_events: gpui::Subscription,
+    /// The Projects page's search and name fields.
+    projects: ProjectFields,
 }
 
 /// Settings in this window: each Settings pane's state, Quick Appearance's scroll
@@ -291,8 +297,13 @@ pub(in crate::gui) struct SettingsUi {
     /// The agent whose install command was copied last, until its card is looked up
     /// again.
     install_copied: Option<ChatHarness>,
-    /// The project whose card is open on the Projects page, by `project_key`.
-    pub(super) project_open: Option<String>,
+    /// The project selected on the Projects page, its detail open, by `project_key`.
+    pub(super) project_selected: Option<String>,
+    /// The Projects page lists its archived projects.
+    pub(super) archived_open: bool,
+    /// The Projects page was shown in the last frame; showing it anew selects the
+    /// current tab's project.
+    pub(super) projects_shown: bool,
 }
 
 /// What a row's renderer needs: where it is drawn and how.
@@ -1208,8 +1219,8 @@ static ROWS: &[Row] = &[
         PROJECTS_ROW,
         SettingsSection::Projects,
         "Projects",
-        "Each project's name, icon and pin, and the agent and model its new threads start with.",
-        "project projects folder repository rename name icon emoji monogram logo favicon pin pinned agent model new thread",
+        "Each project's name, icon and pin, the agent and model its new threads start with, and archiving or removing it.",
+        "project projects folder repository rename name icon emoji monogram logo favicon pin pinned agent model new thread archive archived unarchive remove delete forget reveal open tab",
         |app| app.project_stops(),
         |app, row, _, cx| app.render_projects_page(row, cx),
     ),
@@ -1664,7 +1675,8 @@ fn section_summary(section: SettingsSection) -> &'static str {
         }
         SettingsSection::Chat => "How agent chats look and behave.",
         SettingsSection::Projects => {
-            "Each project's name, icon and pin, and what its new threads start with."
+            "Pick a project to set its name, icon and pin, what its new threads start with, \
+             or to archive or remove it."
         }
         SettingsSection::Keyboard => {
             "Click a shortcut, then press the new keys. Escape cancels; Backspace leaves the \
@@ -1984,7 +1996,7 @@ impl CompiApp {
 
     /// Moves the keyboard highlight to `stop` where `host` draws, scrolling it into view.
     /// On a section icon it shows only once a key moves it (see `settings_pane_key_down`).
-    fn set_settings_focus(&mut self, host: SettingsHost, stop: Stop) {
+    pub(super) fn set_settings_focus(&mut self, host: SettingsHost, stop: Stop) {
         if let Some(scroll) = self.settings_scroll_mut(&host, in_theme_grid(stop)) {
             scroll.to_focus = true;
         }
@@ -2198,6 +2210,7 @@ impl CompiApp {
         if let Some(mut pane) = self.settings.panes.remove(from) {
             pane._events = settings_search_events(to, &pane.search, cx);
             pane._theme_events = theme_search_events(to, &pane.theme_search, cx);
+            pane.projects.follow_pane(to, cx);
             self.settings.panes.insert(to.clone(), pane);
         }
         if let Some(focus) = &mut self.settings.focus
@@ -2241,6 +2254,7 @@ impl CompiApp {
                     let theme_search =
                         cx.new(|cx| InputState::new(window, cx).placeholder("Search themes"));
                     let theme_events = theme_search_events(&pane_id, &theme_search, cx);
+                    let projects = ProjectFields::new(&pane_id, window, cx);
                     self.settings.panes.insert(
                         pane_id.clone(),
                         SettingsPane {
@@ -2256,6 +2270,7 @@ impl CompiApp {
                             grid_columns: std::cell::Cell::new(1),
                             _events: events,
                             _theme_events: theme_events,
+                            projects,
                         },
                     );
                     if let Some(stop) = self.settings.pending.take() {
@@ -2371,7 +2386,8 @@ impl CompiApp {
         if let Some(pane_id) = self.focused_pane().cloned()
             && let Some(pane) = self.settings.panes.get(&pane_id)
             && (pane.search.focus_handle(cx).is_focused(window)
-                || pane.theme_search.focus_handle(cx).is_focused(window))
+                || pane.theme_search.focus_handle(cx).is_focused(window)
+                || pane.projects.has_keyboard(window, cx))
             && let Some(keyboard) = self.settings_keyboard(&pane_id, cx)
             && !keyboard.is_focused(window)
         {
@@ -2387,6 +2403,66 @@ impl CompiApp {
             self.read_agent_installs(cx);
         }
         self.settings.agents_shown = agents;
+        self.prepare_projects_page(window, cx);
+    }
+
+    /// Where the keyboard highlight is: a Settings pane, or Quick Appearance.
+    pub(super) fn settings_focus_host(&self) -> Option<SettingsHost> {
+        Some(self.settings.focus.as_ref()?.host.clone())
+    }
+
+    /// Whether Settings pane `pane` shows `section` (and no search).
+    pub(super) fn settings_pane_shows(&self, pane: &PaneId, section: SettingsSection) -> bool {
+        self.settings
+            .panes
+            .get(pane)
+            .is_some_and(|ui| ui.section == section && ui.query.trim().is_empty())
+    }
+
+    /// The Projects page's fields of Settings pane `pane`; without one, of the pane
+    /// with the highlight, else of any.
+    pub(super) fn page_project_fields(&self, pane: Option<&PaneId>) -> Option<&ProjectFields> {
+        let pane = pane.or_else(|| match &self.settings.focus.as_ref()?.host {
+            SettingsHost::Pane(pane) => Some(pane),
+            SettingsHost::Quick => None,
+        });
+        match pane {
+            Some(pane) => self.settings.panes.get(pane),
+            None => self.settings.panes.values().next(),
+        }
+        .map(|ui| &ui.projects)
+    }
+
+    pub(super) fn project_fields_mut(&mut self, pane: &PaneId) -> Option<&mut ProjectFields> {
+        self.settings.panes.get_mut(pane).map(|ui| &mut ui.projects)
+    }
+
+    /// The Projects page's fields of every Settings pane.
+    pub(super) fn project_fields_each(&mut self) -> impl Iterator<Item = &mut ProjectFields> {
+        self.settings.panes.values_mut().map(|ui| &mut ui.projects)
+    }
+
+    /// Moves the highlight of Settings pane `pane_id` to the next stop (or, not
+    /// `forward`, the one before), and the keyboard with it.
+    pub(super) fn step_settings_focus(
+        &mut self,
+        pane_id: &PaneId,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let host = SettingsHost::Pane(pane_id.clone());
+        let order = self.settings_order(&host);
+        let current = self
+            .settings
+            .focus
+            .as_ref()
+            .filter(|focus| focus.host == host)
+            .map(|focus| focus.stop);
+        if let Some(next) = step(&order, current, forward) {
+            self.set_settings_focus(host, next);
+            self.apply_settings_focus(pane_id, window, cx);
+        }
     }
 
     /// Whether `pane` is a Settings pane with client state, and its focus handle.
@@ -2401,6 +2477,7 @@ impl CompiApp {
                 || pane.focus.contains_focused(window, cx)
                 || pane.search.focus_handle(cx) == *focused
                 || pane.theme_search.focus_handle(cx) == *focused
+                || pane.projects.owns(focused, cx)
         })
     }
 
@@ -2421,23 +2498,38 @@ impl CompiApp {
                 action: SettingsAction::ThemeSearch,
                 ..
             }) => ui.theme_search.focus_handle(cx),
+            Some(Stop::Control {
+                action: SettingsAction::ProjectSearch,
+                ..
+            }) => ui.projects.search_focus(cx),
+            Some(Stop::Control {
+                action:
+                    SettingsAction::Project(ProjectControl {
+                        part: ProjectPart::Name,
+                        ..
+                    }),
+                ..
+            }) => ui.projects.name_focus(cx),
             Some(_) => ui.focus.clone(),
         })
     }
 
-    /// The focused Settings pane's search field, or its theme list's, has the keyboard.
+    /// The focused Settings pane's search field, its theme list's, or a field of the
+    /// Projects page has the keyboard.
     pub(super) fn settings_search_has_keyboard(&self, window: &Window, cx: &App) -> bool {
         self.focused_pane()
             .and_then(|pane| self.settings.panes.get(pane))
             .is_some_and(|pane| {
                 pane.search.focus_handle(cx).is_focused(window)
                     || pane.theme_search.focus_handle(cx).is_focused(window)
+                    || pane.projects.has_keyboard(window, cx)
             })
     }
 
     /// Keys in the focused Settings pane's search fields, before the field's own: Tab
     /// and Down move on to the controls, Escape clears the search or leaves (Settings,
-    /// or the theme list).
+    /// or the theme list). The Projects page's fields have their own
+    /// (`projects_field_key`).
     pub(super) fn settings_search_key(
         &mut self,
         key: &Keystroke,
@@ -2453,6 +2545,14 @@ impl CompiApp {
         let modifiers = &key.modifiers;
         if modifiers.control || modifiers.alt || modifiers.platform {
             return false;
+        }
+        if self
+            .settings
+            .panes
+            .get(&pane_id)
+            .is_some_and(|pane| pane.projects.has_keyboard(window, cx))
+        {
+            return self.projects_field_key(&pane_id, key, window, cx);
         }
         let themes = self
             .settings
@@ -2530,7 +2630,7 @@ impl CompiApp {
     /// Escape in a Settings pane's controls: a waiting theme preview is cancelled, else
     /// the theme list closes, else the highlight goes up to the section shown, and from
     /// there the keyboard goes back to the terminal.
-    fn settings_escape(&mut self, pane_id: &PaneId) {
+    pub(super) fn settings_escape(&mut self, pane_id: &PaneId) {
         let host = SettingsHost::Pane(pane_id.clone());
         if self.theme_bar_shown(pane_id) {
             self.cancel_theme_preview();
@@ -2583,7 +2683,7 @@ impl CompiApp {
     }
 
     /// Gives the keyboard to the search field or the pane, following the highlight.
-    fn apply_settings_focus(&self, pane_id: &PaneId, window: &mut Window, cx: &mut App) {
+    pub(super) fn apply_settings_focus(&self, pane_id: &PaneId, window: &mut Window, cx: &mut App) {
         if let Some(handle) = self.settings_keyboard(pane_id, cx)
             && !handle.is_focused(window)
         {
@@ -2635,6 +2735,10 @@ impl CompiApp {
         };
         if pane.search.focus_handle(cx).is_focused(window)
             || pane.theme_search.focus_handle(cx).is_focused(window)
+            || pane.projects.has_keyboard(window, cx)
+            || self
+                .project_model_search()
+                .is_some_and(|search| search.focus_handle(cx).is_focused(window))
         {
             // Text belongs to the field; Tab, Down and Escape were taken before it.
             return;
@@ -2669,6 +2773,12 @@ impl CompiApp {
             .as_deref()
             .filter(|text| plain && !text.is_empty() && !text.chars().any(char::is_control))
         {
+            if self.type_in_project_search(pane_id, text, window, cx) {
+                self.apply_settings_focus(pane_id, window, cx);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             // Typing searches: the theme list's themes while it shows, else settings.
             let text = text.to_owned();
             let themes = self.theme_list_shown(pane_id);
@@ -3107,6 +3217,11 @@ impl CompiApp {
             SettingsAction::ChooseStartingFolder => self.choose_starting_folder(cx),
             SettingsAction::StartAtHome => self.set_starting_folder(None, cx),
             SettingsAction::Project(control) => self.activate_project_control(control, window, cx),
+            // The field takes the keyboard (`settings_keyboard`).
+            SettingsAction::ProjectSearch => {}
+            SettingsAction::ArchivedProjects => {
+                self.settings.archived_open = !self.settings.archived_open;
+            }
             SettingsAction::OpenSettings => {
                 self.open_settings(Some(SettingsSection::Appearance), None, window, cx)
             }

@@ -198,45 +198,29 @@ impl CompiApp {
         })
     }
 
-    /// `project`'s icon, `size` px square: the one you chose for it, else its image once
-    /// the daemon found one and it decodes, else its letter tile; for no project, or a
-    /// name without a letter, the folder glyph.
+    /// `project`'s icon, `size` px square: the one you chose for it, else its
+    /// automatic one (`automatic_project_icon`); for no project, the folder glyph.
     pub(super) fn project_icon(&self, project: Option<&Project>, size: f32) -> gpui::AnyElement {
-        let colors = self.theme.colors();
-        let folder_color = modal_text_color(colors.muted, colors);
-        let folder = move || {
-            gpui::svg()
-                .flex_none()
-                .size(px(size))
-                .path(controls::IconName::Folder.path())
-                .text_color(rgb(folder_color))
-                .into_any_element()
-        };
         let Some(project) = project else {
-            return folder();
-        };
-        let name = self.project_name(project);
-        let letter = tile_letter(&name).map(|letter| {
-            let letter: SharedString = letter.into();
-            let text = modal_text_color(self.theme.terminal().ansi[tile_color(&name)], colors);
-            (letter, text)
-        });
-        let automatic = {
-            let letter = letter.clone();
-            move || match &letter {
-                Some((letter, text)) => tile(letter.clone(), *text, size),
-                None => folder(),
-            }
+            return self.folder_glyph(size);
         };
         if let Some(icon) = self
             .project_settings(project)
             .and_then(|settings| settings.icon.as_ref())
-            && let Some(icon) = self.chosen_icon(icon, size, automatic.clone())
+            && let Some(icon) = self.chosen_icon(icon, size, self.letter_icon(project, size))
         {
             return icon;
         }
-        if letter.is_none() {
-            return folder();
+        self.automatic_project_icon(project, size)
+    }
+
+    /// `project`'s icon when none is chosen, `size` px square: its image once the
+    /// daemon found one and it decodes, else its letter tile, else (a name without a
+    /// letter) the folder glyph.
+    pub(super) fn automatic_project_icon(&self, project: &Project, size: f32) -> gpui::AnyElement {
+        let automatic = self.letter_icon(project, size);
+        if tile_letter(&self.project_name(project)).is_none() {
+            return automatic();
         }
         let image = self.project_icons.image(project, || {
             let (target, sender, project) =
@@ -259,6 +243,45 @@ impl CompiApp {
                 .with_fallback(automatic)
                 .into_any_element(),
             None => automatic(),
+        }
+    }
+
+    /// What draws `project`'s letter tile, `size` px square; the folder glyph for a
+    /// name without a letter.
+    fn letter_icon(
+        &self,
+        project: &Project,
+        size: f32,
+    ) -> impl Fn() -> gpui::AnyElement + Clone + use<> {
+        let colors = self.theme.colors();
+        let name = self.project_name(project);
+        let letter = tile_letter(&name).map(|letter| {
+            let letter: SharedString = letter.into();
+            let text = modal_text_color(self.theme.terminal().ansi[tile_color(&name)], colors);
+            (letter, text)
+        });
+        let folder = self.folder_glyph_painter(size);
+        move || match &letter {
+            Some((letter, text)) => tile(letter.clone(), *text, size),
+            None => folder(),
+        }
+    }
+
+    /// The muted folder glyph, `size` px square: what stands for no project.
+    fn folder_glyph(&self, size: f32) -> gpui::AnyElement {
+        self.folder_glyph_painter(size)()
+    }
+
+    fn folder_glyph_painter(&self, size: f32) -> impl Fn() -> gpui::AnyElement + Clone + use<> {
+        let colors = self.theme.colors();
+        let folder_color = modal_text_color(colors.muted, colors);
+        move || {
+            gpui::svg()
+                .flex_none()
+                .size(px(size))
+                .path(controls::IconName::Folder.path())
+                .text_color(rgb(folder_color))
+                .into_any_element()
         }
     }
 }

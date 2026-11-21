@@ -100,6 +100,16 @@ impl ProjectHistory {
         matches.into_iter().map(|(_, _, _, path)| path).collect()
     }
 
+    /// Forgets folder `path` (a removed project's root); whether it was remembered.
+    pub fn forget(&mut self, path: &str) -> bool {
+        let Some(path) = folder(path) else {
+            return false;
+        };
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.path != path);
+        self.entries.len() != before
+    }
+
     /// Correct file-derived values before they become live client state.
     pub(crate) fn sanitize(&mut self) -> bool {
         let before = self.entries.len();
@@ -240,6 +250,18 @@ mod tests {
         history.record("/work/recent");
         assert_eq!(history.search(""), ["/work/recent", "/work/frequent"]);
         assert_eq!(history.entries.len(), 2);
+    }
+
+    #[test]
+    fn a_forgotten_folder_leaves_the_history() {
+        let mut history = ProjectHistory::default();
+        history.record("/work/compi");
+        history.record("/C:/work/site/");
+        assert!(history.forget("/work/compi/"));
+        assert!(!history.forget("/work/compi"));
+        assert!(history.forget(r"C:\work\site"));
+        assert!(history.search("").is_empty());
+        assert!(!history.forget("relative"));
     }
 
     #[test]

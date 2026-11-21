@@ -120,6 +120,12 @@ gpui_kit_assets::icon_assets!(
         ShieldHalf,
         ShieldOff,
         FolderCog,
+        FolderOpen,
+        Pin,
+        PinOff,
+        Archive,
+        ArchiveRestore,
+        Trash,
     ]
 );
 
