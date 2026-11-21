@@ -994,6 +994,13 @@ fn handle_connection(
                         },
                     })?
                 }
+                // Looks for each agent's programs and versions, a few seconds at most.
+                ClientMessage::ListAgentInstalls => sink.send_control(&ServerControl {
+                    request_id: Some(request_id),
+                    message: ServerMessage::AgentInstalls {
+                        installs: crate::chat::agent_installs(),
+                    },
+                })?,
                 ClientMessage::ListThreads => match manager.snapshot() {
                     Ok(workspace) => sink.send_control(&ServerControl {
                         request_id: Some(request_id),

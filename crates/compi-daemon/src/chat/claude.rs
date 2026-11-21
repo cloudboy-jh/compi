@@ -111,8 +111,10 @@ impl Claude {
 pub(super) const WIRE: Wire = Wire {
     configured_approval: |_| None,
     launch_args,
+    environment: |_| Vec::new(),
     start,
     handle,
+    line: |_, _, _| {},
     session_with_first_prompt: true,
     prompt,
     steer: None,

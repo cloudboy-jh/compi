@@ -200,6 +200,7 @@ fn provider_name(provider: &str) -> String {
         "github-copilot" => "GitHub Copilot",
         "xai" => "xAI",
         "deepseek" => "DeepSeek",
+        "opencode" => "OpenCode",
         _ => "",
     };
     if !known.is_empty() {
@@ -490,7 +491,7 @@ fn approval_shown(
 }
 
 /// Whether the composer row shows the shield: a chat's own permissions (`chosen`) that
-/// differ from `default` (Settings → Chat → Approvals).
+/// differ from `default` (Settings → Agents → Approvals).
 fn approval_differs(chosen: Option<ChatApproval>, default: ChatApproval) -> bool {
     chosen.is_some_and(|chosen| chosen != default)
 }
@@ -645,7 +646,7 @@ impl CompiApp {
     }
 
     /// The composer row's shield, only while this chat's permissions differ from
-    /// Settings → Chat → Approvals, as the mode shows only when it is not the first. It
+    /// Settings → Agents → Approvals, as the mode shows only when it is not the first. It
     /// opens the picker on the permissions; until the harness reports its settings
     /// (`picker`) there is no picker to open.
     fn render_chat_approval_chip(
@@ -672,7 +673,7 @@ impl CompiApp {
                 .icon(icon)
                 .tooltip("Permissions for this chat")
                 .detail(format!(
-                    "Settings → Chat → Approvals: {}",
+                    "Settings → Agents → Approvals: {}",
                     super::super::settings::chat_approval_label(default)
                 ))
                 .disabled_because(

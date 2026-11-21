@@ -8,8 +8,9 @@ use serde_json::{Value, json};
 use std::sync::LazyLock;
 
 /// One command, or one action of a command, as help describes it. Its usage and detail
-/// may name `{programs}` (`omp|claude|codex`) and `{agents}` (`omp (OMP), claude (Claude
-/// Code) or codex (Codex)`), which read as every agent `compi chat` takes.
+/// may name `{programs}` (`omp|claude|codex|opencode`) and `{agents}` (`omp (OMP), claude
+/// (Claude Code), codex (Codex) or opencode (OpenCode)`), which read as every agent
+/// `compi chat` takes.
 #[derive(Clone, Copy)]
 pub(super) struct Entry {
     pub(super) command: &'static str,
@@ -474,7 +475,7 @@ const CATALOGUE: &[Entry] = &[
         action: None,
         usage: "chat [--agent {programs}]",
         summary: "Chat with an agent in or beside the terminal's pane",
-        detail: "Start a new chat in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or the pane menu's Show terminal returns to it (Esc never leaves the chat). The chat's agent is --agent, {agents}, else the agent of the terminal's project (Settings → Projects), else the Default agent ([chat] agent, Settings → Chat). With [chat] open = \"beside\" (Settings → Chat → Opening a chat), it opens in a new pane beside the terminal instead. The agent works in the shell's current directory, in the terminal's environment (a WSL distribution runs it there). The chat runs while a pane or view holds it, hidden or not; closing its pane, view or tab ends it with the shell, like any terminal's process. Its transcript stays a thread: Threads in the palette reopens it on the same session, and compi threads lists it. --json adds the chat's id and folder.",
+        detail: "Start a new chat in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or the pane menu's Show terminal returns to it (Esc never leaves the chat). The chat's agent is --agent, {agents}, else the agent of the terminal's project (Settings → Projects), else the Default agent ([chat] agent, Settings → General). With [chat] open = \"beside\" (Settings → Chat → Opening a chat), it opens in a new pane beside the terminal instead. The agent works in the shell's current directory, in the terminal's environment (a WSL distribution runs it there). The chat runs while a pane or view holds it, hidden or not; closing its pane, view or tab ends it with the shell, like any terminal's process. Its transcript stays a thread: Threads in the palette reopens it on the same session, and compi threads lists it. --json adds the chat's id and folder.",
         example: "compi chat --agent claude",
     },
     Entry {
@@ -498,7 +499,7 @@ const CATALOGUE: &[Entry] = &[
         action: None,
         usage: "settings [SECTION]",
         summary: "Show Settings in the terminal's pane",
-        detail: "Show Settings in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. SECTION is general, appearance, interface, notifications, terminal, chat, projects, keyboard, monitor, updates or advanced; without it the pane keeps the section it shows, else General. From a Settings pane (--pane), that pane changes section.",
+        detail: "Show Settings in the selected terminal's own pane, in place of the shell, which keeps running underneath at its size; Cmd/Ctrl+Shift+E or Esc returns to it. SECTION is general, agents, appearance, interface, notifications, terminal, chat, projects, keyboard, monitor, updates or advanced; without it the pane keeps the section it shows, else General. From a Settings pane (--pane), that pane changes section.",
         example: "compi settings terminal",
     },
     Entry {
@@ -854,10 +855,11 @@ mod tests {
     #[test]
     fn chat_help_names_every_agent() {
         let chat = find("chat", None).unwrap();
-        assert_eq!(usage(chat), "compi chat [--agent omp|claude|codex]");
+        assert_eq!(usage(chat), "compi chat [--agent omp|claude|codex|opencode]");
         assert!(
-            chat.detail
-                .contains("--agent, omp (OMP), claude (Claude Code) or codex (Codex), else"),
+            chat.detail.contains(
+                "--agent, omp (OMP), claude (Claude Code), codex (Codex) or opencode (OpenCode), else"
+            ),
             "{}",
             chat.detail
         );

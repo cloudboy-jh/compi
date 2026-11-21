@@ -263,7 +263,7 @@ struct ChatModel {
     /// Where the composer card and the model button were drawn, for the model picker.
     picker_anchor: Rc<PickerAnchor>,
     /// The permissions this chat's harness starts with, picked in its model picker;
-    /// `None` follows Settings → Chat → Approvals. The watcher passes it on.
+    /// `None` follows Settings → Agents → Approvals. The watcher passes it on.
     approval: Arc<Mutex<Option<ChatApproval>>>,
     /// What its new sessions start on, which the watcher's next `WatchChat` passes on:
     /// what Compi remembers of its harness, on its project's model (see
@@ -277,7 +277,7 @@ pub(in crate::gui) struct ChatUi {
     chats: HashMap<String, ChatModel>,
     /// A redraw is due for a working chat's elapsed times.
     ticking: bool,
-    /// Settings → Chat → Approvals, which each watcher's next `WatchChat` passes on.
+    /// Settings → Agents → Approvals, which each watcher's next `WatchChat` passes on.
     approval: Arc<Mutex<ChatApproval>>,
     /// Text for each chat's draft (terminal text sent to it), until the chat has client
     /// state.
@@ -423,13 +423,13 @@ impl ChatModel {
         draft::is_draft(self.state.as_ref(), chat.session.as_deref())
     }
 
-    /// The permissions picked for this chat; `None` follows Settings → Chat → Approvals.
+    /// The permissions picked for this chat; `None` follows Settings → Agents → Approvals.
     fn chosen_approval(&self) -> Option<ChatApproval> {
         self.approval.lock().ok().and_then(|approval| *approval)
     }
 
     /// The permissions the harness starts with: the chat's pick, else `default`
-    /// (Settings → Chat → Approvals).
+    /// (Settings → Agents → Approvals).
     fn approval(&self, default: ChatApproval) -> ChatApproval {
         self.chosen_approval().unwrap_or(default)
     }
@@ -642,7 +642,7 @@ impl ChatModel {
 }
 
 /// The permissions a watcher's `WatchChat` starts the harness with: the chat's own, when
-/// its draft set them, else Settings → Chat → Approvals.
+/// its draft set them, else Settings → Agents → Approvals.
 struct WatchApproval {
     chosen: Arc<Mutex<Option<ChatApproval>>>,
     default: Arc<Mutex<ChatApproval>>,
@@ -1439,7 +1439,7 @@ impl CompiApp {
     }
 
     /// The permissions chat `chat`'s harness starts with: its own pick, else
-    /// Settings → Chat → Approvals.
+    /// Settings → Agents → Approvals.
     fn chat_approval(&self, chat: &str) -> ChatApproval {
         let default = self.config.chat_approval;
         self.chat
@@ -2276,7 +2276,7 @@ impl CompiApp {
     /// Over the composer while sub-agents of the chat run: how many, then each by name
     /// with what it does (or how long it has run). A click on the count opens every
     /// running agent's call; a click on an agent unfolds its task, steps and result in the
-    /// transcript and scrolls to it. Settings → Chat turns it off.
+    /// transcript and scrolls to it. Settings → Agents → Agents bar turns it off.
     fn render_chat_agents(
         &self,
         chat: &ChatContent,

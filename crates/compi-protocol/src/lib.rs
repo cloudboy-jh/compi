@@ -91,10 +91,12 @@ use std::fmt;
 // each chat's transcript as a thread once its pane closes and its agent stops:
 // `ListThreads` (`Threads`, `ThreadInfo`), `DeleteThread`, and the mutation `OpenThread`.
 // Tabs and threads belong to a project (`Project`, `WorkspaceTab::project`,
-// `ThreadInfo::project`), with `ProjectIcon` and `SearchProjectFiles`. Settings gains a
-// Projects section. A launch profile's Windows shell can be automatic
-// (`WindowsShell::Automatic`): the daemon starts WSL in a Linux folder and Windows
-// PowerShell in a Windows one, and keeps the shell it picked on the surface.
+// `ThreadInfo::project`), with `ProjectIcon` and `SearchProjectFiles`. Settings gains
+// Projects, General and Agents sections, and `ListAgentInstalls` (`AgentInstalls`) says
+// where each agent is installed on the PC, with its versions. A launch profile's Windows
+// shell can be automatic (`WindowsShell::Automatic`): the daemon starts WSL in a Linux
+// folder and Windows PowerShell in a Windows one, and keeps the shell it picked on the
+// surface.
 pub const PROTOCOL_VERSION: u32 = 41;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
@@ -563,6 +565,9 @@ pub enum ClientMessage {
     ListChatAgents {
         environment: ContentEnvironment,
     },
+    /// Where every agent is installed on this PC: its Windows program and its Linux one,
+    /// with their versions. Answered by `AgentInstalls`.
+    ListAgentInstalls,
     /// Every thread the daemon keeps, newest change first, answered by `Threads`.
     ListThreads,
     /// Deletes thread `chat`: its transcript, and its harness if it runs. Refused while a
@@ -771,6 +776,9 @@ pub enum ServerMessage {
     },
     ChatAgents {
         agents: Vec<chat::ChatHarness>,
+    },
+    AgentInstalls {
+        installs: chat::AgentInstalls,
     },
     Threads {
         threads: Vec<chat::ThreadInfo>,
@@ -1902,6 +1910,8 @@ pub enum SettingsSection {
     /// How you work: what new tabs open, the default agent, the shell.
     #[default]
     General,
+    /// Every agent: where it is installed, and how agents ask before running tools.
+    Agents,
     Appearance,
     Interface,
     Notifications,
@@ -1918,8 +1928,9 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::General,
+        Self::Agents,
         Self::Appearance,
         Self::Interface,
         Self::Notifications,
@@ -1935,6 +1946,7 @@ impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
             Self::General => "General",
+            Self::Agents => "Agents",
             Self::Appearance => "Appearance",
             Self::Interface => "Interface",
             Self::Notifications => "Notifications",

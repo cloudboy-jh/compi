@@ -453,7 +453,7 @@ pub(super) enum Popup {
     UiFont,
     /// Settings → Terminal → Terminal font.
     TerminalFont,
-    /// Settings → Terminal → Advanced → Shell (Windows).
+    /// Settings → General → Shell (Windows).
     Shell,
     /// Settings → Notifications → Show notifications.
     NotificationDelivery,
@@ -461,7 +461,7 @@ pub(super) enum Popup {
     NotificationFocusedPane,
     /// Settings → Notifications → Notification sound.
     NotificationSound,
-    /// Settings → Chat → Approvals.
+    /// Settings → Agents → Approvals.
     ChatApproval,
     /// The theme list's More menu.
     CatalogMenu,

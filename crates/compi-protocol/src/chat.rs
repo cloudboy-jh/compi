@@ -1,8 +1,9 @@
 //! Native agent chat: a content pane talking to an installed agent harness (OMP over the
 //! Agent Client Protocol, Claude Code over its headless JSON stream, Codex over its app
-//! server's JSON-RPC). The daemon runs the harness, like a shell, and keeps the
-//! transcript; windows watch it (`WatchChat`) and send prompts, cancels and answers. The
-//! harness owns its sessions, models, tools and credentials.
+//! server's JSON-RPC, OpenCode over its local HTTP server and event stream). The daemon
+//! runs the harness, like a shell, and keeps the transcript; windows watch it
+//! (`WatchChat`) and send prompts, cancels and answers. The harness owns its sessions,
+//! models, tools and credentials.
 use crate::ContentEnvironment;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -48,6 +49,10 @@ pub enum ChatHarness {
     /// OpenAI's Codex, driven through `codex app-server` (JSON-RPC over its standard
     /// input and output).
     Codex,
+    /// OpenCode, driven through `opencode serve` (its local HTTP server and event
+    /// stream).
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 /// Everything Compi knows of one agent: what it is called, how it looks, how it names
@@ -83,10 +88,14 @@ pub struct AgentEntry {
     pub windows: &'static [WindowsProgram],
     /// The variable naming the Bash its Windows program runs commands with (Claude
     /// Code's `CLAUDE_CODE_GIT_BASH_PATH`; OMP's, through the extension Compi loads,
-    /// `COMPI_AGENT_SHELL`): in a WSL chat it names Compi's agent shell, which runs them
-    /// in WSL. `None` for an agent whose Windows program's commands Compi cannot reach
-    /// (Codex's always run in PowerShell).
+    /// `COMPI_AGENT_SHELL`; OpenCode's `SHELL`): in a WSL chat it names Compi's agent
+    /// shell, which runs them in WSL; a Linux program never gets it. `None` for an agent
+    /// whose Windows program's commands Compi cannot reach (Codex's always run in
+    /// PowerShell).
     pub windows_bash: Option<&'static str>,
+    /// The command that installs it, in a terminal in WSL or on Windows (Settings →
+    /// Agents shows it for an agent installed nowhere).
+    pub install: &'static str,
 }
 
 /// How an agent's mark is drawn.
@@ -114,7 +123,7 @@ pub enum WindowsProgram {
 }
 
 /// Every agent's entry, in `ChatHarness::ALL` order.
-static ENTRIES: [AgentEntry; 3] = [
+static ENTRIES: [AgentEntry; 4] = [
     AgentEntry {
         harness: ChatHarness::Omp,
         name: "OMP",
@@ -135,6 +144,7 @@ static ENTRIES: [AgentEntry; 3] = [
             WindowsProgram::Home(".bun/bin/omp.exe"),
         ],
         windows_bash: Some("COMPI_AGENT_SHELL"),
+        install: "bun install -g @oh-my-pi/pi-coding-agent",
     },
     AgentEntry {
         harness: ChatHarness::Claude,
@@ -156,6 +166,7 @@ static ENTRIES: [AgentEntry; 3] = [
             WindowsProgram::Npm("node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
         ],
         windows_bash: Some("CLAUDE_CODE_GIT_BASH_PATH"),
+        install: "npm install -g @anthropic-ai/claude-code",
     },
     AgentEntry {
         harness: ChatHarness::Codex,
@@ -205,11 +216,31 @@ static ENTRIES: [AgentEntry; 3] = [
             ),
         ],
         windows_bash: None,
+        install: "npm install -g @openai/codex",
+    },
+    AgentEntry {
+        harness: ChatHarness::OpenCode,
+        name: "OpenCode",
+        program: "opencode",
+        keywords: "open code sst",
+        mark: AgentMark::Brand("opencode"),
+        own_models: false,
+        own_setting: "Same as OpenCode",
+        approval_modes: ["ask", "allow-edits", "allow-all"],
+        other_modes: &[],
+        linux_folders: &[".opencode/bin", ".local/bin", ".bun/bin"],
+        windows: &[
+            WindowsProgram::Npm("node_modules/opencode-ai/bin/opencode.exe"),
+            WindowsProgram::Path("opencode.exe"),
+        ],
+        // Its Windows build runs commands with the shell `SHELL` names.
+        windows_bash: Some("SHELL"),
+        install: "npm install -g opencode-ai",
     },
 ];
 
 impl ChatHarness {
-    pub const ALL: [Self; 3] = [Self::Omp, Self::Claude, Self::Codex];
+    pub const ALL: [Self; 4] = [Self::Omp, Self::Claude, Self::Codex, Self::OpenCode];
 
     /// Everything Compi knows of the agent.
     pub fn entry(self) -> &'static AgentEntry {
@@ -270,8 +301,9 @@ impl ChatHarness {
 /// How the harness asks before running tools, as Compi starts it. `Harness` keeps the
 /// harness's own setting (OMP's `tools.approvalMode`, which `omp acp` does not read by
 /// itself, so the daemon looks it up and passes it on; Claude Code's `permissions`
-/// settings and Codex's `approval_policy` and `sandbox_mode`, which they read
-/// themselves). Each agent names the levels its own way (`AgentEntry::approval_modes`).
+/// settings, Codex's `approval_policy` and `sandbox_mode` and OpenCode's `permission`
+/// rules, which they read themselves). Each agent names the levels its own way
+/// (`AgentEntry::approval_modes`).
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatApproval {
@@ -937,6 +969,38 @@ pub enum ChatEvent {
     Plans {
         plans: Vec<ChatPlan>,
     },
+}
+
+/// Where every agent is installed on this PC, for Settings → Agents (`AgentInstalls`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentInstalls {
+    /// The WSL distribution the Linux programs were looked for in, the default one; `None`
+    /// on a PC without WSL, and on a Linux or macOS host, whose own programs they are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distribution: Option<String>,
+    /// One per agent, in `ChatHarness::ALL` order.
+    #[serde(default)]
+    pub agents: Vec<AgentInstall>,
+}
+
+/// Where one agent is installed: its Windows program and its Linux program, each as its
+/// launch finds it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentInstall {
+    pub harness: ChatHarness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub windows: Option<AgentProgram>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux: Option<AgentProgram>,
+}
+
+/// One installed program of an agent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentProgram {
+    /// Its version, as `<program> --version` reports it; `None` when it reports none in
+    /// time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 #[cfg(test)]

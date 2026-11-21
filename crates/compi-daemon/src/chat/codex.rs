@@ -14,7 +14,7 @@
 //! The model, reasoning effort and collaboration mode go with the next `turn/start`, so
 //! changing one restarts nothing. Codex lists its threads itself (`thread/list`), and the
 //! running app server opens another one in place.
-mod items;
+pub(super) mod items;
 #[cfg(test)]
 mod tests;
 
@@ -48,8 +48,10 @@ pub(super) const WIRE: Wire = Wire {
     // Codex reads its own `approval_policy` and `sandbox_mode`.
     configured_approval: |_| None,
     launch_args,
+    environment: |_| Vec::new(),
     start,
     handle: |_, inner, message| handle(inner, message),
+    line: |_, _, _| {},
     session_with_first_prompt: false,
     prompt,
     // Codex takes prompts as turns of their own: they queue.

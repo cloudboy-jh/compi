@@ -109,11 +109,11 @@ mod tests {
     fn agent_lists_name_every_agent() {
         assert_eq!(
             agent_list(|agent| agent.program.to_owned()),
-            "omp, claude or codex"
+            "omp, claude, codex or opencode"
         );
         assert_eq!(
             agent_list(|agent| format!("\"{}\"", agent.program)),
-            "\"omp\", \"claude\" or \"codex\""
+            "\"omp\", \"claude\", \"codex\" or \"opencode\""
         );
     }
 

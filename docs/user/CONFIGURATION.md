@@ -47,21 +47,22 @@ text_size = 15 # 8 through 32; unset follows font.size
 
 ## Chat
 
-**Settings → Chat** holds what Compi controls about agent chats; the model, thinking level and mode are picked in each chat's model picker. A change made in Settings applies to every open window.
+**Settings → General** holds **New tabs** and **Default agent**, **Settings → Agents** each agent's card and how agents ask before running tools, and **Settings → Chat** how the conversation looks and behaves; the model, thinking level and mode are picked in each chat's model picker. A change made in Settings applies to every open window.
 
-- **Text size** sizes agent chats with −, + and **Reset**. The messages and everything around them (header, tool cards, menus, the message box) grow together; the rest of the window keeps its size. With a chat focused, Ctrl+=, Ctrl+- and Ctrl+0 (Cmd on macOS) change the chat text size instead of the terminal font. Reset removes the key, returning to the default of 14.
-- **Default agent** picks the agent every new thread starts with (New chat, New thread, a new tab, `compi chat`): **OMP** (the default), **Claude Code** or **Codex**. Settings lists the agents installed where new chats open, in WSL or on Windows, and dims the others with **Not installed**. A split from a chat keeps that chat's agent, and `compi chat --agent omp|claude|codex` overrides it for one chat.
-- **Approvals** chooses how the agent asks before it runs tools. **Same as the agent** (the default) uses the agent's own setting, the one it follows in a terminal (OMP's `tools.approvalMode`, which Compi reads when the chat starts and hands to OMP, whose chat mode would otherwise ignore it; Claude Code's permissions; Codex's `approval_policy` and `sandbox_mode`). **Always ask** asks before anything but reading, **Allow edits** runs reads and edits and asks before commands, and **Allow everything** never asks. Each agent gets them in its own terms: OMP's `always-ask`, `write` and `yolo`; Claude Code's `default`, `acceptEdits` and `bypassPermissions`; Codex's approval policy and sandbox `untrusted` + `read-only`, `on-request` + `workspace-write` and `never` + `danger-full-access`. A change applies to new chats and to chats that start again (Restart in the ⋯ menu, or after the daemon restarts); a running chat keeps the mode it started with.
-- **New tabs**: **Chat first** opens a new thread in the tab strip's + and Ctrl+T (Cmd+T); **Terminal first** opens a shell. Compi asks once, on first launch; right-click + for the other.
-- **Enter while the agent works**: **Steer** (the default) sends the message into the running turn and Ctrl+Enter (Cmd+Enter on macOS) queues it for after; **Queue** swaps the two.
-- **Opening a chat**: **In place of the shell** (the default) shows the chat over the terminal it starts from; **Beside it** opens it in a new pane next to that terminal.
-- **Agents bar** (on) lists OMP's running sub-agents above the message box.
+- **Settings → General → New tabs**: **Chat first** opens a new thread in the tab strip's + and Ctrl+T (Cmd+T); **Terminal first** opens a shell. Compi asks once, on first launch; right-click + for the other.
+- **Settings → General → Default agent** picks the agent every new thread starts with (New chat, New thread, a new tab, `compi chat`): **OMP** (the default), **Claude Code**, **Codex** or **OpenCode**. Settings lists the agents installed where new chats open, in WSL or on Windows, and dims the others with **Not installed**. A split from a chat keeps that chat's agent, and `compi chat --agent omp|claude|codex|opencode` overrides it for one chat.
+- **Settings → Agents** shows a card for every agent: its mark and name, **Default** on the one new threads start with, and where it is installed, your WSL distribution (named, such as **Ubuntu**), **Windows** or both, each with its program's version as `--version` reports it. Compi looks for the program a chat would run on each side, the Linux one in your default distribution. An agent installed nowhere says **Not installed** and the command that installs it, which **Copy command** copies. Compi looks again each time the page opens.
+- **Settings → Agents → Approvals** chooses how the agent asks before it runs tools. **Same as the agent** (the default) uses the agent's own setting, the one it follows in a terminal (OMP's `tools.approvalMode`, which Compi reads when the chat starts and hands to OMP, whose chat mode would otherwise ignore it; Claude Code's permissions; Codex's `approval_policy` and `sandbox_mode`; OpenCode's `permission` rules). **Always ask** asks before anything but reading, **Allow edits** runs reads and edits and asks before commands, and **Allow everything** never asks. Each agent gets them in its own terms: OMP's `always-ask`, `write` and `yolo`; Claude Code's `default`, `acceptEdits` and `bypassPermissions`; Codex's approval policy and sandbox `untrusted` + `read-only`, `on-request` + `workspace-write` and `never` + `danger-full-access`; OpenCode's session permission rules, the last match winning: `ask` (`*` asks; reading, searching, its todo list and questions are allowed, `.env` files still ask), `allow-edits` (that, with edits and sub-agents allowed) and `allow-all` (`*` allowed). With **Same as the agent** an OpenCode session gets no rules of Compi's, and a resumed one loses those Compi gave it. A change applies to new chats and to chats that start again (Restart in the ⋯ menu, or after the daemon restarts); a running chat keeps the mode it started with.
+- **Settings → Agents → Agents bar** (on) lists OMP's running sub-agents above the message box.
+- **Settings → Chat → Text size** sizes agent chats with −, + and **Reset**. The messages and everything around them (header, tool cards, menus, the message box) grow together; the rest of the window keeps its size. With a chat focused, Ctrl+=, Ctrl+- and Ctrl+0 (Cmd on macOS) change the chat text size instead of the terminal font. Reset removes the key, returning to the default of 14.
+- **Settings → Chat → Enter while the agent works**: **Steer** (the default) sends the message into the running turn and Ctrl+Enter (Cmd+Enter on macOS) queues it for after; **Queue** swaps the two.
+- **Settings → Chat → Opening a chat**: **In place of the shell** (the default) shows the chat over the terminal it starts from; **Beside it** opens it in a new pane next to that terminal.
 
-The model picker remembers, per agent, the model and thinking level you last picked, which new sessions start on, your favorite models and your five latest picks, under `[chat.<program>]`: `[chat.omp]`, `[chat.claude]` and `[chat.codex]`. Values are the agent's own names for its choices (Claude Code's and Codex's are bare, such as `opus` or `gpt-5.5`); one it no longer lists is skipped.
+The model picker remembers, per agent, the model and thinking level you last picked, which new sessions start on, your favorite models and your five latest picks, under `[chat.<program>]`: `[chat.omp]`, `[chat.claude]`, `[chat.codex]` and `[chat.opencode]`. Values are the agent's own names for its choices (Claude Code's and Codex's are bare, such as `opus` or `gpt-5.5`; OpenCode's name their provider, such as `openai/gpt-5.5`, and its thinking levels are the model's variants); one it no longer lists is skipped.
 
 ```toml
 [chat]
-agent = "omp" # omp (OMP), claude (Claude Code) or codex (Codex)
+agent = "omp" # omp (OMP), claude (Claude Code), codex (Codex) or opencode (OpenCode)
 text_size = 14 # 10 through 32
 approval = "harness" # harness (Same as the agent), always_ask, write or yolo
 enter_while_working = "steer" # steer or queue
@@ -82,6 +83,10 @@ favorites = ["opus", "sonnet"]
 [chat.codex]
 model = "gpt-5.5" # unset uses Codex's own (its config.toml's model)
 thinking = "high" # Codex's reasoning effort
+
+[chat.opencode]
+model = "opencode/big-pickle" # unset uses OpenCode's own (its config's model, else the one last picked in it)
+thinking = "high" # the model's variant; "default" is the model's own
 ```
 
 ## Projects
@@ -91,7 +96,7 @@ A project is the folder a tab or thread works in: its Git repository's top folde
 - **Name** is what tabs' tooltips, the sidebar's project headers and cards, the palette's project list and a new thread's draft call the project; typing it in the palette finds the project, as its folder does. **Rename…** gives it a name; **Reset** (or renaming it to its folder's name) goes back to the folder's.
 - **Icon** shows the icon every place uses. **Automatic** is the project's favicon or logo, else its first letter on a coloured tile. **Choose icon…** picks a Lucide icon (search them all by name) or a monogram of one or two letters or numbers, each in a colour of the terminal palette, or an emoji; **Choose file…** takes a PNG, SVG or ICO, which Compi copies into its data folder (`project-icons/`). **Reset** goes back to Automatic.
 - **Pin** puts the project first among the sidebar's project headers and in the palette's project list.
-- **New threads' agent** is the agent new threads in the project start with (New thread here, New thread, a new tab, New chat, `compi chat` without `--agent`): **Default** follows **Settings → Chat → Default agent**, or pick **OMP**, **Claude Code** or **Codex**. Changing it clears the model.
+- **New threads' agent** is the agent new threads in the project start with (New thread here, New thread, a new tab, New chat, `compi chat` without `--agent`): **Default** follows **Settings → General → Default agent**, or pick **OMP**, **Claude Code**, **Codex** or **OpenCode**. Changing it clears the model.
 - **New threads' model** is the model those threads start on: the agent's default (what it starts on elsewhere, see the model picker under [Chat](#chat)), or one of that agent's favorite and recent models. Picking a model while the agent is Default keeps the agent it belongs to as the project's.
 
 Projects are kept under `[projects]`, each under its key: `host:<folder>`, or `wsl:<distribution>:<folder>` for a project in WSL. A project with nothing set has no table.
@@ -186,7 +191,7 @@ Floating panes keep their **Keyboard** label with every option. When the system 
 
 ## Shell (Windows)
 
-Compi picks the shell each new tab or split starts: WSL in a folder only Linux has, Windows PowerShell anywhere else. **Settings → Terminal → Advanced → Shell** overrides it. Open tabs keep their shell. Configurations from before the choice existed stay on WSL. See [Usage](USAGE.md) for what each shell gets.
+Compi picks the shell each new tab or split starts: WSL in a folder only Linux has, Windows PowerShell anywhere else. **Settings → General → Shell** overrides it. Open tabs keep their shell. Configurations from before the choice existed stay on WSL. See [Usage](USAGE.md) for what each shell gets.
 
 ```toml
 [shell]

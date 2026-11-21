@@ -1,9 +1,10 @@
 //! Native agent chats: the daemon runs each chat's agent like a shell and talks to it
 //! over its standard input and output, one JSON message per line, through the agent's
 //! driver (`Wire`): OMP speaks the Agent Client Protocol (`acp`), Claude Code its
-//! headless JSON stream (`claude`), Codex its app server's JSON-RPC (`codex`). One
-//! launcher starts every agent where the chat is (`launch`). The transcript lives here;
-//! windows watch a chat (`WatchChat`) and get its state, then every change.
+//! headless JSON stream (`claude`), Codex its app server's JSON-RPC (`codex`). OpenCode
+//! runs a local HTTP server instead (`opencode`), which says where it listens on its
+//! output. One launcher starts every agent where the chat is (`launch`). The transcript
+//! lives here; windows watch a chat (`WatchChat`) and get its state, then every change.
 //!
 //! A chat is keyed by its pane's chat ID and lives as long as a pane or view holds it:
 //! once none does, its turn and harness stop (`ChatHub::retain`). Compi saves its
@@ -34,6 +35,7 @@ mod acp;
 mod claude;
 mod codex;
 mod launch;
+mod opencode;
 mod saved;
 mod threads;
 
@@ -41,6 +43,7 @@ use acp::Acp;
 use claude::Claude;
 use codex::Codex;
 use launch::{Arg, Prepared};
+use opencode::OpenCode;
 use threads::{ThreadRecord, ThreadStore};
 
 /// Standard error kept to explain an exit.
@@ -352,6 +355,46 @@ pub fn installed_agents(environment: &ContentEnvironment) -> Vec<ChatHarness> {
         .collect()
 }
 
+/// Where every agent is installed on this PC, for Settings → Agents: its Windows program
+/// and its Linux one (in the default WSL distribution on Windows), each as a chat's
+/// launch finds it, with its version. Every program is looked for at once, each for a few
+/// seconds at most.
+pub fn agent_installs() -> compi_protocol::chat::AgentInstalls {
+    type Lookup = std::io::Result<thread::JoinHandle<Option<compi_protocol::chat::AgentProgram>>>;
+    fn spawn(
+        find: impl FnOnce() -> Option<compi_protocol::chat::AgentProgram> + Send + 'static,
+    ) -> Lookup {
+        thread::Builder::new()
+            .name("compi-chat-lookup".into())
+            .spawn(find)
+    }
+    let windows: Vec<Lookup> = ChatHarness::ALL
+        .into_iter()
+        .map(|harness| spawn(move || launch::windows_install(harness)))
+        .collect();
+    let distribution = launch::default_distribution();
+    let linux: Vec<Lookup> = ChatHarness::ALL
+        .into_iter()
+        .map(|harness| {
+            let distribution = distribution.clone();
+            spawn(move || launch::linux_install(harness, distribution.as_deref()))
+        })
+        .collect();
+    let join = |lookup: Lookup| lookup.ok()?.join().ok()?;
+    compi_protocol::chat::AgentInstalls {
+        distribution,
+        agents: ChatHarness::ALL
+            .into_iter()
+            .zip(windows.into_iter().zip(linux))
+            .map(|(harness, (windows, linux))| compi_protocol::chat::AgentInstall {
+                harness,
+                windows: join(windows),
+                linux: join(linux),
+            })
+            .collect(),
+    }
+}
+
 /// Every chat a pane or view of `workspace` holds, with the terminal whose view shows
 /// it, when a terminal's view does.
 fn held_chats(workspace: &WorkspaceSnapshot) -> HashMap<String, Option<SurfaceId>> {
@@ -530,6 +573,8 @@ enum Driver {
     Claude(Box<Claude>),
     /// Codex: its app server's JSON-RPC.
     Codex(Box<Codex>),
+    /// OpenCode: its local HTTP server and event stream.
+    OpenCode(Box<OpenCode>),
 }
 
 impl Default for Driver {
@@ -544,6 +589,7 @@ impl Driver {
             ChatHarness::Omp => Self::default(),
             ChatHarness::Claude => Self::Claude(Box::default()),
             ChatHarness::Codex => Self::Codex(Box::default()),
+            ChatHarness::OpenCode => Self::OpenCode(Box::default()),
         }
     }
 
@@ -553,6 +599,7 @@ impl Driver {
             Self::Acp(_) => &acp::WIRE,
             Self::Claude(_) => &claude::WIRE,
             Self::Codex(_) => &codex::WIRE,
+            Self::OpenCode(_) => &opencode::WIRE,
         }
     }
 }
@@ -571,10 +618,16 @@ struct Wire {
     configured_approval: fn(&ChatContent) -> Option<&'static str>,
     /// The program's arguments, with the approval mode Compi chose, when it chose one.
     launch_args: fn(&mut Inner, Option<&'static str>) -> Vec<Arg>,
+    /// Variables the program starts with besides Compi's shell context, asked after
+    /// `launch_args` (OpenCode's server password).
+    environment: fn(&Inner) -> Vec<(&'static str, String)>,
     /// Starts talking to the program once it runs.
     start: fn(&mut Inner),
     /// One message the program wrote.
     handle: fn(&Arc<Chat>, &mut Inner, Value),
+    /// A line the program wrote that is no message (OpenCode says where its server
+    /// listens so); it also goes with standard error to explain an exit.
+    line: fn(&Arc<Chat>, &mut Inner, &str),
     /// The agent opens its session with the first prompt (Claude Code), rather than
     /// before any (`ChatState::session` set once it has).
     session_with_first_prompt: bool,
@@ -836,6 +889,7 @@ impl Chat {
         }
         inner.notes = (prepared.linux_note.clone(), prepared.windows_note.clone());
         inner.started = None;
+        let own = (wire.environment)(inner);
         let wsl = prepared.runs_in_wsl(&self.content);
         let mut child = match crate::shell_integration::cli_environment(
             inner.surface.as_ref().map(SurfaceId::as_str),
@@ -843,7 +897,10 @@ impl Chat {
             wsl,
         )
         .map_err(|error| format!("Couldn't prepare Compi's shell context: {error}"))
-        .and_then(|environment| launch::command(&self.content, &environment, &args, prepared))
+        .and_then(|mut environment| {
+            environment.extend(own);
+            launch::command(&self.content, &environment, &args, prepared)
+        })
         .and_then(|(mut command, started)| {
             inner.started = started;
             command
@@ -903,7 +960,8 @@ impl Chat {
 
     /// Reads the harness's messages until its output ends, then reports why it stopped.
     /// Lines that are not messages (a launcher's own error, `wsl.exe`'s included) go to
-    /// `tail` with its standard error, to explain an exit.
+    /// the driver (`Wire::line`) and to `tail` with its standard error, to explain an
+    /// exit.
     fn read(self: Arc<Self>, output: impl Read, generation: u64, tail: Arc<Mutex<String>>) {
         for line in BufReader::new(output).lines() {
             let Ok(line) = line else { break };
@@ -921,6 +979,11 @@ impl Chat {
             }
             let Ok(message) = serde_json::from_str::<Value>(line) else {
                 push_tail(&tail, line);
+                let mut inner = self.lock();
+                if inner.closed || inner.generation != generation {
+                    return;
+                }
+                (inner.driver.wire().line)(&self, &mut inner, line);
                 continue;
             };
             let mut inner = self.lock();

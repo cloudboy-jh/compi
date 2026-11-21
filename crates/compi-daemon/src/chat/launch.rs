@@ -24,7 +24,7 @@ use super::not_installed;
 use compi_protocol::ContentEnvironment;
 #[cfg(windows)]
 use compi_protocol::chat::WindowsProgram;
-use compi_protocol::chat::{AgentEntry, ChatContent, ChatHarness};
+use compi_protocol::chat::{AgentEntry, AgentProgram, ChatContent, ChatHarness};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,10 +41,10 @@ const LOGIN_COMMAND: &str = r#"exec /bin/sh -c "$COMPI_CHAT_COMMAND""#;
 const SCRIPT_START: &str = r#"unset COMPI_CHAT_COMMAND; PATH="$HOME/.compi/shell:$PATH""#;
 /// What a launch script does before it starts a Linux program: its `bash -c` commands
 /// go through Compi's hook, after the user's own `BASH_ENV`.
-const LINUX_START: &str = r#"unset COMPI_AGENT_WINDOWS COMPI_AGENT_WINDOWS_NOTE COMPI_AGENT_WSLENV; if [ -f "$HOME/.compi/shell/compi-agent.sh" ]; then export COMPI_USER_BASH_ENV="${BASH_ENV-}" BASH_ENV="$HOME/.compi/shell/compi-agent.sh"; fi"#;
+const LINUX_START: &str = r#"unset COMPI_AGENT_WINDOWS COMPI_AGENT_WINDOWS_NOTE COMPI_AGENT_WINDOWS_BASH COMPI_AGENT_WSLENV; if [ -f "$HOME/.compi/shell/compi-agent.sh" ]; then export COMPI_USER_BASH_ENV="${BASH_ENV-}" BASH_ENV="$HOME/.compi/shell/compi-agent.sh"; fi"#;
 /// What a launch script does before it starts a Windows program: it gets the Windows
 /// note, and Compi's variables reach it (`WSLENV`).
-const WINDOWS_START: &str = r#"COMPI_AGENT_NOTE=${COMPI_AGENT_WINDOWS_NOTE-}; export COMPI_AGENT_NOTE WSLENV="${WSLENV:+$WSLENV:}$COMPI_AGENT_WSLENV"; unset COMPI_AGENT_WINDOWS COMPI_AGENT_WINDOWS_NOTE COMPI_AGENT_WSLENV"#;
+const WINDOWS_START: &str = r#"COMPI_AGENT_NOTE=${COMPI_AGENT_WINDOWS_NOTE-}; export COMPI_AGENT_NOTE WSLENV="${WSLENV:+$WSLENV:}$COMPI_AGENT_WSLENV"; unset COMPI_AGENT_WINDOWS COMPI_AGENT_WINDOWS_NOTE COMPI_AGENT_WINDOWS_BASH COMPI_AGENT_WSLENV"#;
 /// The start of the line a launch script writes before the program's output:
 /// `linux|windows <folder>`.
 pub(super) const LAUNCH_MARK: &str = "\u{1e}compi-agent ";
@@ -232,7 +232,9 @@ pub(super) fn prepare(content: &ChatContent) -> Prepared {
 /// the Windows one `COMPI_AGENT_WINDOWS` names, exiting 127 when there is neither; with
 /// `locate`, it only succeeds when there is a Linux one. A Linux program is looked for
 /// on the search path, then where its installers put it, never in the Windows folders
-/// WSL appends to the search path.
+/// WSL appends to the search path. Only the Windows program gets Compi's agent shell
+/// (`COMPI_AGENT_WINDOWS_BASH`) in its variable (`AgentEntry::windows_bash`), which can
+/// be one a Linux program reads too (OpenCode's `SHELL`).
 fn script(entry: &AgentEntry, args: &[Arg], locate: bool) -> String {
     let folders: String = entry
         .linux_folders
@@ -254,8 +256,13 @@ fn script(entry: &AgentEntry, args: &[Arg], locate: bool) -> String {
         .iter()
         .map(|arg| format!(" {}", arg.shell(true)))
         .collect();
+    let bash = entry.windows_bash.map_or_else(String::new, |variable| {
+        format!(
+            r#"if [ -n "${{COMPI_AGENT_WINDOWS_BASH-}}" ]; then export {variable}="$COMPI_AGENT_WINDOWS_BASH"; fi; "#
+        )
+    });
     format!(
-        r#"{SCRIPT_START}; {find}; if [ -n "$found" ]; then {LINUX_START}; printf '\036compi-agent linux %s\n' "$PWD"; exec "$found"{linux}; elif [ -n "${{COMPI_AGENT_WINDOWS-}}" ] && program=$(wslpath -u "$COMPI_AGENT_WINDOWS"); then {WINDOWS_START}; printf '\036compi-agent windows %s\n' "$(wslpath -w "$PWD")"; exec "$program"{windows}; else exit 127; fi"#
+        r#"{SCRIPT_START}; {find}; if [ -n "$found" ]; then {LINUX_START}; printf '\036compi-agent linux %s\n' "$PWD"; exec "$found"{linux}; elif [ -n "${{COMPI_AGENT_WINDOWS-}}" ] && program=$(wslpath -u "$COMPI_AGENT_WINDOWS"); then {bash}{WINDOWS_START}; printf '\036compi-agent windows %s\n' "$(wslpath -w "$PWD")"; exec "$program"{windows}; else exit 127; fi"#
     )
 }
 
@@ -344,8 +351,9 @@ pub(super) fn command(
                     .filter(|key| !key.starts_with("COMPI_AGENT_WINDOWS"))
                     .collect();
                 if let (Some(shell), Some(variable)) = (&prepared.agent_shell, entry.windows_bash) {
+                    // The script puts it in `variable` for the Windows program alone.
                     environment.extend([
-                        (variable, shell.display().to_string()),
+                        ("COMPI_AGENT_WINDOWS_BASH", shell.display().to_string()),
                         (
                             crate::agent_shell::DISTRIBUTION_VARIABLE,
                             distribution.clone(),
@@ -432,6 +440,128 @@ fn succeeds(mut command: Command, timeout: Duration) -> bool {
             }
         }
     }
+}
+
+/// The start of the line a version lookup's script writes once it has found the agent's
+/// Linux program, before what the program's `--version` says.
+const VERSION_MARK: &str = "\u{1e}compi-agent-version";
+
+/// The WSL distribution the Linux programs of `linux_install` are looked for in: the
+/// default one, where a chat in a Windows folder runs them. `None` without WSL, and on a
+/// Linux or macOS host, whose own programs they are.
+pub(super) fn default_distribution() -> Option<String> {
+    #[cfg(windows)]
+    {
+        compi_protocol::wsl::directory_distribution(None).ok()
+    }
+    #[cfg(unix)]
+    {
+        None
+    }
+}
+
+/// `harness`'s Windows program, the one a chat's launch picks, with its version; `None`
+/// when it has none (and off Windows).
+pub(super) fn windows_install(harness: ChatHarness) -> Option<AgentProgram> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        let mut command = Command::new(windows_program(harness.entry())?);
+        command
+            .arg("--version")
+            .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+        Some(AgentProgram {
+            version: output_within(command, LOOKUP_TIMEOUT)
+                .as_deref()
+                .and_then(version),
+        })
+    }
+    #[cfg(unix)]
+    {
+        let _ = harness;
+        None
+    }
+}
+
+/// `harness`'s Linux program, found by the search its launch makes (in `distribution` on
+/// Windows, on the host elsewhere), with its version; `None` when there is none, or no
+/// answer within `LOOKUP_TIMEOUT`.
+pub(super) fn linux_install(
+    harness: ChatHarness,
+    distribution: Option<&str>,
+) -> Option<AgentProgram> {
+    let lookup = version_script(harness.entry());
+    #[cfg(windows)]
+    let command = wsl_command(distribution?, None, &[], &lookup);
+    #[cfg(unix)]
+    let command = {
+        let _ = distribution;
+        unix_command(&[], &lookup)
+    };
+    let output = output_within(command, LOOKUP_TIMEOUT)?;
+    let (_, said) = output.split_once(VERSION_MARK)?;
+    Some(AgentProgram {
+        version: version(said),
+    })
+}
+
+/// The script that finds `entry`'s Linux program as its launch script does and, when
+/// there is one, writes `VERSION_MARK` and runs it with `--version`.
+fn version_script(entry: &AgentEntry) -> String {
+    format!(
+        r#"{} || exit 127; printf '\036compi-agent-version\n'; exec "$found" --version 2>&1"#,
+        script(entry, &[], true)
+    )
+}
+
+/// The version in what `<program> --version` wrote: its first word that starts with a
+/// digit, after any `v`, and has a dot (`2.1.3` of `2.1.3 (Claude Code)`, `19.0.0` of
+/// `omp/19.0.0`, `0.169.0` of `codex-cli 0.169.0`).
+fn version(output: &str) -> Option<String> {
+    output
+        .split(|c: char| c.is_whitespace() || "/@,;()[]".contains(c))
+        .map(|word| word.trim_end_matches(['.', ':']))
+        .map(|word| word.strip_prefix(['v', 'V']).unwrap_or(word))
+        .find(|word| word.starts_with(|c: char| c.is_ascii_digit()) && word.contains('.'))
+        .map(str::to_owned)
+}
+
+/// What `command` writes to its standard output within `timeout`, after which it is
+/// killed; `None` when it can't start.
+fn output_within(mut command: Command, timeout: Duration) -> Option<String> {
+    use std::io::Read as _;
+    use std::sync::{Arc, Mutex, PoisonError, mpsc};
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let written = Arc::new(Mutex::new(Vec::new()));
+    // The reader drops `reading` once the output ends, which ends the wait below.
+    let (reading, ended) = mpsc::channel::<()>();
+    let stdout = child.stdout.take();
+    let reader = Arc::clone(&written);
+    let _ = thread::Builder::new()
+        .name("compi-chat-lookup".into())
+        .spawn(move || {
+            let _reading = reading;
+            let Some(mut stdout) = stdout else {
+                return;
+            };
+            let mut chunk = [0; 4096];
+            while let Ok(read @ 1..) = stdout.read(&mut chunk) {
+                reader
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..read]);
+            }
+        });
+    let _ = ended.recv_timeout(timeout);
+    let _ = child.kill();
+    let _ = child.wait();
+    let written = written.lock().unwrap_or_else(PoisonError::into_inner);
+    Some(String::from_utf8_lossy(&written).into_owned())
 }
 
 /// The login shell running `script`, with `environment`.
@@ -582,6 +712,17 @@ mod tests {
             r#"exec "$found" --resume 's 1' ${COMPI_AGENT_NOTE:+--append-system-prompt "$COMPI_AGENT_NOTE"}; elif"#
         ));
         assert!(claude.contains(r#"COMPI_AGENT_NOTE=${COMPI_AGENT_WINDOWS_NOTE-}; export"#));
+        // The agent shell goes into the Windows program's variable only: OpenCode's Linux
+        // program reads `SHELL` too.
+        let opencode = script(ChatHarness::OpenCode.entry(), &[Arg::word("serve")], false);
+        let (linux, windows) = opencode.split_once("; elif ").unwrap();
+        assert!(!linux.contains("export SHELL"));
+        assert!(linux.contains(
+            "unset COMPI_AGENT_WINDOWS COMPI_AGENT_WINDOWS_NOTE COMPI_AGENT_WINDOWS_BASH"
+        ));
+        assert!(windows.contains(
+            r#"then if [ -n "${COMPI_AGENT_WINDOWS_BASH-}" ]; then export SHELL="$COMPI_AGENT_WINDOWS_BASH"; fi; COMPI_AGENT_NOTE="#
+        ));
         assert!(
             script(ChatHarness::Codex.entry(), &[], true)
                 .ends_with(r#"$HOME/.codex/packages/standalone/current/bin"; set -f; IFS=:; for dir in $dirs; do case $dir in /mnt/[a-zA-Z]/*) ;; *) if [ -f "$dir/codex" ] && [ -x "$dir/codex" ]; then found=$dir/codex; break; fi;; esac; done; unset IFS; set +f; [ -n "$found" ]"#)
@@ -634,5 +775,20 @@ mod tests {
             ]
         );
         assert_eq!(wsl_arguments("Ubuntu", None, &[], "true")[3], "~");
+    }
+
+    #[test]
+    fn a_version_lookup_finds_the_program_as_its_launch_does_and_reads_its_version() {
+        let lookup = version_script(ChatHarness::Codex.entry());
+        assert!(lookup.starts_with(&script(ChatHarness::Codex.entry(), &[], true)));
+        assert!(lookup.ends_with(
+            r#"[ -n "$found" ] || exit 127; printf '\036compi-agent-version\n'; exec "$found" --version 2>&1"#
+        ));
+        assert_eq!(version("2.1.326 (Claude Code)\n").as_deref(), Some("2.1.326"));
+        assert_eq!(version("omp/19.0.0\n").as_deref(), Some("19.0.0"));
+        assert_eq!(version("codex-cli 0.169.0\n").as_deref(), Some("0.169.0"));
+        assert_eq!(version("opencode v1.19.0.\n").as_deref(), Some("1.19.0"));
+        assert_eq!(version("\n"), None);
+        assert_eq!(version("unknown option --version"), None);
     }
 }

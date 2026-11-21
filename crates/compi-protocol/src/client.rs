@@ -875,6 +875,14 @@ impl DaemonClient {
         }
     }
 
+    /// Where every agent is installed on this PC, with its versions.
+    pub fn agent_installs(&mut self) -> Result<crate::chat::AgentInstalls> {
+        match self.request_bounded(ClientMessage::ListAgentInstalls, Duration::from_secs(15))? {
+            ServerMessage::AgentInstalls { installs } => Ok(installs),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
     /// Every thread the daemon keeps, newest change first.
     pub fn list_threads(&mut self) -> Result<Vec<crate::chat::ThreadInfo>> {
         match self.request_bounded(ClientMessage::ListThreads, Duration::from_secs(10))? {

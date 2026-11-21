@@ -53,7 +53,7 @@ pub(super) struct ListedProject {
     open: bool,
 }
 
-/// New threads' agent choices: Default (Settings → Chat's), then each agent.
+/// New threads' agent choices: Default (Settings → General's), then each agent.
 const AGENT_CHOICES: [Option<ChatHarness>; ChatHarness::ALL.len() + 1] = {
     let mut choices = [None; ChatHarness::ALL.len() + 1];
     let mut index = 0;
@@ -201,7 +201,7 @@ impl CompiApp {
     }
 
     /// The agent a new thread in `project` starts with: the project's, else
-    /// Settings → Chat's (`LoadedConfig::new_thread_agent`, as `compi chat` has it).
+    /// Settings → General's (`LoadedConfig::new_thread_agent`, as `compi chat` has it).
     pub(super) fn new_thread_agent(&self, project: Option<&Project>) -> ChatHarness {
         self.config.new_thread_agent(project)
     }
@@ -377,7 +377,7 @@ impl CompiApp {
         self.set_project_agent(&project, AGENT_CHOICES[next], cx);
     }
 
-    /// New threads in `project` start with `agent` (`None`: Settings → Chat's). A
+    /// New threads in `project` start with `agent` (`None`: Settings → General's). A
     /// model picked for another agent goes.
     fn set_project_agent(
         &mut self,
@@ -699,7 +699,7 @@ impl CompiApp {
                 .selected(settings.agent == agent)
                 .detail(match agent {
                     None => format!(
-                        "Settings → Chat's Default agent, now {}",
+                        "Settings → General's Default agent, now {}",
                         default_agent.name()
                     ),
                     Some(agent) => format!("New threads here start with {}", agent.name()),
@@ -721,7 +721,7 @@ impl CompiApp {
         let agent_detail = match settings.agent {
             Some(agent) => format!("New threads in this project start with {}.", agent.name()),
             None => format!(
-                "New threads in this project start with Settings → Chat's Default agent, now {}.",
+                "New threads in this project start with Settings → General's Default agent, now {}.",
                 default_agent.name()
             ),
         };

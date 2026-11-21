@@ -592,8 +592,8 @@ fn change_diff(change: &Value) -> Option<ChatDiff> {
 }
 
 /// The old and new sides of a unified diff's hunks, a `⋯` line between hunks; `None`
-/// when it has none.
-fn diff_sides(diff: &str) -> Option<(String, String)> {
+/// when it has none. OpenCode's edits come as such diffs too.
+pub(in crate::chat) fn diff_sides(diff: &str) -> Option<(String, String)> {
     let mut old = String::new();
     let mut new = String::new();
     let mut hunks = 0;

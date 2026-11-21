@@ -58,8 +58,10 @@ pub(super) struct Acp {
 pub(super) const WIRE: Wire = Wire {
     configured_approval,
     launch_args,
+    environment: |_| Vec::new(),
     start,
     handle: |chat, inner, message| chat.handle(inner, message),
+    line: |_, _, _| {},
     session_with_first_prompt: false,
     prompt,
     steer: Some((can_steer, steer)),

@@ -21,7 +21,7 @@ use super::project_settings::{PROJECTS_ROW, ProjectControl, ProjectPart};
 use super::*;
 use crate::config::{ChatEnter, ChatOpen, DevServer, NewTab};
 use crate::gui::controls::IconName;
-use compi_protocol::chat::{ChatApproval, ChatHarness};
+use compi_protocol::chat::{AgentInstall, AgentInstalls, AgentProgram, ChatApproval, ChatHarness};
 use compi_protocol::{PaneContent, SettingsContent, SettingsSection, WindowsShell};
 use gpui::Entity;
 use gpui_component::Sizable as _;
@@ -37,6 +37,8 @@ const STACKED_ROW_WIDTH: f32 = 440.0;
 const HEADER_TITLE_MIN_WIDTH: f32 = 380.0;
 /// The width of a drawn choice (pane density, focus indicator).
 const OPTION_CARD_WIDTH: f32 = 120.0;
+/// The size of an agent's mark on its Settings → Agents card.
+const AGENT_MARK_SIZE: f32 = 24.0;
 /// The width of Quick Appearance's content.
 const QUICK_APPEARANCE_WIDTH: f32 = 380.0;
 /// The row holding the shell prompt group; see `prompt`.
@@ -59,6 +61,9 @@ pub(super) const DIAGNOSTICS_ROW: &str = "performance-diagnostics";
 pub(super) const REBUILD_ROW: &str = "rebuild-renderer";
 /// Settings → Keyboard: every command and its shortcut.
 const COMMANDS_ROW: &str = "commands";
+/// Settings → Agents: every agent's card. While shown, the window looks up where each
+/// agent is installed.
+const AGENTS_ROW: &str = "agents";
 
 /// Focusable controls of Settings → Updates. Which ones exist depends on the update
 /// state; see the Updates rows.
@@ -125,6 +130,8 @@ pub(super) enum SettingsAction {
     /// to the next.
     DevServer,
     ToggleChatAgentsBar,
+    /// Copies how to install an agent installed nowhere.
+    CopyInstallCommand(ChatHarness),
     OpenConfiguration,
     /// A command's shortcut, by its index in `commands::REGISTRY`: pressing it records
     /// the next keys pressed.
@@ -258,6 +265,16 @@ pub(in crate::gui) struct SettingsUi {
     chat_agents: Option<Vec<ChatHarness>>,
     /// The last such question asked; a reply to an earlier one is dropped.
     chat_agents_asked: u64,
+    /// Where every agent is installed, for Settings → Agents: asked each time its cards
+    /// show anew; `None` while asking, else the daemon's answer or why there is none.
+    agent_installs: Option<Result<AgentInstalls, String>>,
+    /// The last such question asked; a reply to an earlier one is dropped.
+    agent_installs_asked: u64,
+    /// The agents' cards were shown in the last frame.
+    agents_shown: bool,
+    /// The agent whose install command was copied last, until its card is looked up
+    /// again.
+    install_copied: Option<ChatHarness>,
     /// The project whose card is open on the Projects page, by `project_key`.
     pub(super) project_open: Option<String>,
 }
@@ -303,14 +320,15 @@ pub(super) struct Row {
 
 impl Row {
     /// Whether every term of `query` is in the title, description, keywords or
-    /// group, ignoring case; a Chat row's also name every agent.
+    /// group, ignoring case; an Agents row's, and Default agent's, also name every
+    /// agent.
     fn matches(&self, query: &str) -> bool {
         static AGENT_WORDS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
             ChatHarness::ALL
                 .map(|agent| format!("{} {}", agent.program(), agent.name()))
                 .join(" ")
         });
-        let agents = if self.section == SettingsSection::Chat {
+        let agents = if self.section == SettingsSection::Agents || self.id == "chat-agent" {
             AGENT_WORDS.as_str()
         } else {
             ""
@@ -470,7 +488,7 @@ static ROWS: &[Row] = &[
             SettingsSection::General,
             "Default agent",
             "Every new thread starts with it, unless its project picks another.",
-            "default agent harness new thread chat omp claude codex",
+            "default agent harness new thread chat",
             |_| vec![SettingsAction::ChatAgent],
             |app, row, cx| app.render_chat_agent_row(row, cx),
         ),
@@ -488,6 +506,52 @@ static ROWS: &[Row] = &[
                 |_| vec![SettingsAction::Select(Popup::Shell)],
                 |app, row, cx| app.render_shell_row(row, cx),
             ),
+        ),
+    ),
+    // Agents: every agent and where it is installed, then how they ask, then each one's
+    // own.
+    grouped(
+        "Programs",
+        page_row(
+            AGENTS_ROW,
+            SettingsSection::Agents,
+            "Agents",
+            "Every agent Compi chats with: where it is installed, its version, and how to install it.",
+            "installed install version program windows wsl ubuntu linux distribution default not installed npm bun",
+            |app| app.agent_stops(),
+            |app, row, _, cx| app.render_agents_page(row, cx),
+        ),
+    ),
+    grouped(
+        "Permissions",
+        row(
+            "chat-approval",
+            SettingsSection::Agents,
+            "Approvals",
+            "How the agent asks before it runs tools. Applies to new chats and chats that start again.",
+            "approval permission ask allow edits everything yolo tools agent",
+            |_| vec![SettingsAction::Select(Popup::ChatApproval)],
+            |app, row, cx| app.render_chat_approval_row(row, cx),
+        ),
+    ),
+    grouped(
+        "OMP",
+        row(
+            "chat-agents-bar",
+            SettingsSection::Agents,
+            "Agents bar",
+            "While OMP's sub-agents run, list them above the message box.",
+            "sub-agents subagents task tasks running agent omp",
+            |_| vec![SettingsAction::ToggleChatAgentsBar],
+            |app, row, cx| {
+                app.render_toggle_row(
+                    row,
+                    app.config.chat_agents_bar,
+                    SettingsAction::ToggleChatAgentsBar,
+                    row_description("chat-agents-bar"),
+                    cx,
+                )
+            },
         ),
     ),
     // Appearance; Quick Appearance shows these too.
@@ -1072,18 +1136,6 @@ static ROWS: &[Row] = &[
     ),
     // Chat.
     grouped(
-        "Agent",
-        row(
-            "chat-approval",
-            SettingsSection::Chat,
-            "Approvals",
-            "How the agent asks before it runs tools. Applies to new chats and chats that start again.",
-            "approval permission ask allow edits everything yolo tools agent",
-            |_| vec![SettingsAction::Select(Popup::ChatApproval)],
-            |app, row, cx| app.render_chat_approval_row(row, cx),
-        ),
-    ),
-    grouped(
         "Messages",
         row(
             "chat-text-size",
@@ -1130,26 +1182,6 @@ static ROWS: &[Row] = &[
             "split pane beside in place shell view palette agent",
             |_| vec![SettingsAction::ChatOpen],
             |app, row, cx| app.render_chat_open_row(row, cx),
-        ),
-    ),
-    grouped(
-        "OMP",
-        row(
-            "chat-agents-bar",
-            SettingsSection::Chat,
-            "Agents bar",
-            "While OMP's sub-agents run, list them above the message box.",
-            "sub-agents subagents task tasks running agent omp",
-            |_| vec![SettingsAction::ToggleChatAgentsBar],
-            |app, row, cx| {
-                app.render_toggle_row(
-                    row,
-                    app.config.chat_agents_bar,
-                    SettingsAction::ToggleChatAgentsBar,
-                    row_description("chat-agents-bar"),
-                    cx,
-                )
-            },
         ),
     ),
     // Projects.
@@ -1570,6 +1602,31 @@ fn terminal_key_notice(keys: &str) -> Option<String> {
     })
 }
 
+/// Where `install` has its agent, as its Settings → Agents card says: each side with its
+/// version when it reports one, the Linux side first (`Ubuntu 19.0.0`, `Windows 2.1.3`);
+/// empty when it has none. The Linux side is named for the WSL `distribution` it was
+/// looked for in, else for this computer.
+fn agent_places(distribution: Option<&str>, install: Option<&AgentInstall>) -> Vec<String> {
+    let Some(install) = install else {
+        return Vec::new();
+    };
+    let linux = distribution.unwrap_or(if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "Linux"
+    });
+    [(linux, &install.linux), ("Windows", &install.windows)]
+        .into_iter()
+        .filter_map(|(side, program)| {
+            let program: &AgentProgram = program.as_ref()?;
+            Some(match &program.version {
+                Some(version) => format!("{side} {version}"),
+                None => side.to_owned(),
+            })
+        })
+        .collect()
+}
+
 /// The line under `section`'s heading: what its page covers.
 fn section_summary(section: SettingsSection) -> &'static str {
     match section {
@@ -1582,6 +1639,10 @@ fn section_summary(section: SettingsSection) -> &'static str {
         }
         SettingsSection::Notifications => "When and where Compi tells you a program needs you.",
         SettingsSection::Terminal => "Starting folder, font, dev servers, prompt and shell.",
+        SettingsSection::Agents => {
+            "Every agent: where it is installed and its version, and how agents ask before \
+             they run tools."
+        }
         SettingsSection::Chat => "How agent chats look and behave.",
         SettingsSection::Projects => {
             "Each project's name, icon and pin, and what its new threads start with."
@@ -2113,7 +2174,8 @@ impl CompiApp {
     }
 
     /// Before drawing: state for each Settings pane shown, its section sent to the
-    /// daemon when it changed, and the shell prompt detected when its group shows.
+    /// daemon when it changed, the shell prompt detected when its group shows, and where
+    /// the agents are installed looked up when their cards show.
     pub(super) fn prepare_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = &self.workspace else {
             return;
@@ -2272,6 +2334,11 @@ impl CompiApp {
             self.enter_prompt_settings();
         }
         self.settings.prompt_shown = prompt;
+        let agents = self.settings_row_shown(AGENTS_ROW);
+        if agents && !self.settings.agents_shown {
+            self.read_agent_installs(cx);
+        }
+        self.settings.agents_shown = agents;
     }
 
     /// Whether `pane` is a Settings pane with client state, and its focus handle.
@@ -2909,6 +2976,12 @@ impl CompiApp {
                 },
                 cx,
             ),
+            SettingsAction::CopyInstallCommand(agent) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                    agent.entry().install.to_owned(),
+                ));
+                self.settings.install_copied = Some(agent);
+            }
             SettingsAction::ToggleChatAgentsBar => {
                 self.set_chat_agents_bar(!self.config.chat_agents_bar, cx);
             }
@@ -4211,6 +4284,150 @@ impl CompiApp {
             .ok();
         })
         .detach();
+    }
+
+    /// Asks the daemon, off the UI thread, where every agent is installed on this PC,
+    /// with its versions, for Settings → Agents.
+    fn read_agent_installs(&mut self, cx: &mut Context<Self>) {
+        self.settings.agent_installs = None;
+        self.settings.agent_installs_asked += 1;
+        self.settings.install_copied = None;
+        let asked = self.settings.agent_installs_asked;
+        let target = self.target.clone();
+        cx.spawn(async move |this, cx| {
+            let installs = cx
+                .background_executor()
+                .spawn(async move { target.connect()?.agent_installs() })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.settings.agent_installs_asked == asked {
+                    this.settings.agent_installs =
+                        Some(installs.map_err(|error| error.to_string()));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Where `agent` is installed, as far as Settings → Agents knows: each side it has,
+    /// with its version (`agent_places`); `None` while asking or when asking failed.
+    fn agent_places(&self, agent: ChatHarness) -> Option<Vec<String>> {
+        let Some(Ok(installs)) = &self.settings.agent_installs else {
+            return None;
+        };
+        Some(agent_places(
+            installs.distribution.as_deref(),
+            installs.agents.iter().find(|install| install.harness == agent),
+        ))
+    }
+
+    /// The Agents page's controls: Copy command on each agent installed nowhere.
+    fn agent_stops(&self) -> Vec<SettingsAction> {
+        ChatHarness::ALL
+            .into_iter()
+            .filter(|agent| self.agent_places(*agent).is_some_and(|places| places.is_empty()))
+            .map(SettingsAction::CopyInstallCommand)
+            .collect()
+    }
+
+    /// Settings → Agents: a card per agent.
+    fn render_agents_page(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        div()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(
+                ChatHarness::ALL
+                    .into_iter()
+                    .map(|agent| self.render_agent_card(row, agent, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// One agent's card: its mark and name, Default when new threads start with it, and
+    /// where it is installed with each side's version, or how to install it.
+    fn render_agent_card(&self, row: &RowCx, agent: ChatHarness, cx: &Context<Self>) -> AnyElement {
+        let colors = *self.colors();
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let places = self.agent_places(agent);
+        let missing = places.as_ref().is_some_and(Vec::is_empty);
+        let status = match (&self.settings.agent_installs, places) {
+            (None, _) => "Looking for it…".to_owned(),
+            (Some(Err(error)), _) => format!("Couldn't look for it: {error}"),
+            (Some(Ok(_)), Some(places)) if !places.is_empty() => places.join(" · "),
+            (Some(Ok(_)), _) => {
+                format!("Not installed. Install it with {}", agent.entry().install)
+            }
+        };
+        let copy = missing.then(|| {
+            let label = if self.settings.install_copied == Some(agent) {
+                "Copied"
+            } else {
+                "Copy command"
+            };
+            self.settings_control(
+                row,
+                SettingsAction::CopyInstallCommand(agent),
+                controls::text_button(("agent-install", agent as usize), label)
+                    .header()
+                    .detail(agent.entry().install),
+                cx,
+            )
+        });
+        settings_card(&colors)
+            .child(
+                div()
+                    .min_w_0()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        gpui::img(super::chat::harness_mark(agent))
+                            .flex_none()
+                            .size(px(AGENT_MARK_SIZE)),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(agent.name()),
+                                    )
+                                    .when(self.config.chat_agent == agent, |name| {
+                                        name.child(controls::chip(
+                                            "Default",
+                                            controls::ChipTone::Tint(colors.accent),
+                                        ))
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                                    .line_height(px(UI_SMALL_LINE_HEIGHT))
+                                    .text_color(muted)
+                                    .child(status),
+                            ),
+                    )
+                    .children(copy),
+            )
+            .into_any_element()
     }
 
     /// Default agent from the keyboard: the next installed agent after the current one,
@@ -5909,6 +6126,7 @@ pub(super) fn chat_approval_detail(approval: ChatApproval) -> &'static str {
 fn section_icon(section: SettingsSection) -> IconName {
     match section {
         SettingsSection::General => IconName::Settings,
+        SettingsSection::Agents => IconName::Bot,
         SettingsSection::Appearance => IconName::Palette,
         SettingsSection::Interface => IconName::LayoutPanelLeft,
         SettingsSection::Terminal => IconName::SquareTerminal,
@@ -6073,11 +6291,19 @@ mod tests {
             ["show-fps", RESOURCES_ROW, DIAGNOSTICS_ROW]
         );
         assert!(ids("network").contains(&MONITOR_ROW));
-        // Every agent's program and name find Default agent.
+        // Every agent's program and name find Default agent and the Agents page.
         for agent in ChatHarness::ALL {
             for word in [agent.program(), agent.name()] {
                 assert!(settings(word).contains(&"chat-agent"), "{word}");
+                assert!(settings(word).contains(&AGENTS_ROW), "{word}");
             }
+        }
+        // Approvals and OMP's Agents bar are found on the Agents page.
+        let section = |id: &str| ROWS.iter().find(|row| row.id == id).map(|row| row.section);
+        assert!(settings("approval").contains(&"chat-approval"));
+        assert_eq!(settings("sub-agents"), ["chat-agents-bar"]);
+        for id in [AGENTS_ROW, "chat-approval", "chat-agents-bar"] {
+            assert_eq!(section(id), Some(SettingsSection::Agents), "{id}");
         }
         // A group name finds its rows; so does the group's old name.
         let tab_details = [
@@ -6293,9 +6519,10 @@ mod tests {
             ["Shell", "Font", "Dev servers", "Prompt"]
         );
         assert_eq!(
-            groups(SettingsSection::Chat),
-            ["Agent", "Messages", "Opening", "OMP"]
+            groups(SettingsSection::Agents),
+            ["Programs", "Permissions", "OMP"]
         );
+        assert_eq!(groups(SettingsSection::Chat), ["Messages", "Opening"]);
         assert_eq!(groups(SettingsSection::Projects), ["Projects"]);
         assert_eq!(groups(SettingsSection::Keyboard), ["Commands"]);
         assert_eq!(groups(SettingsSection::Monitor), ["Monitor"]);
@@ -6318,5 +6545,36 @@ mod tests {
             assert!(!row.description.is_empty(), "{}", row.id);
             assert_ne!(row.group, Some(row.title), "{}", row.id);
         }
+    }
+
+    #[test]
+    fn an_agent_card_names_each_side_it_is_installed_on_with_its_version() {
+        let install = |linux: Option<&str>, windows: Option<&str>| AgentInstall {
+            harness: ChatHarness::Omp,
+            linux: linux.map(|version| AgentProgram {
+                version: (!version.is_empty()).then(|| version.to_owned()),
+            }),
+            windows: windows.map(|version| AgentProgram {
+                version: (!version.is_empty()).then(|| version.to_owned()),
+            }),
+        };
+        assert_eq!(
+            agent_places(
+                Some("Ubuntu"),
+                Some(&install(Some("19.0.0"), Some("19.0.1")))
+            ),
+            ["Ubuntu 19.0.0", "Windows 19.0.1"]
+        );
+        // A program that reports no version is named alone.
+        assert_eq!(
+            agent_places(Some("Ubuntu"), Some(&install(None, Some("")))),
+            ["Windows"]
+        );
+        assert_eq!(
+            agent_places(Some("Debian"), Some(&install(Some(""), None))),
+            ["Debian"]
+        );
+        assert!(agent_places(Some("Ubuntu"), Some(&install(None, None))).is_empty());
+        assert!(agent_places(Some("Ubuntu"), None).is_empty());
     }
 }

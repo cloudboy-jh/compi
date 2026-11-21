@@ -124,10 +124,16 @@ gpui_kit_assets::icon_assets!(
 );
 
 /// Agents' brand marks (`AgentMark::Brand`), drawn in their own colours with `img`.
-const BRAND_MARKS: &[(&str, &[u8])] = &[(
-    "brands/omp.svg",
-    include_bytes!("../../assets/brands/omp.svg"),
-)];
+const BRAND_MARKS: &[(&str, &[u8])] = &[
+    (
+        "brands/omp.svg",
+        include_bytes!("../../assets/brands/omp.svg"),
+    ),
+    (
+        "brands/opencode.svg",
+        include_bytes!("../../assets/brands/opencode.svg"),
+    ),
+];
 
 /// Where the agent's mark is in the application's assets: its brand mark
 /// (`brands/<file>.svg`), or `agents/<program>.svg` for an agent drawn with a model mark,

@@ -597,7 +597,7 @@ impl Command {
             ),
             OpenBrowser => Some("Opens a web page in a pane beside the focused one."),
             OpenChat => Some(
-                "Starts a chat with the default agent (Settings → Chat) in the focused terminal's folder, in place of its shell or beside it as Settings → Chat says; from another pane, beside it.",
+                "Starts a chat with the default agent (Settings → General) in the focused terminal's folder, in place of its shell or beside it as Settings → Chat says; from another pane, beside it.",
             ),
             Threads => Some(
                 "Lists your chats with agents, open or ended; an ended one reopens in a pane on its session, × deletes it.",

@@ -4113,7 +4113,8 @@ mod tests {
         let invalid = load(Some(&path), FontOverrides::default());
         assert_eq!(invalid.chat_agent, ChatHarness::Omp);
         assert!(invalid.diagnostics.iter().any(|message| {
-            message.contains("chat.agent") && message.contains("\"omp\", \"claude\" or \"codex\"")
+            message.contains("chat.agent")
+                && message.contains("\"omp\", \"claude\", \"codex\" or \"opencode\"")
         }));
         fs::remove_dir_all(root).unwrap();
     }
