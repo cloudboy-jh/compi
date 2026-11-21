@@ -34,7 +34,7 @@ At inspected upstream `5aff8fa51a2f70be9cd2c1896f80b451aa4dac74`:
 - Checksums are combined/verified and native release metadata is signed with `docs/user/release-notes.md` as its notes. The Windows job fails first if that file's heading does not match the tag.
 - The Windows job also publishes the Setup as stable-named `Compi-Setup.exe` (in `SHA256SUMS.txt`) with its own signed `compi-setup-<platform>.json`. In-app **Repair Compi** downloads it from the latest release, so check both are on the draft.
 - The workflow creates a draft GitHub release for deliberate publication.
-- Manual workflow dispatch produces build artifacts, not a public release.
+- A manual dispatch without `release_tag` produces build artifacts only. To recover a draft blocked by a stuck advisory installed-update check, dispatch from `main` with the existing `release_tag` and `check_installed_update=false`. Both native jobs still check out that tag and verify their packages. Record the skipped installed check; it is not an upgrade result.
 - The updater requests GitHub's latest release and rejects drafts/prereleases. Pushing commits or a tag alone does not make an update available.
 - Update checks do not silently download, install, close windows, or restart daemons.
 
