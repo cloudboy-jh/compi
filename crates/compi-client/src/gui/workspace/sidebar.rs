@@ -22,6 +22,10 @@ use gpui::DragMoveEvent;
 
 /// The cards Go to sidebar card 1–9 reach.
 const SHORTCUT_CARDS: usize = 9;
+/// How far cards sit in from the list's edge, under their project's heading.
+const CARD_INDENT: f32 = 32.0;
+/// Where the line joining a project's cards runs: under the middle of its icon.
+const CARD_GUIDE_X: f32 = 26.0;
 /// How tall the bottom row's buttons are.
 const FOOTER_BUTTON_HEIGHT: f32 = 32.0;
 
@@ -112,7 +116,7 @@ struct SidebarCard {
     /// The workspace whose group shows it.
     session: SessionId,
     title: String,
-    /// The project's name, else the folder's.
+    /// The folder its panes show, for the tooltip and search.
     folder: Option<String>,
     /// The listed project whose section shows it: its saved project, else Home.
     project: Project,
@@ -284,15 +288,6 @@ fn move_to_workspace(
         index: target.tabs.len(),
         group: TabPlacement::Leave,
     })
-}
-
-/// The last name of `path`.
-fn folder_name(path: &str) -> &str {
-    let trimmed = path.trim_end_matches(['/', '\\']);
-    trimmed
-        .rsplit(['/', '\\'])
-        .find(|part| !part.is_empty())
-        .unwrap_or(path)
 }
 
 /// Every terminal and content leaf of `node`, in reading order.
@@ -510,14 +505,8 @@ impl CompiApp {
                 .unwrap_or_else(|| "New thread".to_owned()),
             None => self.tab_label(tab),
         };
-        // A saved project's cards name it; Home's name their own folder.
         let project = self.section_project(tab.project.as_ref());
-        let folder = if self.is_home_project(&project) {
-            self.tab_folder(tab)
-                .map(|folder| folder_name(&folder).to_owned())
-        } else {
-            Some(self.project_name(&project))
-        };
+        let folder = self.tab_folder(tab);
         let state = self
             .tab_program_headline(tab)
             .filter(|_| self.config.program_status.sidebar)
@@ -1738,7 +1727,8 @@ impl CompiApp {
         div()
             .id(("sidebar-project", row))
             .mx_2()
-            .mt_1()
+            // Room between one project's cards and the next heading.
+            .mt(px(if row == 0 { 4.0 } else { 14.0 }))
             .px_2p5()
             .py_1()
             .rounded(px(8.0))
@@ -1850,10 +1840,11 @@ impl CompiApp {
             line,
         } = place;
         let this_card = card.tab.clone();
+        // Its kind leads the line: the agent's mark for a thread, else a terminal.
         let kind = if let Some(harness) = card.chat {
             img(super::chat::harness_mark(harness))
                 .flex_none()
-                .size(px(12.0))
+                .size(px(14.0))
                 .into_any_element()
         } else {
             controls::glyph(IconName::SquareTerminal, muted).into_any_element()
@@ -1871,25 +1862,21 @@ impl CompiApp {
                     None,
                 ))
         });
-        let mut detail = Vec::new();
-        detail.push(format!(
+        let mut detail = vec![format!(
             "{} · {}",
             self.project_name(&card.project),
-            card.project.root
-        ));
+            card.folder.as_deref().unwrap_or(&card.project.root)
+        )];
         if card.pinned {
             detail.push("Pinned".to_owned());
         }
         if card.hidden {
             detail.push("Hidden".to_owned());
         }
-        let tooltip = self.context_menu.is_none().then(|| {
-            controls::tooltip(
-                card.title.clone(),
-                (!detail.is_empty()).then(|| detail.join("\n").into()),
-                None,
-            )
-        });
+        let tooltip = self
+            .context_menu
+            .is_none()
+            .then(|| controls::tooltip(card.title.clone(), Some(detail.join("\n").into()), None));
         let background = if card.selected {
             Some(blend_rgb(colors.surface, colors.foreground, 0.09))
         } else if highlighted {
@@ -1897,12 +1884,10 @@ impl CompiApp {
         } else {
             None
         };
-        div()
+        let row = div()
             .id(("sidebar-card", index))
             .relative()
-            .mx_2()
-            .mb_0p5()
-            .px_2p5()
+            .px_2()
             .py_1p5()
             .rounded(px(8.0))
             .flex()
@@ -1957,66 +1942,56 @@ impl CompiApp {
             .when_some(tooltip, |card, tooltip| card.tooltip(tooltip))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .text_size(px(UI_MICRO_TEXT_SIZE))
-                            .text_color(muted)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(card.folder.clone().unwrap_or_default()),
-                            )
-                            .children(card_note(&card, now).map(|note| {
-                                div()
-                                    .flex_none()
-                                    .when(card.draft, |shown| shown.italic())
-                                    .child(note)
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id(("sidebar-card-title", index))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(UI_SMALL_TEXT_SIZE))
-                            .child(card.title)
-                            // A double click on the title renames the tab.
-                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                if event.click_count() >= 2 {
-                                    this.rename_tab(&rename);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }
-                            })),
-                    ),
-            )
-            .child(
-                div()
                     .flex_none()
                     .w(px(14.0))
                     .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_1p5()
-                    .child(kind)
-                    .child(match dot {
-                        Some(dot) => dot.into_any_element(),
-                        None => div().size(px(7.0)).into_any_element(),
-                    }),
+                    .justify_center()
+                    .child(kind),
             )
+            .child(
+                div()
+                    .id(("sidebar-card-title", index))
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(UI_SMALL_TEXT_SIZE))
+                    .child(card.title.clone())
+                    // A double click on the title renames the tab.
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        if event.click_count() >= 2 {
+                            this.rename_tab(&rename);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    })),
+            )
+            .children(card_note(&card, now).map(|note| {
+                div()
+                    .flex_none()
+                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                    .text_color(muted)
+                    .when(card.draft, |shown| shown.italic())
+                    .child(note)
+            }))
+            .children(dot);
+        // Indented under its project's heading, along a faint line from its icon.
+        div()
+            .relative()
+            .pl(px(CARD_INDENT))
+            .pr_2()
+            .pb_0p5()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(CARD_GUIDE_X))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(1.0))
+                    .bg(color(blend_rgb(colors.surface, colors.foreground, 0.12))),
+            )
+            .child(row)
             .into_any_element()
     }
 }
