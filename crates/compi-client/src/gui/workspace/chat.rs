@@ -27,8 +27,8 @@ use crate::chat::now_ms;
 use crate::gui::controls::{self, IconName, icon_button, text_button};
 use compi_protocol::chat::{
     ChatAnswer, ChatAnswers, ChatApproval, ChatContent, ChatDelivery, ChatEntry, ChatEvent,
-    ChatHarness, ChatImage, ChatPermission, ChatPicks, ChatQuestion, ChatSessionInfo, ChatState,
-    ChatStatus,
+    ChatHarness, ChatImage, ChatLoginStep, ChatPermission, ChatPicks, ChatQuestion,
+    ChatSessionInfo, ChatState, ChatStatus,
 };
 use compi_protocol::{ContentEnvironment, ContentTab, FolderContent, GitScope, PaneContent};
 use gpui::{
@@ -48,6 +48,7 @@ mod models;
 mod rows;
 mod scroller;
 mod sessions;
+mod sign_in;
 mod timeline;
 
 use composer::{
@@ -1394,6 +1395,20 @@ impl CompiApp {
                 chat: chat.to_owned(),
                 queued: edit.id,
                 text: text.to_owned(),
+            };
+            self.chat_request(chat, message, Some(draft), window, cx);
+            return;
+        }
+        // A sign-in waiting for a code takes what was typed.
+        let code_asked = model
+            .state
+            .as_ref()
+            .and_then(|state| state.login.as_ref())
+            .is_some_and(|login| matches!(login.step, ChatLoginStep::Code { .. }));
+        if code_asked && !text.is_empty() {
+            let message = ClientMessage::AnswerChatSignIn {
+                chat: chat.to_owned(),
+                code: text.to_owned(),
             };
             self.chat_request(chat, message, Some(draft), window, cx);
             return;

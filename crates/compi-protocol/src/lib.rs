@@ -101,7 +101,10 @@ use std::fmt;
 // add existing or newly cloned projects on the daemon without opening a pane.
 // Version 42 lets a client choose a tab's project (`SetTabProject`), which the daemon
 // then keeps instead of finding one from the tab's folders.
-pub const PROTOCOL_VERSION: u32 = 42;
+// Version 43 signs model providers in from a chat (`SignInChat`, `AnswerChatSignIn`,
+// `CancelChatSignIn`, `ChatState::login`) and reports sign-ins the agent can no longer
+// use (`ChatState::expired_logins`).
+pub const PROTOCOL_VERSION: u32 = 43;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -613,6 +616,22 @@ pub enum ClientMessage {
         #[serde(default)]
         picks: chat::ChatPicks,
     },
+    /// Signs `provider` (`anthropic`, `openai-codex`) in for the chat's agent, where the
+    /// chat runs, through the agent's own login; `ChatState::login` shows how it goes.
+    SignInChat {
+        chat: String,
+        provider: String,
+    },
+    /// What the chat's sign-in asked for: an authorization code, or the page the
+    /// provider redirected to.
+    AnswerChatSignIn {
+        chat: String,
+        code: String,
+    },
+    /// Stops the chat's sign-in.
+    CancelChatSignIn {
+        chat: String,
+    },
     ShutdownDaemon,
 }
 
@@ -788,7 +807,7 @@ pub enum ServerMessage {
         sample: system_metrics::SystemSample,
     },
     ChatWatching {
-        state: chat::ChatState,
+        state: Box<chat::ChatState>,
     },
     /// Unsolicited, after `WatchChat`: one change to the watched chat.
     ChatChanged {

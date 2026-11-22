@@ -250,7 +250,7 @@ fn choice_id(choice: &ChatChoice) -> &str {
 }
 
 /// A provider as people know it: `openai-codex` is OpenAI Codex.
-fn provider_name(provider: &str) -> String {
+pub(super) fn provider_name(provider: &str) -> String {
     let known = match provider {
         "anthropic" => "Anthropic",
         "openai" => "OpenAI",
@@ -1656,7 +1656,70 @@ impl CompiApp {
             .child(self.render_model_list(
                 owner, harness, option, layout, picker, remembered, empty, cx,
             ))
+            .children(self.render_picker_sign_in(owner, harness, picker, cx))
             .into_any_element()
+    }
+
+    /// Under a provider's models in an OMP chat's picker: whether the agent can still use
+    /// its sign-in to it, and a button to sign it in, or in again.
+    fn render_picker_sign_in(
+        &self,
+        owner: &PickerOwner,
+        harness: ChatHarness,
+        picker: &ModelPicker,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let (PickerOwner::Chat(chat), ChatHarness::Omp, PickerTab::Provider(Some(provider))) =
+            (owner, harness, &picker.tab)
+        else {
+            return None;
+        };
+        let state = self.chat.chats.get(chat)?.state.as_ref()?;
+        let colors = *self.colors();
+        let muted = modal_text_color(colors.muted, &colors);
+        let expired = state
+            .expired_logins
+            .iter()
+            .find(|lost| lost.provider == *provider);
+        let subscribed = state.plans.iter().any(|plan| plan.provider == *provider);
+        let (text, tint) = match expired {
+            Some(lost) => (format!("Sign-in expired: {}", lost.reason), colors.error),
+            None if subscribed => ("Signed in with a subscription".to_owned(), muted),
+            None => (
+                "Sign in with a subscription, or use an API key".to_owned(),
+                muted,
+            ),
+        };
+        let label = if expired.is_some() || subscribed {
+            "Sign in again"
+        } else {
+            "Sign in"
+        };
+        let (id, provider) = (chat.clone(), provider.clone());
+        let button = controls::text_button("chat-picker-sign-in", label).on_click(cx.listener(
+            move |this, _: &ClickEvent, window, cx| {
+                if let Some(model) = this.chat.chats.get_mut(&id) {
+                    model.menu = None;
+                }
+                this.sign_in_chat(&id, provider.clone(), window, cx);
+                cx.notify();
+            },
+        ));
+        Some(
+            div()
+                .flex_none()
+                .mx_3()
+                .py_2()
+                .border_t_1()
+                .border_color(color(colors.border))
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                .child(div().flex_1().min_w_0().text_color(color(tint)).child(text))
+                .child(button)
+                .into_any_element(),
+        )
     }
 
     /// The strip: your saved models' star, then a mark per provider, the shown one lit

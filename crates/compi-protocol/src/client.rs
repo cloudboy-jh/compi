@@ -831,7 +831,7 @@ impl DaemonClient {
             },
             Duration::from_secs(10),
         )? {
-            ServerMessage::ChatWatching { state } => Ok(state),
+            ServerMessage::ChatWatching { state } => Ok(*state),
             message => Err(unexpected_response(message)),
         }
     }

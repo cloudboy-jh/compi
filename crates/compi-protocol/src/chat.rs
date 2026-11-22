@@ -413,6 +413,12 @@ pub struct ChatState {
     /// The model providers signed in with a subscription plan, with what is left of it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plans: Vec<ChatPlan>,
+    /// Sign-ins the agent keeps but can no longer use (an expired refresh token).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expired_logins: Vec<ChatExpiredLogin>,
+    /// A provider being signed in from the chat (`SignInChat`), and how far it got.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<ChatLogin>,
     /// The daemon keeps the chat as a thread: it was sent its first prompt, or opened
     /// from a saved thread. A chat without one is a draft, which closing leaves nothing
     /// of. A chat gets its thread with its first transcript entry, so watchers learn it
@@ -463,6 +469,8 @@ impl ChatState {
             ChatEvent::Question { question } => self.question = question,
             ChatEvent::Queued { queued } => self.queued = queued,
             ChatEvent::Plans { plans } => self.plans = plans,
+            ChatEvent::ExpiredLogins { expired } => self.expired_logins = expired,
+            ChatEvent::Login { login } => self.login = login,
         }
     }
 
@@ -852,6 +860,70 @@ pub struct ChatPlanLimit {
     pub left_percent: u8,
 }
 
+/// A provider sign-in the agent keeps but can no longer use, and why: signing in again
+/// replaces it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatExpiredLogin {
+    /// As model values name it before their `/` (`anthropic`, `openai-codex`).
+    pub provider: String,
+    /// The account it was, when the agent says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Why, in the provider's words (`Refresh token expired`).
+    pub reason: String,
+}
+
+/// A provider being signed in from the chat, through the agent's own login, where the
+/// chat runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatLogin {
+    /// As model values name it before their `/`.
+    pub provider: String,
+    /// The page to sign in on, once the login gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub step: ChatLoginStep,
+}
+
+/// How far a sign-in got.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatLoginStep {
+    /// Starting, or waiting for the browser; what the login said last.
+    Waiting {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    /// The login asks for something pasted back: an authorization code, or the page the
+    /// provider redirected to.
+    Code {
+        prompt: String,
+    },
+    /// Signed in, as `account` when the login says.
+    Done {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+/// The provider a model value (`anthropic/claude-opus-5-5`) belongs to: what comes
+/// before its `/`.
+pub fn model_provider(model: &str) -> Option<&str> {
+    model.split_once('/').map(|(provider, _)| provider)
+}
+
+/// Whether `provider` can name a provider to sign in: letters, digits, `-`, `_` and `.`.
+pub fn valid_provider(provider: &str) -> bool {
+    !provider.is_empty()
+        && provider.len() <= 64
+        && provider
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+}
+
 /// A session of the harness in the chat's folder, for resuming. Sessions without a
 /// message are left out.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -968,6 +1040,12 @@ pub enum ChatEvent {
     },
     Plans {
         plans: Vec<ChatPlan>,
+    },
+    ExpiredLogins {
+        expired: Vec<ChatExpiredLogin>,
+    },
+    Login {
+        login: Option<ChatLogin>,
     },
 }
 

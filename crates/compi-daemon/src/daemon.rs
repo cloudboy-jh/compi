@@ -913,7 +913,9 @@ fn handle_connection(
                             crate::chat::hub().watch(&chat, approval, picks, surface);
                         sink.send_control(&ServerControl {
                             request_id: Some(request_id),
-                            message: ServerMessage::ChatWatching { state },
+                            message: ServerMessage::ChatWatching {
+                                state: Box::new(state),
+                            },
                         })?;
                         chat_watch = Some(events);
                     }
@@ -1037,6 +1039,19 @@ fn handle_connection(
                     request_id,
                     crate::chat::hub().restart(&chat, approval, picks),
                 )?,
+                ClientMessage::SignInChat { chat, provider } => answer_chat(
+                    &sink,
+                    request_id,
+                    crate::chat::hub().sign_in(&chat, provider),
+                )?,
+                ClientMessage::AnswerChatSignIn { chat, code } => answer_chat(
+                    &sink,
+                    request_id,
+                    crate::chat::hub().answer_sign_in(&chat, code),
+                )?,
+                ClientMessage::CancelChatSignIn { chat } => {
+                    answer_chat(&sink, request_id, crate::chat::hub().cancel_sign_in(&chat))?
+                }
                 ClientMessage::WatchSystemTotals { source } => match Source::resolve(&source) {
                     Ok(source) => {
                         system_totals_watch = Some(source.watch_totals());

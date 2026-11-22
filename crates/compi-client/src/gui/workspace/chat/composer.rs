@@ -930,6 +930,7 @@ impl CompiApp {
                         .child(self.chat_restart_button(chat, cx)),
                 )
             })
+            .children(state.and_then(|state| self.render_chat_sign_in(chat, state, cx)))
             .when_some(orphan, |footer, permission| {
                 footer.child(rows::render_permission_block(None, permission, &frame))
             })
