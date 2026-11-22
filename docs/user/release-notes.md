@@ -1,27 +1,27 @@
-# 0.9.0
+# 0.9.1
 
-- Choose whether new tabs start as chats or terminals
-- Use OMP, Claude Code, Codex or OpenCode in native chat
-- Add a folder or clone a Git URL directly into your saved projects
-- Start the first WSL tab faster when WSL is already running
+- New tabs and threads open in the project you're working in
+- Tabs find their project, including WSL tabs in a Windows project folder
+- **Home** replaces Loose tabs as the project for everything else
+- Drag sidebar cards to reorder them or move them to another project
 - Updating restarts the local daemon and ends running shells and chats
 
-## Chats and terminals
+## Projects and the sidebar
 
-- Choose **Chat first** or **Terminal first** at setup or in **Settings → General**. The choice applies to the tab strip’s **+** and Ctrl/Cmd+T. Right-click **+** to open the other kind of tab or start a thread with a different agent.
-- A new thread starts as a draft. Send a message to keep it as a thread, or use **Open here** to open a terminal, files, changes, browser or monitor in the same place. Reopen a closed thread from **Threads** in the command palette.
-- Native chat works with installed OMP, Claude Code, Codex and OpenCode. New threads use your default agent or the project’s choice. You can switch agents in an unsent draft without losing your text. Available controls depend on the agent.
-- Compi starts shell preparation in the background instead of making new tabs wait on each other. On Windows, **Automatic** uses PowerShell for Windows folders and WSL for Linux-only folders. Existing explicit shell choices are kept.
+- The tab strip’s **+**, Ctrl/Cmd+T and the sidebar’s buttons open new tabs and threads in the selected tab’s project, in the folder you’re in when it’s inside that project. With no tab selected they use the project you used last.
+- A tab that starts outside a Git repository, such as your home folder, joins the first repository its shell enters or a thread opens in, then stays there. A WSL tab in `/mnt/c/…`, or behind a link to it, now shows under the project saved as `C:\…`.
+- **Home** is your Start folder. It holds every tab outside a saved project and has its own name, icon and agent defaults in **Settings → Projects**. It can’t be archived or removed.
+- Drag a thread or terminal card to reorder it, pin it among pinned cards, or drop it on another project to move it there for good. Drop it on the panes to add its tab to the one you’re looking at. Esc cancels.
+- A new thread’s draft names its project at the top. Click it to start the thread in another project before you send.
+- Sidebar cards are one line each, indented under their project.
+- **New terminal here** on a Windows project uses your chosen shell instead of always opening PowerShell.
 
-## Projects and settings
+## Fixes
 
-- **Add project…** in the sidebar and Settings opens the same picker. Open an existing folder or clone an HTTPS or SSH Git URL into the selected environment. Adding a project does not launch a tab.
-- Saved projects stay in the sidebar even with no tabs. Start a thread or terminal from the project’s menu, or open its settings. Other tabs stay under **Loose tabs**. Existing workspace commands and tab layouts remain available.
-- Use **Settings → Projects** to change the name, icon, pin, default agent and model. Archive a project to hide it without losing threads. **Remove from Compi…** confirms thread deletion and leaves files on disk.
-- General holds startup defaults. Agents shows installed agents and their approval settings. Window and layout controls are now under Appearance.
+- The theme list in **Settings → Appearance** scrolls on its own, in a framed box with a scrollbar, instead of scrolling the whole page.
 
 ## Updating
 
-- **Save your work first.** This release changes daemon protocol 40 → 41 and workspace format 10 → 11. The update restarts the local daemon after you consent, ending its running shells and chats. It does not restart remote daemons.
-- **From 0.8.0 or 0.8.1 on Windows, use [Compi 0.9.0 Setup](https://github.com/cloudboy-jh/compi/releases/download/v0.9.0/Compi-0.9.0-Setup.exe).** Those versions’ in-app updater can hang and roll back. From 0.3.0 or earlier, use Setup once to replace the old update helper.
+- **Save your work first.** This release changes daemon protocol 41 → 42. The update restarts the local daemon after you consent, ending its running shells and chats. It does not restart remote daemons.
+- **From 0.8.0 or 0.8.1 on Windows, use [Compi 0.9.1 Setup](https://github.com/cloudboy-jh/compi/releases/download/v0.9.1/Compi-0.9.1-Setup.exe).** Those versions’ in-app updater can hang and roll back. From 0.3.0 or earlier, use Setup once to replace the old update helper.
 - Windows packages are not publisher-signed. The macOS app may be ad-hoc signed and not notarized. Signed update metadata does not replace operating-system publisher signing.

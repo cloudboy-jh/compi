@@ -9,6 +9,14 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 - **0.8.1**: published 2026-11-11 21:20 UTC, tagged `v0.8.1` at `d5fb6e3`, release run [43099782821](https://github.com/cloudboy-jh/compi/actions/runs/43099782821), 12 assets. Its in-app update from 0.8.0 rolled back on the working instance (the window hang, fixed in 0.8.2); Setup installed it.
 - **0.8.0**: published 2026-11-11 16:10 UTC, tagged `v0.8.0` at `7c12262`, release run [43053398818](https://github.com/cloudboy-jh/compi/actions/runs/43053398818), 12 assets.
 
+## v0.9.1
+
+The batch: tabs finding their project (WSL and linked folders included), Home replacing Loose tabs, sidebar card dragging (`SetTabProject`, protocol **42**), new tabs and threads in the selected tab's project with a draft's project switch, one-line indented sidebar cards, and the theme grid's own scroll. Workspace format stays **11** (`chosen_projects` is additive). See [Completed work](COMPLETED.md#chat-first-v090). Checked only in Windows `cargo dev`.
+
+1. Tag `v0.9.1` on the release-prep commit; check both draft packages, checksums, signed metadata with `daemon_protocol` 42 and the 0.9.1 notes, and the Setup metadata.
+2. After it is published, check that the installed 0.9.0 finds 0.9.1 with its signed notes. Protocol 41 → 42 restarts the local daemon, ending open shells and chats.
+3. Not seen: native macOS, the actual in-app upgrade from 0.9.0.
+
 ## v0.9.0 follow-through
 
 This release includes chat-first setup and new tabs, four native agents (OMP, Claude Code, Codex, OpenCode), faster first tabs with WSL already running, reorganized Settings, and one saved project list shared by the sidebar and Settings. See [Completed work](COMPLETED.md#chat-first-v090) and [T3 Code research](../research/t3-code/README.md). Pi is next, not part of v0.9.0.
