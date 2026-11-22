@@ -89,6 +89,37 @@ model = "opencode/big-pickle" # unset uses OpenCode's own (its config's model, e
 thinking = "high" # the model's variant; "default" is the model's own
 ```
 
+### Shared OMP authentication on Windows and WSL
+
+Compi runs the installed agent with that operating-system user's configuration. Its installed and development instances do not need separate OMP logins, but Windows and WSL have different home directories and, by default, different OMP credential stores. A login in one does not sign the other in.
+
+Use OMP's native authentication broker rather than copying OAuth refresh tokens or sharing `agent.db` between operating systems. Choose the installation with the working accounts as the authority. For example, in Ubuntu:
+
+```sh
+omp auth-broker serve --bind=127.0.0.1:44937
+```
+
+Keep it running, preferably as a user service. OMP creates its broker token at `~/.omp/auth-broker.token`; keep it private to your OS user. Configure **both** OMP installations in their own `~/.omp/agent/config.yml`:
+
+```yaml
+auth:
+  broker:
+    url: http://127.0.0.1:44937
+    token: "!cat ~/.omp/auth-broker.token"
+```
+
+That token command is for the WSL client. On Windows, read the same token through WSL, replacing the `token` line with the following and changing `Ubuntu` and `/home/you` to your distribution and Linux home:
+
+```yaml
+    token: "!wsl.exe -d Ubuntu --exec cat /home/you/.omp/auth-broker.token"
+```
+
+This example requires the broker and Windows-to-WSL localhost forwarding to be ready before OMP starts. An on-demand token helper must start the service and wait for its health endpoint **from the client's operating system** before returning the token; Linux readiness alone can precede Windows forwarding. Never put token values in project files, shell history or logs. Bind only to loopback; this grants local clients access to your provider accounts and is not a multi-user sharing setup.
+
+Open or resume a chat after changing the configuration so a fresh OMP process reads it. Check `omp auth-broker status --json` and `omp usage --json` on each side, then make a model request; the unauthenticated health endpoint alone does not prove provider access. The broker owns refresh and shared login/logout changes; clients can keep OMP's encrypted access-token/API-key cache. Existing credentials missing from the broker require OMP's native migration; inspect `omp auth-broker migrate --from-local --include-oauth --dry-run --json` before importing anything.
+
+This shares OMP provider authentication, not sessions, other agents' credential stores or deliberately isolated OMP profiles. Use **Threads** to reopen a Compi conversation in its original environment.
+
 ## Projects
 
 A project is a saved folder in a particular environment. In a Git repository it is the repository root. **Settings → Projects** and the sidebar show the same saved projects, including projects with no open tabs. Use **Add project…** to open an existing folder or clone a Git URL. Existing project customizations are kept; folders only visited by a shell are not saved as projects. Choose a project row to edit its settings, or open **Project settings…** from its sidebar menu.

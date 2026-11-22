@@ -576,7 +576,7 @@ impl CompiApp {
             menu_item(
                 agent.name(),
                 cx.listener(move |this, _, _, cx| {
-                    this.create_thread_tab(agent);
+                    this.create_thread_tab(agent, cx);
                     cx.notify();
                 }),
             )

@@ -1899,48 +1899,90 @@ impl CompiApp {
         self.section_project(project)
     }
 
-    /// The focused pane's folder (a chat's, shown on a terminal too, a shell's, or a
-    /// files pane's) while it lies in `project`; any folder for Home.
-    fn focused_folder_in(
-        &self,
-        project: &compi_protocol::Project,
-    ) -> Option<compi_protocol::Project> {
+    /// The focused pane's folder in its own execution environment.
+    fn focused_tab_folder(&self) -> Option<compi_protocol::Project> {
         let (environment, root) = match self.focused_pane_content() {
             Some(compi_protocol::PaneContent::Chat(chat)) => {
                 (chat.environment.clone(), chat.folder.clone())
             }
             _ => self.chat_scope().ok()?,
         };
-        let folder = compi_protocol::Project { environment, root };
-        (self.is_home_project(project) || crate::config::folder_in_project(project, &folder))
-            .then_some(folder)
+        Some(compi_protocol::Project { environment, root })
     }
 
-    /// A terminal tab in the selected tab's project: in the focused pane's folder while
-    /// it lies there, else at the project's folder.
-    fn create_terminal_tab(&mut self) {
+    /// A terminal tab in the selected project, keeping the focused folder when it
+    /// belongs there, including folders reached through a WSL link.
+    fn create_terminal_tab(&mut self, cx: &mut Context<Self>) {
+        self.create_project_tab(None, cx);
+    }
+
+    /// A thread draft in the selected project, keeping the focused folder and its
+    /// execution environment when it belongs there.
+    pub(super) fn create_thread_tab(
+        &mut self,
+        harness: compi_protocol::chat::ChatHarness,
+        cx: &mut Context<Self>,
+    ) {
+        self.create_project_tab(Some(harness), cx);
+    }
+
+    fn create_project_tab(
+        &mut self,
+        harness: Option<compi_protocol::chat::ChatHarness>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session) = self.state.selected_session.clone() else {
             self.create_terminal(None);
             return;
         };
         let project = self.new_tab_project();
-        let place = self.focused_folder_in(&project).unwrap_or(project);
-        self.new_project_terminal(session, &place);
-    }
-
-    /// A new thread draft with `harness` in a tab of its own, in the selected tab's
-    /// project: in the focused pane's folder while it lies there, else at the project's
-    /// folder.
-    pub(super) fn create_thread_tab(&mut self, harness: compi_protocol::chat::ChatHarness) {
-        let Some(session_id) = self.state.selected_session.clone() else {
-            self.create_terminal(None);
+        let Some(folder) = self.focused_tab_folder() else {
+            self.new_project_tab(session, project, harness);
             return;
         };
-        let project = self.new_tab_project();
-        let place = self.focused_folder_in(&project).unwrap_or(project);
+        if self.is_home_project(&project) || crate::config::folder_in_project(&project, &folder) {
+            self.new_project_tab(session, folder, harness);
+            return;
+        }
+        // Project identity may name a WSL link by its Windows target. Resolve it off
+        // the UI thread, but keep the original folder/environment for execution.
+        let target = self.target.clone();
+        cx.spawn(async move |this, cx| {
+            let asked = folder.clone();
+            let resolved = cx
+                .background_executor()
+                .spawn(async move {
+                    target
+                        .connect()
+                        .and_then(|mut client| {
+                            client.resolve_project_folder(asked.environment, asked.root)
+                        })
+                        .ok()
+                })
+                .await;
+            let place = resolved_tab_folder(project, folder, resolved.as_ref());
+            this.update(cx, |this, cx| {
+                this.new_project_tab(session, place, harness);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn new_project_tab(
+        &mut self,
+        session: SessionId,
+        place: compi_protocol::Project,
+        harness: Option<compi_protocol::chat::ChatHarness>,
+    ) {
+        let Some(harness) = harness else {
+            self.new_project_terminal(session, &place);
+            return;
+        };
         self.mutate(
             WorkspaceMutation::CreateContentTab {
-                session_id,
+                session_id: session,
                 label: String::new(),
                 content: compi_protocol::PaneContent::Chat(crate::chat::new_chat(
                     harness,
@@ -3759,7 +3801,7 @@ impl CompiApp {
         self.set_new_tab(new_tab, cx);
         self.dismiss_overlay();
         if new_tab == crate::config::NewTab::Chat {
-            self.create_thread_tab(self.new_tab_agent());
+            self.create_thread_tab(self.new_tab_agent(), cx);
         }
         cx.notify();
     }
@@ -4085,11 +4127,11 @@ impl CompiApp {
                 }
             }
             Command::NewTab => match self.config.new_tab.unwrap_or_default() {
-                crate::config::NewTab::Chat => self.create_thread_tab(self.new_tab_agent()),
-                crate::config::NewTab::Terminal => self.create_terminal_tab(),
+                crate::config::NewTab::Chat => self.create_thread_tab(self.new_tab_agent(), cx),
+                crate::config::NewTab::Terminal => self.create_terminal_tab(cx),
             },
-            Command::NewTerminalTab => self.create_terminal_tab(),
-            Command::NewThreadTab => self.create_thread_tab(self.new_tab_agent()),
+            Command::NewTerminalTab => self.create_terminal_tab(cx),
+            Command::NewThreadTab => self.create_thread_tab(self.new_tab_agent(), cx),
             Command::SwitchTab => self.open_overlay(Overlay::Tabs { hidden_only: false }, ""),
             Command::RestoreHiddenTab => self.open_overlay(Overlay::Tabs { hidden_only: true }, ""),
             Command::PreviousTab | Command::NextTab => {
@@ -8425,6 +8467,20 @@ fn rounded_rect_path(path: &mut PathBuilder, bounds: Bounds<Pixels>, radius: f32
     path.close();
 }
 
+/// A resolved project establishes membership without changing how the pane names
+/// its folder. A deliberate move to a different project still starts at its root.
+fn resolved_tab_folder(
+    project: compi_protocol::Project,
+    folder: compi_protocol::Project,
+    resolved: Option<&compi_protocol::Project>,
+) -> compi_protocol::Project {
+    if resolved.is_some_and(|resolved| crate::config::folder_in_project(&project, resolved)) {
+        folder
+    } else {
+        project
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -8440,6 +8496,53 @@ mod tests {
     };
     use compi_protocol::{PaneId, TabId};
     use gpui::{Bounds, point, px, size};
+
+    #[test]
+    fn linked_wsl_folder_keeps_its_execution_environment_for_new_tabs() {
+        use compi_protocol::{ContentEnvironment, Project};
+        let project = Project {
+            environment: ContentEnvironment::Host,
+            root: r"C:\Users\me\Proj\compi".into(),
+        };
+        let folder = Project {
+            environment: ContentEnvironment::Wsl {
+                distribution: "Ubuntu".into(),
+            },
+            root: "/home/me/proj/compi".into(),
+        };
+        assert!(!crate::config::folder_in_project(&project, &folder));
+        assert_eq!(
+            super::resolved_tab_folder(project.clone(), folder.clone(), Some(&project)),
+            folder
+        );
+    }
+
+    #[test]
+    fn reassigned_or_unresolved_folder_uses_the_destination_project() {
+        use compi_protocol::{ContentEnvironment, Project};
+        let destination = Project {
+            environment: ContentEnvironment::Host,
+            root: r"C:\work\other".into(),
+        };
+        let folder = Project {
+            environment: ContentEnvironment::Wsl {
+                distribution: "Ubuntu".into(),
+            },
+            root: "/home/me/proj/compi".into(),
+        };
+        let resolved = Project {
+            environment: ContentEnvironment::Host,
+            root: r"C:\work\compi".into(),
+        };
+        assert_eq!(
+            super::resolved_tab_folder(destination.clone(), folder.clone(), Some(&resolved)),
+            destination
+        );
+        assert_eq!(
+            super::resolved_tab_folder(destination.clone(), folder, None),
+            destination
+        );
+    }
 
     #[test]
     fn split_overrides_inherit_independently_and_preserve_missing_theme_ids() {

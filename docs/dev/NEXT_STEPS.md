@@ -14,6 +14,8 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 
 This release adds tabs finding their project (WSL and linked folders included), Home in place of Loose tabs, sidebar card dragging (`SetTabProject`, protocol 42), new tabs and threads in the selected tab's project with a draft's project switch, one-line indented sidebar cards, and the theme grid's own scroll. See [Completed work](COMPLETED.md#chat-first-v090).
 
+- **Unreleased fix:** new tabs/threads from a linked WSL project keep the focused folder's environment instead of switching to Windows OMP and its separate logins/sessions. Reproduced in installed 0.9.1 and verified in Windows `cargo dev`; [evidence](COMPLETED.md#after-091-unreleased). Ship with the next release.
+
 - Run the in-app upgrade from 0.9.0 on the daily Windows install when convenient; protocol 41 → 42 restarts the local daemon, ending open shells and chats.
 - Not seen natively: the macOS app, sidebar dragging on macOS.
 
