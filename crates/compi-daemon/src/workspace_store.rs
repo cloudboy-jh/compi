@@ -5,7 +5,7 @@ use compi_protocol::{
     WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -57,6 +57,10 @@ pub struct StoredWorkspace {
     /// restarts comes back where the user was. Daemon-internal; never sent to clients.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub last_directories: BTreeMap<SurfaceId, String>,
+    /// Tabs whose project was chosen (`SetTabProject`), so the daemon keeps it instead of
+    /// finding one. Daemon-internal; never sent to clients.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub chosen_projects: BTreeSet<TabId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -275,6 +279,7 @@ impl StoredWorkspace {
             receipts: Vec::new(),
             recovery_message: None,
             last_directories: BTreeMap::new(),
+            chosen_projects: BTreeSet::new(),
         }
     }
 
@@ -374,6 +379,7 @@ fn migrate_legacy(mut legacy: LegacyManifest, backup: &Path) -> StoredWorkspace 
             backup.display()
         )),
         last_directories: BTreeMap::new(),
+        chosen_projects: BTreeSet::new(),
     }
 }
 
@@ -722,6 +728,13 @@ fn recover_lost_surfaces(workspace: &mut StoredWorkspace) {
     workspace
         .last_directories
         .retain(|surface, _| held.contains(surface));
+    let tabs: HashSet<&TabId> = workspace
+        .sessions
+        .iter()
+        .flat_map(|session| &session.tabs)
+        .map(|tab| &tab.id)
+        .collect();
+    workspace.chosen_projects.retain(|tab| tabs.contains(tab));
     if changed {
         workspace.revision = workspace.revision.saturating_add(1);
     }

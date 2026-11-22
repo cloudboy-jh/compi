@@ -99,7 +99,9 @@ use std::fmt;
 // folder and Windows PowerShell in a Windows one, and keeps the shell it picked on the
 // surface. `ProjectEnvironments`, `ResolveProjectFolder` and `CloneProject` let a client
 // add existing or newly cloned projects on the daemon without opening a pane.
-pub const PROTOCOL_VERSION: u32 = 41;
+// Version 42 lets a client choose a tab's project (`SetTabProject`), which the daemon
+// then keeps instead of finding one from the tab's folders.
+pub const PROTOCOL_VERSION: u32 = 42;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every
@@ -2165,7 +2167,8 @@ pub struct WorkspaceTab {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<TabGroupId>,
     /// The project the tab belongs to: where it started, at its Git top level when it
-    /// is in a repository. `None` until the daemon knows where the tab started.
+    /// is in a repository, or the one `SetTabProject` chose. `None` until the daemon
+    /// knows where the tab started, or when it was taken out of its project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<Project>,
 }
@@ -2393,6 +2396,12 @@ pub enum WorkspaceMutation {
     OpenThread {
         session_id: SessionId,
         chat: chat::ChatContent,
+    },
+    /// Put `tab_id` in `project` (`None`: in none) for good: the daemon stops finding
+    /// the tab's project from its folders.
+    SetTabProject {
+        tab_id: TabId,
+        project: Option<Project>,
     },
     RenameTab {
         tab_id: TabId,

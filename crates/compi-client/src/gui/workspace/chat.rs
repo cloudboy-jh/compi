@@ -840,7 +840,7 @@ impl CompiApp {
             self.focus_pane(pane);
             Some(chat)
         } else {
-            self.open_chat(self.new_thread_agent(self.selected_project()), window, cx)
+            self.open_chat(self.new_tab_agent(), window, cx)
         };
         let Some(chat) = chat else {
             return;

@@ -15,7 +15,7 @@ use super::settings::{
     settings_group_label, share_config_change,
 };
 use super::*;
-use crate::config::{ProjectSettings, project_key};
+use crate::config::{ProjectSettings, project_folder_key, project_from_key};
 use crate::gui::controls::{ChipTone, IconName};
 use compi_protocol::chat::{ChatHarness, ChatPicks};
 use compi_protocol::{ContentEnvironment, Project, SettingsSection};
@@ -72,35 +72,35 @@ const AGENT_CHOICES: [Option<ChatHarness>; ChatHarness::ALL.len() + 1] = {
     choices
 };
 
-/// The project `key` names (`project_key`), for a project listed only by its settings.
-fn project_from_key(key: &str) -> Option<Project> {
-    if let Some(root) = key.strip_prefix("host:") {
-        return Some(Project {
-            environment: ContentEnvironment::Host,
-            root: root.to_owned(),
-        });
+/// The saved projects and `home`, which is listed even unsaved and is never archived.
+/// Archived projects come last; within each section pinned projects come first, and
+/// Home after the other unpinned ones.
+fn listed_order(projects: &HashMap<String, ProjectSettings>, home: &Project) -> Vec<ListedProject> {
+    let home_folder = project_folder_key(home);
+    let mut entries: Vec<_> = projects
+        .iter()
+        .filter_map(|(key, settings)| {
+            let project = project_from_key(key)?;
+            let is_home = project_folder_key(&project) == home_folder;
+            Some((
+                project,
+                settings.archived && !is_home,
+                settings.pinned,
+                is_home,
+                key,
+            ))
+        })
+        .collect();
+    let home_key = crate::config::project_key(home);
+    if !entries.iter().any(|entry| entry.3) {
+        entries.push((home.clone(), false, false, true, &home_key));
     }
-    let (distribution, root) = key.strip_prefix("wsl:")?.split_once(':')?;
-    Some(Project {
-        environment: ContentEnvironment::Wsl {
-            distribution: distribution.to_owned(),
-        },
-        root: root.to_owned(),
-    })
-}
-
-/// Archived projects come last; within each section, pinned projects come first.
-fn listed_order(projects: &HashMap<String, ProjectSettings>) -> Vec<ListedProject> {
-    let mut entries: Vec<_> = projects.iter().collect();
-    entries.sort_unstable_by_key(|&(key, settings)| (settings.archived, !settings.pinned, key));
+    entries.sort_unstable_by_key(|&(_, archived, pinned, is_home, key)| {
+        (archived, !pinned, is_home, key)
+    });
     entries
         .into_iter()
-        .filter_map(|(key, settings)| {
-            Some(ListedProject {
-                project: project_from_key(key)?,
-                archived: settings.archived,
-            })
-        })
+        .map(|(project, archived, ..)| ListedProject { project, archived })
         .collect()
 }
 
@@ -264,14 +264,44 @@ fn project_field_events(
 impl CompiApp {
     /// What you set for `project`; nothing set when it has no table.
     pub(in crate::gui) fn project_settings(&self, project: &Project) -> Option<&ProjectSettings> {
-        self.config.projects.get(&project_key(project))
+        self.config
+            .projects
+            .get(&self.config.project_settings_key(project))
     }
 
-    /// The name `project` goes by: the one you gave it, else its folder's.
+    /// The name `project` goes by: the one you gave it, else "Home" for Home and the
+    /// folder's for the rest.
     pub(in crate::gui) fn project_name(&self, project: &Project) -> String {
         self.project_settings(project)
             .and_then(|settings| settings.name.clone())
-            .unwrap_or_else(|| project.name().to_owned())
+            .unwrap_or_else(|| {
+                if self.is_home_project(project) {
+                    "Home".to_owned()
+                } else {
+                    project.name().to_owned()
+                }
+            })
+    }
+
+    /// The Home project: the Start folder, holding every tab outside a saved project;
+    /// named as it is kept when its settings are saved under another name.
+    pub(in crate::gui) fn home_project(&self) -> Project {
+        let home = self.config.home_project();
+        self.config.kept_project(&home).unwrap_or(home)
+    }
+
+    /// Whether `project` is Home.
+    pub(in crate::gui) fn is_home_project(&self, project: &Project) -> bool {
+        self.config.is_home_project(project)
+    }
+
+    /// The listed project a tab in `project` shows under: the saved project for its
+    /// folder while not archived, else Home.
+    pub(in crate::gui) fn section_project(&self, project: Option<&Project>) -> Project {
+        project
+            .and_then(|project| self.config.kept_project(project))
+            .filter(|project| !self.project_archived(project))
+            .unwrap_or_else(|| self.home_project())
     }
 
     /// Whether `project` is archived and hidden from the main project list.
@@ -300,13 +330,13 @@ impl CompiApp {
         self.persist_project_settings(project, settings, cx)
     }
 
-    fn persist_project_settings(
+    pub(super) fn persist_project_settings(
         &mut self,
         project: &Project,
         settings: ProjectSettings,
         cx: &mut Context<Self>,
     ) -> bool {
-        let key = project_key(project);
+        let key = self.config.project_settings_key(project);
         if let Err(error) = self.config.save_project_settings(&key, settings.clone()) {
             self.global_error = Some(error);
             return false;
@@ -376,6 +406,11 @@ impl CompiApp {
         self.config.new_thread_agent(project)
     }
 
+    /// The agent a new thread started from the selected tab begins with: its project's.
+    pub(super) fn new_tab_agent(&self) -> ChatHarness {
+        self.new_thread_agent(Some(&self.new_tab_project()))
+    }
+
     /// What a new session of `harness` in `project` starts on: what Compi remembers of
     /// `harness`, on the project's model when the project's new threads start with
     /// `harness`.
@@ -401,7 +436,7 @@ impl CompiApp {
 
     /// Saved projects, including those with pre-existing customizations.
     pub(super) fn listed_projects(&self) -> Vec<ListedProject> {
-        listed_order(&self.config.projects)
+        listed_order(&self.config.projects, &self.home_project())
     }
 
     /// The Projects page's search, as `host` (else the Settings pane with the
@@ -459,15 +494,17 @@ impl CompiApp {
             if settings.is_some_and(|settings| settings.icon.is_some()) {
                 stops.push(action(Control::ResetIcon));
             }
+            let removable = if self.is_home_project(project) {
+                &[][..]
+            } else {
+                &[Control::Archive, Control::Remove][..]
+            };
             stops.extend(
-                [
-                    Control::Pin,
-                    Control::Agent,
-                    Control::Model,
-                    Control::Archive,
-                    Control::Remove,
-                ]
-                .map(action),
+                [Control::Pin, Control::Agent, Control::Model]
+                    .iter()
+                    .chain(removable)
+                    .copied()
+                    .map(action),
             );
             return stops;
         }
@@ -800,12 +837,17 @@ impl CompiApp {
 
     /// Why `project` cannot be removed now: the tabs open in it, by name.
     fn project_tabs_refusal(&self, project: &Project) -> Option<String> {
+        let folder = project_folder_key(project);
         let tabs: Vec<String> = self
             .workspace
             .iter()
             .flat_map(|workspace| &workspace.sessions)
             .flat_map(|session| &session.tabs)
-            .filter(|tab| tab.project.as_ref() == Some(project))
+            .filter(|tab| {
+                tab.project
+                    .as_ref()
+                    .is_some_and(|project| project_folder_key(project) == folder)
+            })
             .map(|tab| format!("“{}”", self.tab_label(tab)))
             .collect();
         match tabs.len() {
@@ -834,9 +876,15 @@ impl CompiApp {
             this.update(cx, |this, cx| {
                 match listed {
                     Ok(threads) => {
+                        let folder = project_folder_key(&project);
                         let ids = threads
                             .iter()
-                            .filter(|thread| thread.project.as_ref() == Some(&project))
+                            .filter(|thread| {
+                                thread
+                                    .project
+                                    .as_ref()
+                                    .is_some_and(|project| project_folder_key(project) == folder)
+                            })
                             .map(|thread| thread.chat.id.clone())
                             .collect();
                         this.sidebar_threads_listed(threads);
@@ -1429,6 +1477,7 @@ impl CompiApp {
             "Archiving hides the project from the main list but keeps its threads and settings."
         };
 
+        let home = self.is_home_project(project);
         let card = settings_card(&colors)
             .child(div().px_4().child(self.settings_row(
                 "Name",
@@ -1460,16 +1509,19 @@ impl CompiApp {
                 model,
                 row.compact,
             )))
-            .child(line(self.settings_row(
-                if settings.archived {
-                    "Archived"
-                } else {
-                    "Archive or remove"
-                },
-                ending.to_owned(),
-                buttons().child(archive).child(remove).into_any_element(),
-                row.compact,
-            )));
+            // Home holds every tab outside a saved project: it stays.
+            .when(!home, |card| {
+                card.child(line(self.settings_row(
+                    if settings.archived {
+                        "Archived"
+                    } else {
+                        "Archive or remove"
+                    },
+                    ending.to_owned(),
+                    buttons().child(archive).child(remove).into_any_element(),
+                    row.compact,
+                )))
+            });
         div()
             .min_w_0()
             .flex()
@@ -1485,6 +1537,7 @@ impl CompiApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::project_key;
 
     fn host(root: &str) -> Project {
         Project {
@@ -1506,6 +1559,49 @@ mod tests {
         }
         assert_eq!(project_from_key("elsewhere:/work"), None);
         assert_eq!(project_from_key("wsl:no-root"), None);
+    }
+
+    #[test]
+    fn a_folder_is_one_project_by_any_of_its_names() {
+        let wsl = |distribution: &str, root: &str| Project {
+            environment: ContentEnvironment::Wsl {
+                distribution: distribution.into(),
+            },
+            root: root.into(),
+        };
+        let saved = project_folder_key(&host(r"C:\Users\me\Proj\compi"));
+        for same in [
+            wsl("Ubuntu", "/mnt/c/Users/me/Proj/compi"),
+            wsl("Debian", "/mnt/c/users/me/proj/compi/"),
+            host("c:/Users/me/Proj/compi"),
+        ] {
+            assert_eq!(project_folder_key(&same), saved, "{same:?}");
+        }
+        for other in [
+            wsl("Ubuntu", "/mnt/d/Users/me/Proj/compi"),
+            wsl("Ubuntu", "/home/me/Proj/compi"),
+            host(r"C:\Users\me\Proj\compi-old"),
+        ] {
+            assert_ne!(project_folder_key(&other), saved, "{other:?}");
+        }
+        // A Windows path into a distribution is that distribution's folder.
+        assert_eq!(
+            project_folder_key(&host(r"\\wsl.localhost\Ubuntu\home\me\compi")),
+            project_folder_key(&wsl("Ubuntu", "/home/me/compi"))
+        );
+        assert_eq!(
+            project_folder_key(&host(r"\\wsl$\Ubuntu\home\me\compi")),
+            project_folder_key(&wsl("Ubuntu", "/home/me/compi"))
+        );
+        // Linux folders keep their case and their distribution.
+        assert_ne!(
+            project_folder_key(&wsl("Ubuntu", "/home/me/Compi")),
+            project_folder_key(&wsl("Ubuntu", "/home/me/compi"))
+        );
+        assert_ne!(
+            project_folder_key(&wsl("Debian", "/home/me/compi")),
+            project_folder_key(&wsl("Ubuntu", "/home/me/compi"))
+        );
     }
 
     #[test]
@@ -1544,15 +1640,45 @@ mod tests {
         .into_iter()
         .map(|(key, settings)| (key.to_owned(), settings))
         .collect();
-        let listed = listed_order(&saved);
+        let home = Project {
+            environment: ContentEnvironment::Host,
+            root: "/home/me".into(),
+        };
+        let listed = listed_order(&saved, &home);
         let order: Vec<_> = listed
             .iter()
             .map(|listed| (listed.project.root.as_str(), listed.archived))
             .collect();
+        // Home is listed unsaved, after the other unpinned projects.
         assert_eq!(
             order,
-            [("/b", false), ("/a", false), ("/c", false), ("/d", true)]
+            [
+                ("/b", false),
+                ("/a", false),
+                ("/c", false),
+                ("/home/me", false),
+                ("/d", true)
+            ]
         );
+        // Saved Home is listed once, and never archived.
+        let mut saved = saved;
+        saved.insert(
+            "host:/home/me".into(),
+            ProjectSettings {
+                pinned: true,
+                archived: true,
+                ..Default::default()
+            },
+        );
+        let order: Vec<_> = listed_order(&saved, &home)
+            .iter()
+            .map(|listed| (listed.project.root.clone(), listed.archived))
+            .collect();
+        assert_eq!(
+            order[..2],
+            [("/b".into(), false), ("/home/me".into(), false)]
+        );
+        assert_eq!(order.len(), 5);
     }
 
     #[test]

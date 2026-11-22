@@ -8,6 +8,7 @@ use crate::theme_store::ThemeLibrary;
 use gpui::Entity;
 use gpui::PathPromptOptions;
 use gpui_component::Sizable as _;
+use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
 // One local store job at a time, including across native windows. The library also
 // serializes mutations; this gate bounds the GUI's queued filesystem work.
@@ -1307,6 +1308,7 @@ impl CompiApp {
         };
         // No `min_h_0`: the header, notes and the grid's minimum height always fit, and a
         // short page scrolls around them.
+        let grid_scroll = grid.clone();
         div()
             .when(terminal_page, |section| section.flex_1())
             .when(!terminal_page, |section| section.flex_none())
@@ -1317,10 +1319,20 @@ impl CompiApp {
             .child(header)
             .children(notices)
             .child(
-                div()
+                // Its own framed box, so it reads as a list that scrolls inside the page.
+                settings_card(&colors)
                     .relative()
+                    .overflow_hidden()
                     .when(terminal_page, |area| area.flex_1().min_h(px(160.0)))
                     .when(!terminal_page, |area| area.h(px(THEME_GRID_HEIGHT)))
+                    // GPUI hands a wheel to every scroll under the pointer, so the page
+                    // would scroll along with the grid. The grid keeps the wheel while it
+                    // has room to move; past either end the page takes it.
+                    .on_scroll_wheel(move |_, _, cx| {
+                        if grid_keeps_wheel(grid_scroll.offset().y, grid_scroll.max_offset().y) {
+                            cx.stop_propagation();
+                        }
+                    })
                     .child(
                         div()
                             .id("theme-grid")
@@ -1328,9 +1340,17 @@ impl CompiApp {
                             .inset_0()
                             .overflow_y_scroll()
                             .track_scroll(grid)
-                            // The scroll clips: room for a tile's ring on every edge.
-                            .p(px(4.0))
+                            // Room for a tile's ring on every edge, and on the right for
+                            // the scrollbar.
+                            .pl(px(THEME_GRID_PADDING))
+                            .py(px(THEME_GRID_PADDING))
+                            .pr(px(THEME_GRID_PADDING + THEME_GRID_SCROLLBAR))
                             .child(content),
+                    )
+                    .child(
+                        Scrollbar::vertical(grid)
+                            .id("theme-grid-scrollbar")
+                            .mode(ScrollbarMode::Always),
                     )
                     .child(viewport),
             )
@@ -1576,6 +1596,21 @@ const THEME_GRID_MAX_COLUMNS: usize = 4;
 const THEME_GROUP_LABEL_GAP: f32 = 8.0;
 /// The height of the theme grid's own scroll on the Appearance page, above its cards.
 const THEME_GRID_HEIGHT: f32 = 320.0;
+/// Between the theme grid's frame and its tiles.
+const THEME_GRID_PADDING: f32 = 12.0;
+/// Kept clear on the theme grid's right for its scrollbar.
+const THEME_GRID_SCROLLBAR: f32 = 8.0;
+/// How much narrower than its box the theme grid's tiles are: the padding on both
+/// sides, the scrollbar's room and the frame's border.
+pub(super) const THEME_GRID_INSET: f32 = 2.0 * THEME_GRID_PADDING + THEME_GRID_SCROLLBAR + 2.0;
+
+/// Whether the theme grid keeps a wheel it has just applied, so the page does not scroll
+/// with it: when its new offset (`offset`, zero at the top and negative below it) is
+/// still within its range (`max`, the farthest it scrolls). An offset past either end
+/// means the grid had no room that way, and the page scrolls instead.
+fn grid_keeps_wheel(offset: Pixels, max: Pixels) -> bool {
+    offset <= Pixels::ZERO && offset >= -max
+}
 
 /// How many columns the theme grid has `width` pixels across: as many tiles of the
 /// minimum width as fit, at least one and at most four. They share the row.
@@ -1763,6 +1798,19 @@ pub(super) fn theme_matches(
 mod tests {
     use super::*;
     use crate::theme::ThemePreset;
+
+    #[test]
+    fn the_theme_grid_keeps_the_wheel_until_an_end() {
+        let max = px(400.0);
+        // Scrolled within the grid: the page stays.
+        assert!(grid_keeps_wheel(px(-40.0), max));
+        assert!(grid_keeps_wheel(px(-400.0), max));
+        // Past the top or the bottom: the page scrolls.
+        assert!(!grid_keeps_wheel(px(40.0), max));
+        assert!(!grid_keeps_wheel(px(-440.0), max));
+        // A grid with nothing to scroll never keeps it.
+        assert!(!grid_keeps_wheel(px(-40.0), px(0.0)));
+    }
 
     #[test]
     fn theme_list_filters_and_searches() {

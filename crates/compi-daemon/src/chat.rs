@@ -291,7 +291,8 @@ impl ChatHub {
                     project: crate::project::project_of(
                         &stored.chat.environment,
                         &stored.chat.folder,
-                    ),
+                    )
+                    .map(|found| found.project),
                     open: held.contains_key(&id),
                     chat: stored.chat,
                     title: stored.title,

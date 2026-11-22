@@ -7,7 +7,7 @@ use compi_protocol::{
     TabPlacement, WorkspaceMutation, WorkspaceSession, WorkspaceSnapshot, WorkspaceTab,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{
@@ -141,8 +141,25 @@ struct PendingCommit {
     reply: Option<SyncSender<std::result::Result<MutationReceipt, ActorError>>>,
 }
 
-/// A tab whose project is to be found: the environment and folder it started in.
-type ProjectRequest = (TabId, ContentEnvironment, String);
+/// A tab whose project is to be found: the project it has, and the folders its panes show
+/// now, in reading order, each in its environment.
+struct ProjectRequest {
+    tab: TabId,
+    current: Option<Project>,
+    folders: Vec<(ContentEnvironment, String)>,
+}
+
+/// What finding a tab's project concluded.
+enum ProjectFound {
+    /// The tab's project is a Git repository, so it keeps it.
+    Settled(TabId),
+    /// The tab's project becomes `project`, unless it changed from `replaces` meanwhile.
+    Assign {
+        tab: TabId,
+        replaces: Option<Project>,
+        project: Project,
+    },
+}
 
 struct ActorState {
     workspace: StoredWorkspace,
@@ -155,8 +172,11 @@ struct ActorState {
     read_only_error: Option<String>,
     next_ordinal: u64,
     stopping: bool,
-    /// Tabs whose project was asked for in this run, so each is looked up once.
-    projects_asked: HashSet<TabId>,
+    /// The folders each tab's project was last asked for in this run, so a tab is looked
+    /// up again only when they change.
+    projects_asked: HashMap<TabId, Vec<(ContentEnvironment, String)>>,
+    /// Tabs whose project is a Git repository: theirs for good.
+    projects_settled: HashSet<TabId>,
     project_requests: mpsc::Sender<ProjectRequest>,
 }
 
@@ -264,7 +284,7 @@ fn run_actor(
     // Finding a folder's Git top level reads the filesystem, which can be slow (a WSL share,
     // a network drive), so it runs off the actor, which applies what it finds.
     let (project_requests, requested) = mpsc::channel::<ProjectRequest>();
-    let (found_sender, found_projects) = mpsc::channel::<Vec<(TabId, Project)>>();
+    let (found_sender, found_projects) = mpsc::channel::<Vec<ProjectFound>>();
     thread::spawn(move || find_projects(requested, found_sender));
 
     let mut state = ActorState {
@@ -278,10 +298,11 @@ fn run_actor(
         read_only_error: None,
         next_ordinal: 1,
         stopping: false,
-        projects_asked: HashSet::new(),
+        projects_asked: HashMap::new(),
+        projects_settled: HashSet::new(),
         project_requests,
     };
-    // Tabs saved without a project get one from where their first terminal was.
+    // Tabs saved without a project, or outside Git, look for one where their panes are.
     ask_projects(&mut state);
 
     loop {
@@ -570,7 +591,8 @@ fn commit_observed(
     }
 }
 
-/// Asks for the project of every tab without one whose starting folder is now known.
+/// Asks for the project of every tab not settled in a Git repository whose folders are
+/// known and changed since it was last asked.
 fn ask_projects(state: &mut ActorState) {
     for tab in state
         .workspace
@@ -578,23 +600,29 @@ fn ask_projects(state: &mut ActorState) {
         .iter()
         .flat_map(|session| &session.tabs)
     {
-        if tab.project.is_some() || state.projects_asked.contains(&tab.id) {
+        if state.projects_settled.contains(&tab.id)
+            || state.workspace.chosen_projects.contains(&tab.id)
+        {
             continue;
         }
-        if let Some((environment, folder)) = start_folder(&state.workspace, tab) {
-            state.projects_asked.insert(tab.id.clone());
-            let _ = state
-                .project_requests
-                .send((tab.id.clone(), environment, folder));
+        let folders = tab_folders(&state.workspace, tab);
+        if folders.is_empty() || state.projects_asked.get(&tab.id) == Some(&folders) {
+            continue;
         }
+        state.projects_asked.insert(tab.id.clone(), folders.clone());
+        let _ = state.project_requests.send(ProjectRequest {
+            tab: tab.id.clone(),
+            current: tab.project.clone(),
+            folders,
+        });
     }
 }
 
-/// Gives the tabs `found` names the projects found for them, unless they have one: a
-/// tab's project never changes once set.
+/// Applies what was found: settled tabs are not asked again, and a tab whose project is
+/// unchanged since it was asked takes the one found.
 fn assign_projects(
     state: &mut ActorState,
-    found: Vec<(TabId, Project)>,
+    found: Vec<ProjectFound>,
     persist_sender: &SyncSender<PersistJob>,
 ) {
     if state.read_only_error.is_some() {
@@ -602,12 +630,24 @@ fn assign_projects(
     }
     let mut candidate = state.workspace.clone();
     let mut changed = false;
-    for (tab_id, project) in found {
-        if let Some(tab) = find_tab_mut(&mut candidate.sessions, &tab_id)
-            && tab.project.is_none()
-        {
-            tab.project = Some(project);
-            changed = true;
+    for found in found {
+        match found {
+            ProjectFound::Settled(tab_id) => {
+                state.projects_settled.insert(tab_id);
+            }
+            ProjectFound::Assign {
+                tab,
+                replaces,
+                project,
+            } => {
+                if !candidate.chosen_projects.contains(&tab)
+                    && let Some(tab) = find_tab_mut(&mut candidate.sessions, &tab)
+                    && tab.project == replaces
+                {
+                    tab.project = Some(project);
+                    changed = true;
+                }
+            }
         }
     }
     if changed {
@@ -617,17 +657,55 @@ fn assign_projects(
 }
 
 /// Finds the project of each tab asked for, batching the requests that queued meanwhile.
-fn find_projects(requests: Receiver<ProjectRequest>, found: mpsc::Sender<Vec<(TabId, Project)>>) {
+fn find_projects(requests: Receiver<ProjectRequest>, found: mpsc::Sender<Vec<ProjectFound>>) {
     while let Ok(first) = requests.recv() {
         let batch: Vec<_> = std::iter::once(first)
             .chain(requests.try_iter())
-            .filter_map(|(tab_id, environment, folder)| {
-                Some((tab_id, crate::project::project_of(&environment, &folder)?))
-            })
+            .filter_map(find_project)
             .collect();
         if !batch.is_empty() && found.send(batch).is_err() {
             return;
         }
+    }
+}
+
+/// A tab keeps a Git repository once it has one, named as it is named now. Until then it
+/// takes the first repository one of its folders is in, so a shell started in a home
+/// folder joins the repository it enters. A tab without a project, its panes outside
+/// Git, takes its first folder.
+fn find_project(request: ProjectRequest) -> Option<ProjectFound> {
+    let ProjectRequest {
+        tab,
+        current,
+        folders,
+    } = request;
+    let assign = |project: Project, replaces: Option<Project>| {
+        (replaces.as_ref() != Some(&project)).then_some(ProjectFound::Assign {
+            tab: tab.clone(),
+            replaces,
+            project,
+        })
+    };
+    if let Some(project) = &current {
+        // A folder no longer reachable keeps its tab until it is again.
+        let found = crate::project::project_of(&project.environment, &project.root)?;
+        if found.in_git {
+            return assign(found.project, current).or(Some(ProjectFound::Settled(tab.clone())));
+        }
+    }
+    let mut first = None;
+    for (environment, folder) in &folders {
+        let Some(found) = crate::project::project_of(environment, folder) else {
+            continue;
+        };
+        if found.in_git {
+            return assign(found.project, current);
+        }
+        first.get_or_insert(found.project);
+    }
+    match current {
+        None => assign(first?, None),
+        Some(_) => None,
     }
 }
 
@@ -1012,6 +1090,20 @@ fn apply_mutation(
             affected_sessions.push(session_id.clone());
             affected_tabs.push(tab_id);
             affected_panes.push(pane_id);
+            Ok("committed".into())
+        }
+        WorkspaceMutation::SetTabProject { tab_id, project } => {
+            if project
+                .as_ref()
+                .is_some_and(|project| project.root.is_empty())
+            {
+                return Err(invalid("a project needs a folder".into()));
+            }
+            let tab = find_tab_mut(&mut workspace.sessions, tab_id)
+                .ok_or_else(|| invalid(format!("tab {tab_id} was not found")))?;
+            tab.project = project.clone();
+            workspace.chosen_projects.insert(tab_id.clone());
+            affected_tabs.push(tab_id.clone());
             Ok("committed".into())
         }
         WorkspaceMutation::RenameTab { tab_id, label } => {
@@ -1989,58 +2081,75 @@ fn prepare_removal(
     }
 }
 
-/// Where `tab` started, as the environment and folder its project is found from: the
-/// folder of its first pane that has one, which is a files pane's folder, a thread's
-/// folder, or a terminal's first known directory. `None` while that first terminal's
-/// environment or directory is not known yet.
-fn start_folder(
+/// The folders `tab`'s panes show, in reading order, each in its environment, as its
+/// project is found from: a files pane's folder, a thread's folder (a terminal showing
+/// a thread belongs to the thread's), or a terminal's folders, where its shell is now
+/// first. Stops at a terminal whose environment or folder is not known yet, so a tab's
+/// first pane names its project.
+fn tab_folders(
     workspace: &StoredWorkspace,
     tab: &WorkspaceTab,
-) -> Option<(ContentEnvironment, String)> {
+) -> Vec<(ContentEnvironment, String)> {
     let mut leaves = Vec::new();
     collect_leaves(&tab.layout, &mut leaves);
+    let mut folders: Vec<(ContentEnvironment, String)> = Vec::new();
+    let mut add = |environment: &ContentEnvironment, folder: &str| {
+        if !folders
+            .iter()
+            .any(|(known, path)| known == environment && path == folder)
+        {
+            folders.push((environment.clone(), folder.to_owned()));
+        }
+    };
     for leaf in leaves {
         match leaf {
             LayoutNode::Content { content, .. } => match content {
-                PaneContent::Files(folder) => {
-                    return Some((folder.environment.clone(), folder.root.clone()));
-                }
-                PaneContent::Chat(chat) => {
-                    return Some((chat.environment.clone(), chat.folder.clone()));
-                }
+                PaneContent::Files(folder) => add(&folder.environment, &folder.root),
+                PaneContent::Chat(chat) => add(&chat.environment, &chat.folder),
                 PaneContent::Settings(_) | PaneContent::Monitor(_) | PaneContent::Browser(_) => {}
             },
             LayoutNode::Pane {
                 surface_id, view, ..
             } => {
-                // A thread's terminal belongs to the thread's folder.
                 if let Some(PaneView {
                     content: PaneContent::Chat(chat),
                     ..
                 }) = view
                 {
-                    return Some((chat.environment.clone(), chat.folder.clone()));
+                    add(&chat.environment, &chat.folder);
+                    continue;
                 }
-                let surface = workspace
+                let Some(surface) = workspace
                     .surfaces
                     .iter()
-                    .find(|surface| &surface.id == surface_id)?;
-                return terminal_folder(surface, workspace.last_directories.get(surface_id));
+                    .find(|surface| &surface.id == surface_id)
+                else {
+                    break;
+                };
+                let Some((environment, candidates)) =
+                    terminal_folders(surface, workspace.last_directories.get(surface_id))
+                        .filter(|(_, candidates)| candidates.iter().any(Option::is_some))
+                else {
+                    break;
+                };
+                for folder in candidates.into_iter().flatten() {
+                    add(&environment, folder);
+                }
             }
             LayoutNode::Split { .. } => {}
         }
     }
-    None
+    folders
 }
 
-/// The first directory known of a terminal's shell: where it was asked to start, else
-/// the first it reported (`last`, while no other is known). `None` until its environment
-/// is known: the daemon learns whether a Windows shell runs in WSL once it runs, unless
-/// its launch profile says.
-fn terminal_folder(
-    surface: &SurfaceInfo,
-    last: Option<&String>,
-) -> Option<(ContentEnvironment, String)> {
+/// A terminal's environment and the folders its shell is known by: the one it last
+/// reported (`last`), then where it was asked to start. `None` until its environment is
+/// known: the daemon learns whether a Windows shell runs in WSL once it runs, unless its
+/// launch profile says.
+fn terminal_folders<'a>(
+    surface: &'a SurfaceInfo,
+    last: Option<&'a String>,
+) -> Option<(ContentEnvironment, [Option<&'a str>; 4])> {
     if surface.status == SurfaceStatus::Starting
         && !surface.runs_powershell()
         && surface.wsl_distribution().is_none()
@@ -2060,14 +2169,10 @@ fn terminal_folder(
         .and_then(|profile| profile.working_directory.as_deref());
     let last = last.map(String::as_str);
     let candidates = match environment {
-        ContentEnvironment::Host => [launched, profile, last, None],
-        ContentEnvironment::Wsl { .. } => [resolved, launched, profile, last],
+        ContentEnvironment::Host => [last, launched, profile, None],
+        ContentEnvironment::Wsl { .. } => [last, resolved, launched, profile],
     };
-    let folder = candidates
-        .into_iter()
-        .flatten()
-        .find_map(|directory| crate::project::normalized(&environment, directory))?;
-    Some((environment, folder))
+    Some((environment, candidates))
 }
 
 /// A thread's tab label: the last component of its folder, or "Chat" when it has none.
@@ -3212,6 +3317,132 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_outside_git_joins_the_repository_its_shell_enters() {
+        let folder = std::env::temp_dir().join(format!(
+            "compi-tab-joins-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        if folder
+            .ancestors()
+            .any(|ancestor| ancestor.join(".git").exists())
+        {
+            return;
+        }
+        let repo = folder.join("repo");
+        let src = repo.join("src");
+        let home = folder.join("home");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let text = |path: &std::path::Path| path.to_str().unwrap().to_owned();
+        let host = |path: &std::path::Path| Project {
+            environment: ContentEnvironment::Host,
+            root: text(path),
+        };
+
+        let (actor, effects) = WorkspaceActor::memory();
+        let session_id = mutate_current(
+            &actor,
+            "workspace",
+            WorkspaceMutation::CreateSession {
+                label: "Work".into(),
+            },
+        )
+        .unwrap()
+        .affected_sessions[0]
+            .clone();
+        let created = mutate_current(
+            &actor,
+            "create",
+            WorkspaceMutation::CreateTab {
+                session_id: session_id.clone(),
+                label: String::new(),
+                cols: 80,
+                rows: 24,
+                working_directory: Some(text(&home)),
+            },
+        )
+        .unwrap();
+        let tab_id = created.affected_tabs[0].clone();
+        let WorkspaceEffect::Launch(shell, _) = effects.recv().unwrap() else {
+            unreachable!()
+        };
+        actor.observe(RuntimeObservation::Running {
+            surface_id: shell.id.clone(),
+            process_lifetime_id: shell.process_lifetime_id.clone(),
+            working_directory: None,
+            distribution: None,
+        });
+        let tab = &tab_id;
+        let project_is = |expected: Project| {
+            move |workspace: &WorkspaceSnapshot| {
+                tab_project(workspace, tab) == Some(expected.clone())
+            }
+        };
+        let cd = |path: &std::path::Path| {
+            actor.observe(RuntimeObservation::Directory {
+                surface_id: shell.id.clone(),
+                process_lifetime_id: shell.process_lifetime_id.clone(),
+                directory: text(path),
+            })
+        };
+        // Outside Git, the tab's folder stands in until the shell enters a repository.
+        wait_for(&actor, "the home folder", project_is(host(&home)));
+        cd(&src);
+        wait_for(&actor, "the repository", project_is(host(&repo)));
+        // Once in a repository, the tab stays there wherever its shell goes.
+        cd(&home);
+        thread::sleep(Duration::from_millis(100));
+        assert!(project_is(host(&repo))(&actor.snapshot().unwrap()));
+        // A chosen project stays, none included, wherever the shell goes.
+        let other = mutate_current(
+            &actor,
+            "create-other",
+            WorkspaceMutation::CreateTab {
+                session_id,
+                label: String::new(),
+                cols: 80,
+                rows: 24,
+                working_directory: Some(text(&home)),
+            },
+        )
+        .unwrap()
+        .affected_tabs[0]
+            .clone();
+        let WorkspaceEffect::Launch(other_shell, _) = effects.recv().unwrap() else {
+            unreachable!()
+        };
+        actor.observe(RuntimeObservation::Running {
+            surface_id: other_shell.id.clone(),
+            process_lifetime_id: other_shell.process_lifetime_id.clone(),
+            working_directory: None,
+            distribution: None,
+        });
+        wait_for(&actor, "the other tab's home folder", |workspace| {
+            tab_project(workspace, &other) == Some(host(&home))
+        });
+        mutate_current(
+            &actor,
+            "choose",
+            WorkspaceMutation::SetTabProject {
+                tab_id: other.clone(),
+                project: None,
+            },
+        )
+        .unwrap();
+        actor.observe(RuntimeObservation::Directory {
+            surface_id: other_shell.id.clone(),
+            process_lifetime_id: other_shell.process_lifetime_id.clone(),
+            directory: text(&src),
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(tab_project(&actor.snapshot().unwrap(), &other), None);
+        drop(actor);
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
     fn exact_retry_returns_receipt_but_changed_reuse_fails() {
         let (actor, _effects) = WorkspaceActor::memory();
         let mutation = request(
@@ -3997,6 +4228,7 @@ mod tests {
             pending_removals: vec![],
             recovery_message: after.recovery_message.clone(),
             last_directories: Default::default(),
+            chosen_projects: Default::default(),
         };
         let path = std::env::temp_dir().join(format!(
             "compi-detach-{}-{}.json",
@@ -4229,6 +4461,7 @@ mod tests {
             pending_removals: vec![],
             recovery_message: None,
             last_directories: Default::default(),
+            chosen_projects: Default::default(),
         })
         .unwrap();
 
@@ -4560,6 +4793,7 @@ mod tests {
             pending_removals: vec![],
             recovery_message: None,
             last_directories: Default::default(),
+            chosen_projects: Default::default(),
         };
         crate::workspace_store::validate(&stored).unwrap();
     }

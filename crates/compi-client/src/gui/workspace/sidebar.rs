@@ -15,6 +15,11 @@ use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
 use std::collections::HashMap;
 
+mod drag;
+pub(in crate::gui) use drag::CardDrag;
+use drag::CardDrop;
+use gpui::DragMoveEvent;
+
 /// The cards Go to sidebar card 1–9 reach.
 const SHORTCUT_CARDS: usize = 9;
 /// How tall the bottom row's buttons are.
@@ -38,6 +43,10 @@ pub(in crate::gui) struct SidebarUi {
     listing: bool,
     /// The workspace changed since the last listing began.
     listing_due: bool,
+    /// Saved WSL projects were checked for a newer name this run.
+    projects_renamed: bool,
+    /// Where a dragged card would land.
+    drop: Option<CardDrop>,
     /// The workspace label being renamed in place.
     rename: Option<LabelRename>,
     /// The workspace New workspace asked for, until the daemon answers.
@@ -65,6 +74,8 @@ impl SidebarUi {
             threads: Vec::new(),
             listing: false,
             listing_due: true,
+            projects_renamed: false,
+            drop: None,
             rename: None,
             creating: None,
         }
@@ -103,7 +114,8 @@ struct SidebarCard {
     title: String,
     /// The project's name, else the folder's.
     folder: Option<String>,
-    project: Option<Project>,
+    /// The listed project whose section shows it: its saved project, else Home.
+    project: Project,
     /// The agent of the chat in it, rather than a terminal.
     chat: Option<ChatHarness>,
     /// Its chat is a draft: nothing sent yet, so no thread is kept.
@@ -120,12 +132,20 @@ struct SidebarCard {
 impl SidebarCard {
     fn matches(&self, query: &str) -> bool {
         // Its folder's name too, when the project goes by another.
-        let project = self.project.as_ref().map_or("", Project::name);
+        let project = self.project.name();
         matches_query(
             query,
             &[&self.title, self.folder.as_deref().unwrap_or(""), project],
         )
     }
+}
+
+/// Where a card is drawn, for drags: its section's project, the card after it there,
+/// and the drop line it shows (`Some(true)` under it, `Some(false)` over it).
+struct CardPlace {
+    section: Project,
+    next: Option<TabId>,
+    line: Option<bool>,
 }
 
 /// The quiet note at a card's top right: "Draft" for a thread not sent yet, else how
@@ -137,9 +157,9 @@ fn card_note(card: &SidebarCard, now: u64) -> Option<String> {
     card.changed_ms.map(|then| age_label(then, now))
 }
 
-/// A saved project's cards, or Loose tabs.
+/// A listed project's cards.
 struct ProjectSection {
-    project: Option<Project>,
+    project: Project,
     folded: bool,
     cards: Vec<SidebarCard>,
 }
@@ -165,37 +185,32 @@ fn card_order(tabs: &[TabId], pinned: &[TabId]) -> Vec<TabId> {
         .collect()
 }
 
-/// Group tabs by the saved list, preserving that list's order and each tab's order.
-/// Unregistered and archived projects have no section and their tabs remain reachable.
+/// Group cards by the listed projects (`projects`, Home among them), in that list's
+/// order and each card's order. Every listed project has a section, with cards or not;
+/// a card whose project is not listed is in `home`'s.
 fn project_sections(
     projects: Vec<Project>,
+    home: &Project,
     cards: impl IntoIterator<Item = SidebarCard>,
-    folded: impl Fn(Option<&Project>) -> bool,
+    folded: impl Fn(&Project) -> bool,
 ) -> Vec<ProjectSection> {
     let indices: HashMap<_, _> = projects
         .iter()
         .enumerate()
         .map(|(index, project)| (project, index))
         .collect();
-    let mut sections: Vec<_> = (0..=projects.len()).map(|_| Vec::new()).collect();
-    let loose = projects.len();
+    let home = indices.get(home).copied();
+    let mut sections: Vec<_> = projects.iter().map(|_| Vec::new()).collect();
     for card in cards {
-        let index = card
-            .project
-            .as_ref()
-            .and_then(|project| indices.get(project))
-            .copied()
-            .unwrap_or(loose);
-        sections[index].push(card);
+        if let Some(index) = indices.get(&card.project).copied().or(home) {
+            sections[index].push(card);
+        }
     }
     projects
         .into_iter()
-        .map(Some)
-        .chain(std::iter::once(None))
         .zip(sections)
-        .filter(|(project, cards)| project.is_some() || !cards.is_empty())
         .map(|(project, cards)| ProjectSection {
-            folded: folded(project.as_ref()),
+            folded: folded(&project),
             project,
             cards,
         })
@@ -440,6 +455,7 @@ impl CompiApp {
             .map(|listed| listed.project)
             .filter(|project| !self.project_archived(project))
             .collect();
+        let home = self.home_project();
         let selected = self.selected_tab().map(|tab| &tab.id);
         let cards = self
             .workspace
@@ -455,15 +471,16 @@ impl CompiApp {
                     })
             })
             .filter(|card| !searching || card.matches(query));
-        let mut sections = project_sections(projects, cards, |project| {
-            !searching && self.state.project_folded(project)
+        let mut sections = project_sections(projects, &home, cards, |project| {
+            !searching && self.state.project_folded(Some(project))
         });
         if searching {
             sections.retain(|section| {
                 !section.cards.is_empty()
-                    || section.project.as_ref().is_some_and(|project| {
-                        matches_query(query, &[&self.project_name(project), &project.root])
-                    })
+                    || matches_query(
+                        query,
+                        &[&self.project_name(&section.project), &section.project.root],
+                    )
             });
         }
         sections
@@ -493,11 +510,13 @@ impl CompiApp {
                 .unwrap_or_else(|| "New thread".to_owned()),
             None => self.tab_label(tab),
         };
-        let folder = match &tab.project {
-            Some(project) => Some(self.project_name(project)),
-            None => self
-                .tab_folder(tab)
-                .map(|folder| folder_name(&folder).to_owned()),
+        // A saved project's cards name it; Home's name their own folder.
+        let project = self.section_project(tab.project.as_ref());
+        let folder = if self.is_home_project(&project) {
+            self.tab_folder(tab)
+                .map(|folder| folder_name(&folder).to_owned())
+        } else {
+            Some(self.project_name(&project))
         };
         let state = self
             .tab_program_headline(tab)
@@ -509,7 +528,7 @@ impl CompiApp {
             session: session.clone(),
             title,
             folder,
-            project: tab.project.clone(),
+            project,
             chat: chat.map(|chat| chat.harness),
             draft,
             state,
@@ -577,11 +596,8 @@ impl CompiApp {
             .flat_map(|workspace| &workspace.sessions)
             .flat_map(|session| &session.tabs)
             .filter(|tab| {
-                let saved = tab.project.as_ref().filter(|project| {
-                    self.project_settings(project)
-                        .is_some_and(|settings| !settings.archived)
-                });
-                !self.state.project_folded(saved)
+                let project = self.section_project(tab.project.as_ref());
+                !self.state.project_folded(Some(&project))
             })
             .take(SHORTCUT_CARDS)
             .count()
@@ -822,6 +838,67 @@ impl CompiApp {
         .detach();
     }
 
+    /// Once a run, saved WSL projects take the name the daemon gives their folder now:
+    /// a folder behind a link to a Windows drive (`~/proj/x` → `/mnt/c/…/x`) is named by
+    /// the drive, so the project kept under the link's name follows, settings and all,
+    /// and finds its tabs again. A folder already kept under another name stays as is.
+    pub(super) fn rename_linked_projects(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar.projects_renamed || self.connection_error.is_some() {
+            return;
+        }
+        self.sidebar.projects_renamed = true;
+        let linked: Vec<Project> = self
+            .listed_projects()
+            .into_iter()
+            .map(|listed| listed.project)
+            .filter(|project| {
+                matches!(
+                    project.environment,
+                    compi_protocol::ContentEnvironment::Wsl { .. }
+                ) && !project.root.starts_with("/mnt/")
+            })
+            .collect();
+        if linked.is_empty() {
+            return;
+        }
+        let target = self.target.clone();
+        cx.spawn(async move |this, cx| {
+            let renamed = cx
+                .background_executor()
+                .spawn(async move {
+                    let Ok(mut client) = target.connect() else {
+                        return Vec::new();
+                    };
+                    linked
+                        .into_iter()
+                        .filter_map(|old| {
+                            let new = client
+                                .resolve_project_folder(old.environment.clone(), old.root.clone())
+                                .ok()?;
+                            (new != old).then_some((old, new))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                for (old, new) in renamed {
+                    if this.config.kept_project(&new).is_some() {
+                        continue;
+                    }
+                    let Some(settings) = this.project_settings(&old).cloned() else {
+                        continue;
+                    };
+                    if this.persist_project_settings(&new, settings, cx) {
+                        this.persist_project_settings(&old, Default::default(), cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// The sidebar's search, or a workspace label renamed in place, has the keyboard.
     pub(super) fn sidebar_has_keyboard(&self, window: &Window, cx: &App) -> bool {
         self.sidebar_open
@@ -901,12 +978,10 @@ impl CompiApp {
                 if let Some(tab) = tab {
                     self.clear_sidebar_search(window, cx);
                     self.open_card(tab, window, cx);
-                } else if searching
-                    && sections.len() == 1
-                    && let Some(project) = &sections[0].project
-                {
+                } else if searching && sections.len() == 1 {
+                    let project = sections[0].project.clone();
                     self.clear_sidebar_search(window, cx);
-                    self.open_project_settings(project, window, cx);
+                    self.open_project_settings(&project, window, cx);
                 }
                 true
             }
@@ -1101,14 +1176,14 @@ impl CompiApp {
         self.open_menu(position, Anchor::TopLeft, entries, window, cx);
     }
 
-    /// New terminal here: a new tab of workspace `session` whose shell starts at the
-    /// project's root, in the project's WSL distribution for a WSL project.
+    /// A new terminal tab of workspace `session` whose shell starts at `project`'s
+    /// folder: in the project's WSL distribution for a WSL project, else with the shell
+    /// Settings → General picks (WSL reaches a Windows folder by its drive).
     pub(super) fn new_project_terminal(&mut self, session: SessionId, project: &Project) {
         use compi_protocol::{ContentEnvironment, WindowsShell};
-        let windows_shell = match &project.environment {
-            ContentEnvironment::Wsl { .. } => Some(WindowsShell::Wsl),
-            host if self.windows_paths(host) => Some(WindowsShell::PowerShell),
-            _ => None,
+        let distribution = match &project.environment {
+            ContentEnvironment::Wsl { distribution } => Some(distribution.clone()),
+            ContentEnvironment::Host => None,
         };
         self.mutate_with_launch(
             WorkspaceMutation::CreateTab {
@@ -1120,17 +1195,15 @@ impl CompiApp {
             },
             true,
             |launch| {
-                if let Some(shell) = windows_shell {
+                if let Some(distribution) = distribution {
                     let profile = &mut launch.profile;
-                    if profile.windows_shell.for_directory(Some(&project.root)) != shell {
+                    if profile.windows_shell.for_directory(Some(&project.root)) != WindowsShell::Wsl
+                    {
                         profile.executable = None;
                         profile.args.clear();
                     }
-                    profile.windows_shell = shell;
-                    profile.distribution = match &project.environment {
-                        ContentEnvironment::Wsl { distribution } => Some(distribution.clone()),
-                        ContentEnvironment::Host => None,
-                    };
+                    profile.windows_shell = WindowsShell::Wsl;
+                    profile.distribution = Some(distribution);
                 }
             },
         );
@@ -1202,6 +1275,15 @@ impl CompiApp {
                             .pb_2()
                             .overflow_y_scroll()
                             .track_scroll(&self.sidebar.scroll)
+                            .on_drag_move(cx.listener(
+                                |this, event: &DragMoveEvent<CardDrag>, _, cx| {
+                                    this.leave_card_drop(event, cx);
+                                },
+                            ))
+                            .on_drop(cx.listener(|this, drag: &CardDrag, _, cx| {
+                                this.drop_card(drag, cx);
+                                cx.stop_propagation();
+                            }))
                             .children(self.render_sidebar_rows(cx)),
                     )
                     .children(self.render_whats_new_card(cx))
@@ -1504,7 +1586,7 @@ impl CompiApp {
         }
         let mut row = 0;
         for section in self.sidebar_sections() {
-            if section.project.as_ref() == Some(project) {
+            if section.project == *project {
                 let scroll = self.sidebar.scroll.clone();
                 window.on_next_frame(move |_, _| scroll.scroll_to_item(row));
                 break;
@@ -1539,17 +1621,37 @@ impl CompiApp {
                     .into_any_element(),
             );
         }
+        let drop = self.card_drop(cx).cloned();
         for section in sections {
+            let target = drop.as_ref().filter(|drop| drop.project == section.project);
             rows.push(
-                self.render_project_header(rows.len(), &section, cx)
-                    .into_any_element(),
+                self.render_project_header(
+                    rows.len(),
+                    &section,
+                    target.is_some_and(|drop| drop.joins),
+                    cx,
+                )
+                .into_any_element(),
             );
             if section.folded {
                 continue;
             }
-            for card in section.cards {
+            let order: Vec<TabId> = section.cards.iter().map(|card| card.tab.clone()).collect();
+            for (index, card) in section.cards.into_iter().enumerate() {
                 let highlighted = self.sidebar.highlight == Some(shown);
-                rows.push(self.render_card(shown, card, highlighted, now, cx));
+                let next = order.get(index + 1).cloned();
+                // The line sits on the card a drop lands before, or under the last one.
+                let line = target.and_then(|drop| match &drop.before {
+                    Some(before) if *before == card.tab => Some(false),
+                    None if next.is_none() => Some(true),
+                    _ => None,
+                });
+                let place = CardPlace {
+                    section: section.project.clone(),
+                    next,
+                    line,
+                };
+                rows.push(self.render_card(shown, card, highlighted, place, now, cx));
                 shown += 1;
             }
         }
@@ -1599,26 +1701,24 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// A saved project (even before a tab is open), or the Loose tabs section.
+    /// A saved project (even before a tab is open), or the Loose tabs section. While a
+    /// card from another section is dragged over it, `drop_target` lights it.
     fn render_project_header(
         &self,
         row: usize,
         section: &ProjectSection,
+        drop_target: bool,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let colors = *self.colors();
         let muted = modal_text_color(colors.muted, &colors);
-        let icon = section
-            .project
-            .as_ref()
-            .map(|project| self.project_icon(Some(project), 16.0));
-        let name = section.project.as_ref().map_or_else(
-            || "Loose tabs".to_owned(),
-            |project| self.project_name(project),
+        let icon = self.project_icon(Some(&section.project), 16.0);
+        let name = self.project_name(&section.project);
+        let tooltip = controls::tooltip(
+            name.clone(),
+            Some(section.project.root.clone().into()),
+            None,
         );
-        let tooltip = section.project.as_ref().map(|project| {
-            controls::tooltip(name.clone(), Some(project.root.clone().into()), None)
-        });
         let dot = section.state().filter(|_| section.folded).map(|state| {
             div()
                 .id(("sidebar-project-status", row))
@@ -1634,6 +1734,7 @@ impl CompiApp {
         });
         let fold_project = section.project.clone();
         let menu_project = section.project.clone();
+        let drop_project = section.project.clone();
         div()
             .id(("sidebar-project", row))
             .mx_2()
@@ -1655,25 +1756,34 @@ impl CompiApp {
                 header
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_project_fold(fold_project.as_ref());
+                        this.toggle_project_fold(Some(&fold_project));
                         cx.notify();
                     }))
             })
             .hover(move |style| style.bg(color(blend_rgb(colors.surface, colors.foreground, 0.05))))
-            .when_some(menu_project, |header, project| {
-                header.on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        this.open_project_menu(project.clone(), event.position, window, cx);
-                        cx.stop_propagation();
-                    }),
-                )
+            .when(drop_target, |header| {
+                header
+                    .bg(color(colors.accent).opacity(0.16))
+                    .border_1()
+                    .border_color(color(colors.accent).opacity(0.6))
             })
-            .when_some(
-                tooltip.filter(|_| self.context_menu.is_none()),
-                |header, tooltip| header.tooltip(tooltip),
+            // A card dropped on the heading joins the section at its end.
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<CardDrag>, _, cx| {
+                    this.hover_card_drop(event, drop_project.clone(), None, cx);
+                }),
             )
-            .children(icon)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.open_project_menu(menu_project.clone(), event.position, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .when(self.context_menu.is_none(), |header| {
+                header.tooltip(tooltip)
+            })
+            .child(icon)
             .child(
                 div()
                     .flex_1()
@@ -1704,20 +1814,19 @@ impl CompiApp {
                     color(muted),
                 ))
             })
-            .when_some(section.project.clone(), |header, project| {
-                header.child(
-                    controls::icon_button(
-                        ("sidebar-project-actions", row),
-                        IconName::Ellipsis,
-                        "Project actions",
-                    )
-                    .on_click(cx.listener(
-                        move |this, event: &ClickEvent, window, cx| {
-                            this.open_project_menu(project.clone(), event.position(), window, cx);
-                            cx.stop_propagation();
-                        },
-                    )),
+            .child({
+                let project = section.project.clone();
+                controls::icon_button(
+                    ("sidebar-project-actions", row),
+                    IconName::Ellipsis,
+                    "Project actions",
                 )
+                .on_click(cx.listener(
+                    move |this, event: &ClickEvent, window, cx| {
+                        this.open_project_menu(project.clone(), event.position(), window, cx);
+                        cx.stop_propagation();
+                    },
+                ))
             })
     }
 
@@ -1726,6 +1835,7 @@ impl CompiApp {
         index: usize,
         card: SidebarCard,
         highlighted: bool,
+        place: CardPlace,
         now: u64,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -1733,6 +1843,13 @@ impl CompiApp {
         let muted = color(modal_text_color(colors.muted, &colors));
         let (open, rename) = (card.tab.clone(), card.tab.clone());
         let (menu_tab, menu_session) = (card.tab.clone(), card.session.clone());
+        let dragged = self.card_drag(&card);
+        let CardPlace {
+            section,
+            next,
+            line,
+        } = place;
+        let this_card = card.tab.clone();
         let kind = if let Some(harness) = card.chat {
             img(super::chat::harness_mark(harness))
                 .flex_none()
@@ -1755,9 +1872,11 @@ impl CompiApp {
                 ))
         });
         let mut detail = Vec::new();
-        if let Some(project) = &card.project {
-            detail.push(format!("{} · {}", self.project_name(project), project.root));
-        }
+        detail.push(format!(
+            "{} · {}",
+            self.project_name(&card.project),
+            card.project.root
+        ));
         if card.pinned {
             detail.push("Pinned".to_owned());
         }
@@ -1780,6 +1899,7 @@ impl CompiApp {
         };
         div()
             .id(("sidebar-card", index))
+            .relative()
             .mx_2()
             .mb_0p5()
             .px_2p5()
@@ -1819,6 +1939,21 @@ impl CompiApp {
                     cx.stop_propagation();
                 }),
             )
+            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+            // Over its upper half a card lands before this one, over its lower half
+            // before the next.
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<CardDrag>, _, cx| {
+                    let lower = event.event.position.y > event.bounds.center().y;
+                    let before = if lower {
+                        next.clone()
+                    } else {
+                        Some(this_card.clone())
+                    };
+                    this.hover_card_drop(event, section.clone(), before, cx);
+                }),
+            )
+            .children(line.map(|bottom| self.card_drop_line(bottom)))
             .when_some(tooltip, |card, tooltip| card.tooltip(tooltip))
             .child(
                 div()
@@ -1898,13 +2033,18 @@ mod tests {
         }
     }
 
-    fn tab_card(id: &str, project: Option<&Project>) -> SidebarCard {
+    /// Home, in these tests.
+    fn home() -> Project {
+        project("/home/me")
+    }
+
+    fn tab_card(id: &str, project: &Project) -> SidebarCard {
         SidebarCard {
             tab: TabId::from(id),
             session: SessionId::new("s"),
             title: String::new(),
             folder: None,
-            project: project.cloned(),
+            project: project.clone(),
             chat: None,
             draft: false,
             state: None,
@@ -1921,7 +2061,7 @@ mod tests {
         let mut card = SidebarCard {
             chat: Some(ChatHarness::Omp),
             changed_ms: Some(now - 2 * 3_600_000),
-            ..tab_card("t1", None)
+            ..tab_card("t1", &home())
         };
         assert_eq!(card_note(&card, now).as_deref(), Some("2h"));
         card.draft = true;
@@ -2067,35 +2207,33 @@ mod tests {
         assert!(matches_query("fix site", &fields));
         assert!(matches_query("comp", &fields));
         assert!(!matches_query("fix deploy", &fields));
-        let mut card = tab_card("a", None);
+        let mut card = tab_card("a", &home());
         card.title = "Release Notes".into();
         card.folder = Some("docs".into());
         assert!(card.matches("release"));
         assert!(card.matches("notes docs"));
         assert!(!card.matches("compi"));
-        card.project = Some(project("/work/compi"));
+        card.project = project("/work/compi");
         assert!(card.matches("compi"));
     }
 
     #[test]
-    fn saved_projects_without_tabs_stay_visible_and_unknown_tabs_are_loose() {
+    fn saved_projects_without_tabs_stay_visible_and_unknown_tabs_are_in_home() {
         let empty = project("/work/compi");
         let saved = project("/work/site");
         let unsaved = project("/work/other");
         let sections = project_sections(
-            vec![empty.clone(), saved.clone()],
+            vec![empty.clone(), saved.clone(), home()],
+            &home(),
             [
-                tab_card("home", None),
-                tab_card("site", Some(&saved)),
-                tab_card("other", Some(&unsaved)),
+                tab_card("home", &home()),
+                tab_card("site", &saved),
+                tab_card("other", &unsaved),
             ],
             |_| false,
         );
-        let headers: Vec<_> = sections
-            .iter()
-            .map(|section| section.project.as_ref())
-            .collect();
-        assert_eq!(headers, [Some(&empty), Some(&saved), None]);
+        let headers: Vec<_> = sections.iter().map(|section| &section.project).collect();
+        assert_eq!(headers, [&empty, &saved, &home()]);
         assert!(sections[0].cards.is_empty());
         assert_eq!(
             targets(sections[2].cards.iter()),
@@ -2113,9 +2251,10 @@ mod tests {
     fn folded_project_cards_are_skipped_by_sidebar_shortcuts() {
         let compi = project("/work/compi");
         let sections = project_sections(
-            vec![compi.clone()],
-            [tab_card("a", Some(&compi)), tab_card("b", None)],
-            |project| project == Some(&compi),
+            vec![compi.clone(), home()],
+            &home(),
+            [tab_card("a", &compi), tab_card("b", &home())],
+            |project| *project == compi,
         );
         assert_eq!(targets(shown_cards(&sections)), tab_targets(&["b"]));
         assert_eq!(card_row(&sections, 0), Some(2));
@@ -2125,15 +2264,15 @@ mod tests {
     #[test]
     fn a_folded_project_header_shows_its_most_urgent_card() {
         let mut cards = vec![
-            tab_card("a", None),
-            tab_card("b", None),
-            tab_card("c", None),
+            tab_card("a", &home()),
+            tab_card("b", &home()),
+            tab_card("c", &home()),
         ];
         cards[0].state = Some(ProgramState::Done);
         cards[1].state = Some(ProgramState::Error);
         cards[2].state = Some(ProgramState::Working);
         let mut section = ProjectSection {
-            project: None,
+            project: home(),
             folded: true,
             cards,
         };

@@ -198,8 +198,9 @@ impl CompiApp {
         })
     }
 
-    /// `project`'s icon, `size` px square: the one you chose for it, else its
-    /// automatic one (`automatic_project_icon`); for no project, the folder glyph.
+    /// `project`'s icon, `size` px square: the one you chose for it, else a house for
+    /// Home, else its automatic one (`automatic_project_icon`); for no project, the
+    /// folder glyph.
     pub(super) fn project_icon(&self, project: Option<&Project>, size: f32) -> gpui::AnyElement {
         let Some(project) = project else {
             return self.folder_glyph(size);
@@ -210,6 +211,17 @@ impl CompiApp {
             && let Some(icon) = self.chosen_icon(icon, size, self.letter_icon(project, size))
         {
             return icon;
+        }
+        if self.is_home_project(project)
+            && let Some(house) = lucide_icons::path("house")
+        {
+            let tint = modal_text_color(self.theme.colors().muted, self.theme.colors());
+            return gpui::svg()
+                .flex_none()
+                .size(px(size))
+                .path(house)
+                .text_color(rgb(tint))
+                .into_any_element();
         }
         self.automatic_project_icon(project, size)
     }

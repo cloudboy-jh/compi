@@ -588,6 +588,9 @@ fn restore_native_window_geometry(
     }
 }
 
+/// A workspace change made from the workspace as the daemon has it when it is sent.
+pub(super) type Step = Box<dyn FnOnce(&WorkspaceSnapshot) -> Option<WorkspaceMutation> + Send>;
+
 pub(super) struct DividerDrag {
     revision: u64,
     index: usize,
@@ -1104,6 +1107,7 @@ impl CompiApp {
                         this.poll_browser_home(cx);
                         this.poll_dev_servers(cx);
                         this.list_sidebar_threads(cx);
+                        this.rename_linked_projects(cx);
                         this.expire_toasts(cx);
                         let now = Instant::now();
                         let mut scroll_expired = false;
@@ -1287,7 +1291,16 @@ impl CompiApp {
                 .as_ref()
                 .is_some_and(|workspace| workspace.initialized)
         {
-            let working_directory = this.initial_working_directory.take();
+            // The very first tab opens where you asked, else in the project used last.
+            let working_directory = this.initial_working_directory.take().or_else(|| {
+                this.state
+                    .last_project
+                    .as_ref()
+                    .filter(|project| {
+                        project.environment == compi_protocol::ContentEnvironment::Host
+                    })
+                    .map(|project| project.root.clone())
+            });
             this.mutate(
                 WorkspaceMutation::Initialize {
                     cols: this.terminal_cols,
@@ -1876,30 +1889,63 @@ impl CompiApp {
         Err("Workspace kept changing while committing the divider".into())
     }
 
-    /// A terminal tab in the focused terminal's folder.
-    fn create_terminal_tab(&mut self) {
-        self.create_terminal(inherited_working_directory(
-            self.focused_view().and_then(|view| view.mirror.snapshot()),
-        ));
+    /// The project new tabs and threads start in: the selected tab's, else the one used
+    /// last, else Home.
+    pub(super) fn new_tab_project(&self) -> compi_protocol::Project {
+        let project = self
+            .selected_tab()
+            .map(|tab| tab.project.as_ref())
+            .unwrap_or(self.state.last_project.as_ref());
+        self.section_project(project)
     }
 
-    /// A new thread draft with `harness` in a tab of its own, in the focused pane's
-    /// folder. With no folder to start it in (nothing focused), a terminal tab instead.
-    pub(super) fn create_thread_tab(&mut self, harness: compi_protocol::chat::ChatHarness) {
-        let (Some(session_id), Ok((environment, folder))) =
-            (self.state.selected_session.clone(), self.chat_scope())
-        else {
-            self.create_terminal_tab();
+    /// The focused pane's folder (a chat's, shown on a terminal too, a shell's, or a
+    /// files pane's) while it lies in `project`; any folder for Home.
+    fn focused_folder_in(
+        &self,
+        project: &compi_protocol::Project,
+    ) -> Option<compi_protocol::Project> {
+        let (environment, root) = match self.focused_pane_content() {
+            Some(compi_protocol::PaneContent::Chat(chat)) => {
+                (chat.environment.clone(), chat.folder.clone())
+            }
+            _ => self.chat_scope().ok()?,
+        };
+        let folder = compi_protocol::Project { environment, root };
+        (self.is_home_project(project) || crate::config::folder_in_project(project, &folder))
+            .then_some(folder)
+    }
+
+    /// A terminal tab in the selected tab's project: in the focused pane's folder while
+    /// it lies there, else at the project's folder.
+    fn create_terminal_tab(&mut self) {
+        let Some(session) = self.state.selected_session.clone() else {
+            self.create_terminal(None);
             return;
         };
+        let project = self.new_tab_project();
+        let place = self.focused_folder_in(&project).unwrap_or(project);
+        self.new_project_terminal(session, &place);
+    }
+
+    /// A new thread draft with `harness` in a tab of its own, in the selected tab's
+    /// project: in the focused pane's folder while it lies there, else at the project's
+    /// folder.
+    pub(super) fn create_thread_tab(&mut self, harness: compi_protocol::chat::ChatHarness) {
+        let Some(session_id) = self.state.selected_session.clone() else {
+            self.create_terminal(None);
+            return;
+        };
+        let project = self.new_tab_project();
+        let place = self.focused_folder_in(&project).unwrap_or(project);
         self.mutate(
             WorkspaceMutation::CreateContentTab {
                 session_id,
                 label: String::new(),
                 content: compi_protocol::PaneContent::Chat(crate::chat::new_chat(
                     harness,
-                    environment,
-                    folder,
+                    place.environment,
+                    place.root,
                 )),
             },
             true,
@@ -1927,6 +1973,53 @@ impl CompiApp {
             },
             true,
         );
+    }
+
+    /// Sends `steps` one after another off the UI thread, each made from the workspace
+    /// as the daemon has it then; a step with nothing left to change is skipped.
+    pub(super) fn submit_steps(&mut self, steps: Vec<Step>) {
+        if steps.is_empty() || self.update_quiesced.load(Ordering::Acquire) {
+            return;
+        }
+        if self.mutation_pending {
+            self.global_error = Some("A workspace change is still pending".into());
+            return;
+        }
+        self.mutation_pending = true;
+        let sender = self.event_tx.clone();
+        let target = self.target.clone();
+        thread::spawn(move || {
+            let result = (|| -> crate::Result<_> {
+                let mut client = target.connect()?;
+                let mut receipt = None;
+                for step in steps {
+                    let workspace = client.workspace()?;
+                    let Some(operation) = step(&workspace) else {
+                        continue;
+                    };
+                    receipt = Some(client.submit_mutation(MutationRequest {
+                        server_id: workspace.server_id.clone(),
+                        expected_generation: workspace.server_generation.clone(),
+                        expected_revision: workspace.revision,
+                        mutation_id: MutationId::new(format!(
+                            "gui-{}-{:x}-{}",
+                            std::process::id(),
+                            *MUTATION_RUN_NONCE,
+                            NEXT_MUTATION_ID.fetch_add(1, Ordering::Relaxed)
+                        )),
+                        operation,
+                        launch: None,
+                    })?);
+                }
+                let receipt = receipt.ok_or("the workspace changed before the change was sent")?;
+                Ok((client.workspace()?, receipt))
+            })()
+            .map_err(|error| error.to_string());
+            sender.send(UiEvent::MutationFinished {
+                result,
+                select_created: false,
+            });
+        });
     }
 
     /// Opens `pending_open` once the workspace is there and no change is in flight: a
@@ -2994,6 +3087,10 @@ impl CompiApp {
                 self.state.select_tab(workspace, &id);
             }
         }
+        // A tab whose project is not known yet leaves the one used last.
+        if let Some(project) = self.tab_by_id(&id).and_then(|tab| tab.project.clone()) {
+            self.state.last_project = Some(self.section_project(Some(&project)));
+        }
         self.unfold_for(&id);
         self.workspace_scroll.set_offset(point(px(0.0), px(0.0)));
         self.sync_visible_views();
@@ -3662,7 +3759,7 @@ impl CompiApp {
         self.set_new_tab(new_tab, cx);
         self.dismiss_overlay();
         if new_tab == crate::config::NewTab::Chat {
-            self.create_thread_tab(self.new_thread_agent(self.selected_project()));
+            self.create_thread_tab(self.new_tab_agent());
         }
         cx.notify();
     }
@@ -3710,6 +3807,10 @@ impl CompiApp {
             return true;
         }
         if key.key == "escape" && self.cancel_pane_drag() {
+            cx.notify();
+            return true;
+        }
+        if key.key == "escape" && self.cancel_card_drag(window, cx) {
             cx.notify();
             return true;
         }
@@ -3984,15 +4085,11 @@ impl CompiApp {
                 }
             }
             Command::NewTab => match self.config.new_tab.unwrap_or_default() {
-                crate::config::NewTab::Chat => {
-                    self.create_thread_tab(self.new_thread_agent(self.selected_project()))
-                }
+                crate::config::NewTab::Chat => self.create_thread_tab(self.new_tab_agent()),
                 crate::config::NewTab::Terminal => self.create_terminal_tab(),
             },
             Command::NewTerminalTab => self.create_terminal_tab(),
-            Command::NewThreadTab => {
-                self.create_thread_tab(self.new_thread_agent(self.selected_project()))
-            }
+            Command::NewThreadTab => self.create_thread_tab(self.new_tab_agent()),
             Command::SwitchTab => self.open_overlay(Overlay::Tabs { hidden_only: false }, ""),
             Command::RestoreHiddenTab => self.open_overlay(Overlay::Tabs { hidden_only: true }, ""),
             Command::PreviousTab | Command::NextTab => {
@@ -4403,7 +4500,7 @@ impl CompiApp {
             Command::OpenMonitor => self.open_monitor(window, cx),
             Command::OpenBrowser => self.open_browser(compi_protocol::BrowserContent::BLANK.into()),
             Command::OpenChat => {
-                self.open_chat(self.new_thread_agent(self.selected_project()), window, cx);
+                self.open_chat(self.new_tab_agent(), window, cx);
             }
             Command::OpenChatWith(agent) => {
                 self.open_chat(agent, window, cx);
@@ -6464,6 +6561,11 @@ impl CompiApp {
             .min_w_0()
             .h_full()
             .relative()
+            // A sidebar card dropped here joins the shown tab, on the right.
+            .group("card-drop")
+            .on_drop(cx.listener(|this, drag: &sidebar::CardDrag, _, cx| {
+                this.drop_card_on_panes(drag, cx);
+            }))
             .overflow_hidden()
             .child(
                 div()
@@ -6503,6 +6605,20 @@ impl CompiApp {
                             .when(!self.motion.landing(), |canvas| canvas.children(dividers))
                             .children(self.render_drop_preview(layout)),
                     ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(PANE_RADIUS))
+                    .group_drag_over::<sidebar::CardDrag>("card-drop", move |style| {
+                        style
+                            .border_2()
+                            .border_color(color(colors.accent))
+                            .bg(color(colors.accent).opacity(0.08))
+                    })
+                    // Drag styles apply only to elements with a hitbox.
+                    .drag_over::<sidebar::CardDrag>(|style, _, _, _| style),
             )
             .when(layout.canvas.width > layout.viewport.width, |pane| {
                 pane.child(self.render_workspace_scrollbar(true, cx))

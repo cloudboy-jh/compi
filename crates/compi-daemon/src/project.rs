@@ -79,27 +79,35 @@ const SKIPPED_FOLDERS: [&str; 3] = [".git", "node_modules", "target"];
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_RESULTS: usize = 100;
 
-type RootCache = HashMap<(ContentEnvironment, String), (Instant, Option<Project>)>;
+/// A folder's project, and whether that project is a Git work tree rather than the folder
+/// standing alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FolderProject {
+    pub project: Project,
+    pub in_git: bool,
+}
+
+type RootCache = HashMap<(ContentEnvironment, String), (Instant, Option<FolderProject>)>;
 static ROOTS: LazyLock<Mutex<RootCache>> = LazyLock::new(Mutex::default);
 
 /// The project `folder`, an absolute folder of `environment`, belongs to: the nearest of
 /// it and its ancestors holding `.git` (a repository's folder, or the file of a worktree or
 /// submodule), else the folder itself. `None` when `folder` is not an absolute folder this
 /// host can reach there. Answers are remembered for a minute.
-pub(crate) fn project_of(environment: &ContentEnvironment, folder: &str) -> Option<Project> {
+pub(crate) fn project_of(environment: &ContentEnvironment, folder: &str) -> Option<FolderProject> {
     let folder = normalized(environment, folder)?;
     let key = (environment.clone(), folder);
-    if let Some((at, project)) = ROOTS.lock().get(&key)
+    if let Some((at, found)) = ROOTS.lock().get(&key)
         && at.elapsed() < ROOT_TTL
     {
-        return project.clone();
+        return found.clone();
     }
-    let project = find_project(environment, &key.1);
-    remember_project(key, project.clone());
-    project
+    let found = find_project(environment, &key.1);
+    remember_project(key, found.clone());
+    found
 }
 
-fn remember_project(key: (ContentEnvironment, String), project: Option<Project>) {
+fn remember_project(key: (ContentEnvironment, String), found: Option<FolderProject>) {
     let mut cache = ROOTS.lock();
     if cache.len() >= MAX_CACHED {
         cache.retain(|_, (at, _)| at.elapsed() < ROOT_TTL);
@@ -107,10 +115,10 @@ fn remember_project(key: (ContentEnvironment, String), project: Option<Project>)
             cache.clear();
         }
     }
-    cache.insert(key, (Instant::now(), project));
+    cache.insert(key, (Instant::now(), found));
 }
 
-fn find_project(environment: &ContentEnvironment, folder: &str) -> Option<Project> {
+fn find_project(environment: &ContentEnvironment, folder: &str) -> Option<FolderProject> {
     let host = share_root(environment, folder);
     if host.is_none() {
         // The Windows file provider cannot represent every valid Linux path.
@@ -126,8 +134,9 @@ pub(crate) fn resolve_folder(
 ) -> Result<Project, Failure> {
     let folder = absolute_folder(environment, folder)?;
     checkout::validate_folder(environment, &folder)?;
-    let project = root_of(environment, &folder, share_root(environment, &folder));
-    remember_project((environment.clone(), folder), Some(project.clone()));
+    let found = root_of(environment, &folder, share_root(environment, &folder));
+    let project = found.project.clone();
+    remember_project((environment.clone(), folder), Some(found));
     Ok(project)
 }
 
@@ -142,7 +151,10 @@ pub(crate) fn clone_repository(
     let project = Project { environment, root };
     remember_project(
         (project.environment.clone(), project.root.clone()),
-        Some(project.clone()),
+        Some(FolderProject {
+            project: project.clone(),
+            in_git: true,
+        }),
     );
     Ok(project)
 }
@@ -156,55 +168,69 @@ fn absolute_folder(environment: &ContentEnvironment, folder: &str) -> Result<Str
     })
 }
 
-fn root_of(environment: &ContentEnvironment, folder: &str, host: Option<Root>) -> Project {
+fn root_of(environment: &ContentEnvironment, folder: &str, host: Option<Root>) -> FolderProject {
     let walked = host.and_then(|root| {
         root.host
             .ancestors()
             .position(|ancestor| ancestor.join(".git").symlink_metadata().is_ok())
     });
-    let root = decide_root(environment, folder, walked, || match environment {
+    let (root, in_git) = decide_root(environment, folder, walked, || match environment {
         ContentEnvironment::Host => None,
         ContentEnvironment::Wsl { .. } => {
             crate::git::work_tree_of(environment, folder).ok().flatten()
         }
     });
-    Project {
-        environment: environment.clone(),
-        root,
+    FolderProject {
+        project: Project {
+            environment: environment.clone(),
+            root,
+        },
+        in_git,
     }
 }
 
-/// The project root of `folder`: its ancestor `walked` components up when a walk found
-/// `.git` there. Else, in WSL, where Git in the distribution places it, since the walk
-/// through the WSL share cannot follow a link out of the distribution (into a drive mount);
-/// `ask_git` gives Git's top level and `folder`'s path below it, `None` outside a work
-/// tree. Else the folder itself.
+/// The project root of `folder`, and whether it is a Git work tree: its ancestor `walked`
+/// components up when a walk found `.git` there. Else, in WSL, where Git in the
+/// distribution places it, since the walk through the WSL share cannot follow a link out
+/// of the distribution (into a drive mount); `ask_git` gives Git's top level and
+/// `folder`'s path below it, `None` outside a work tree. Else the folder itself.
 fn decide_root(
     environment: &ContentEnvironment,
     folder: &str,
     walked: Option<usize>,
     ask_git: impl FnOnce() -> Option<(String, String)>,
-) -> String {
+) -> (String, bool) {
     if let Some(depth) = walked {
-        return ancestor(environment, folder, depth);
+        return (ancestor(environment, folder, depth), true);
     }
     match ask_git() {
-        Some((top, prefix)) => git_root(environment, folder, &top, &prefix),
-        None => folder.to_owned(),
+        Some((top, prefix)) => (git_root(environment, folder, &top, &prefix), true),
+        None => (folder.to_owned(), false),
     }
 }
 
 /// The top level Git reports for `folder`, named as `folder` names it: `folder` without the
 /// components of `prefix`, its path below the top level (`a/b/`), when it ends with them.
-/// Else `top` as Git gives it, with links resolved.
+/// Else, and always for a top level on a drive mount (`/mnt/c/...`), `top` as Git gives
+/// it, with links resolved: a Windows folder keeps the one name that matches it as
+/// Windows names it.
 fn git_root(environment: &ContentEnvironment, folder: &str, top: &str, prefix: &str) -> String {
     let below: Vec<&str> = prefix.split('/').filter(|part| !part.is_empty()).collect();
     let segments: Vec<&str> = folder.split('/').filter(|part| !part.is_empty()).collect();
-    if segments.ends_with(&below) {
+    if segments.ends_with(&below) && !drive_mount(top) {
         ancestor(environment, folder, below.len())
     } else {
         top.to_owned()
     }
+}
+
+/// Whether `folder`, a Linux folder, lies on a Windows drive WSL mounts (`/mnt/c`).
+fn drive_mount(folder: &str) -> bool {
+    let Some(rest) = folder.strip_prefix("/mnt/") else {
+        return false;
+    };
+    let mount = rest.split('/').next().unwrap_or("");
+    mount.len() == 1 && mount.as_bytes()[0].is_ascii_alphabetic()
 }
 
 /// `folder` without its last `depth` components, in `environment`'s syntax.
@@ -899,10 +925,11 @@ mod tests {
         folder.write("worktree/.git", b"gitdir: /elsewhere/.git/worktrees/x\n");
         let inside = folder.dir("worktree/crates");
         let host = ContentEnvironment::Host;
-        let root = |path: &str| project_of(&host, path).unwrap().root;
+        let root = |path: &str| project_of(&host, path).unwrap().project.root;
         assert_eq!(root(&deep), repo);
         assert_eq!(root(&repo), repo);
         assert_eq!(root(&inside), worktree);
+        assert!(project_of(&host, &deep).unwrap().in_git);
         // Outside any repository the folder is its own project, unless the temporary
         // folder itself lies inside one.
         let plain = folder.dir("plain/sub");
@@ -912,6 +939,7 @@ mod tests {
             .any(|ancestor| ancestor.join(".git").exists())
         {
             assert_eq!(root(&plain), plain);
+            assert!(!project_of(&host, &plain).unwrap().in_git);
         }
         assert_eq!(project_of(&host, "relative/folder"), None);
     }
@@ -923,7 +951,7 @@ mod tests {
         folder.dir("repo/.git");
         let nested = folder.dir("repo/src");
         let host = ContentEnvironment::Host;
-        let tab_project = project_of(&host, &nested).unwrap();
+        let tab_project = project_of(&host, &nested).unwrap().project;
         assert_eq!(tab_project.root, repo);
         assert_eq!(resolve_folder(&host, &nested).unwrap(), tab_project);
 
@@ -950,29 +978,42 @@ mod tests {
         // A walk that finds `.git` decides without Git.
         assert_eq!(
             decide_root(&wsl, folder, Some(3), no_git),
-            "/home/me/proj/compi"
+            ("/home/me/proj/compi".to_owned(), true)
         );
-        // Behind a link into a drive mount, Git's prefix names the root as the folder does.
-        let linked = || {
+        // Behind a link within the distribution, Git's prefix names the root as the
+        // folder does.
+        let linked = || Some(("/data/compi".to_owned(), "crates/daemon/src/".to_owned()));
+        assert_eq!(
+            decide_root(&wsl, folder, None, linked),
+            ("/home/me/proj/compi".to_owned(), true)
+        );
+        // Behind a link into a drive mount, the root is the Windows folder's own name.
+        let on_drive = || {
             Some((
                 "/mnt/c/Users/me/Proj/compi".to_owned(),
                 "crates/daemon/src/".to_owned(),
             ))
         };
         assert_eq!(
-            decide_root(&wsl, folder, None, linked),
-            "/home/me/proj/compi"
+            decide_root(&wsl, folder, None, on_drive),
+            ("/mnt/c/Users/me/Proj/compi".to_owned(), true)
         );
         let top = || Some(("/home/me/repo".to_owned(), String::new()));
         assert_eq!(
             decide_root(&wsl, "/home/me/repo", None, top),
-            "/home/me/repo"
+            ("/home/me/repo".to_owned(), true)
         );
         // A prefix the folder does not end with leaves Git's own top level.
-        let elsewhere = || Some(("/mnt/c/repo".to_owned(), "other/src/".to_owned()));
-        assert_eq!(decide_root(&wsl, folder, None, elsewhere), "/mnt/c/repo");
-        // Outside any repository the folder is its own project.
-        assert_eq!(decide_root(&wsl, folder, None, || None), folder);
+        let elsewhere = || Some(("/home/me/repo".to_owned(), "other/src/".to_owned()));
+        assert_eq!(
+            decide_root(&wsl, folder, None, elsewhere),
+            ("/home/me/repo".to_owned(), true)
+        );
+        // Outside any repository the folder is its own project, not a Git one.
+        assert_eq!(
+            decide_root(&wsl, folder, None, || None),
+            (folder.to_owned(), false)
+        );
     }
 
     #[test]

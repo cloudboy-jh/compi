@@ -7,6 +7,7 @@
 //! (`ChatState::thread`), so closing an untouched one leaves nothing; closing one with
 //! typed text offers Undo for a few seconds.
 use super::*;
+use crate::gui::controls::menu_item;
 use compi_protocol::{
     BrowserContent, MonitorContent, MutationId, MutationReceipt, PaneReplacement, Project,
     SessionId, SplitAxis,
@@ -190,7 +191,8 @@ impl CompiApp {
     ) -> AnyElement {
         let colors = *self.colors();
         let muted = color(modal_text_color(colors.muted, &colors));
-        // The tab's project, else the repository the folder is in.
+        // The tab's project, else the repository the folder is in, as the sidebar shows
+        // it: a saved project, else Home.
         let repo_project = match &model.repo {
             Repo::At { top, .. } => Some(Project {
                 environment: chat.environment.clone(),
@@ -198,11 +200,9 @@ impl CompiApp {
             }),
             Repo::Reading | Repo::None => None,
         };
-        let project = self.pane_project(pane_id).or(repo_project.as_ref());
-        let name: SharedString = match project {
-            Some(project) => self.project_name(project).into(),
-            None => model.folder_label.clone(),
-        };
+        let project = self.section_project(self.pane_project(pane_id).or(repo_project.as_ref()));
+        let name: SharedString = self.project_name(&project).into();
+        let menu_chat = chat.id.clone();
         let header = div()
             .id("chat-draft-project")
             .w_full()
@@ -212,11 +212,23 @@ impl CompiApp {
             .gap_1()
             .child(
                 div()
+                    .id("chat-draft-project-name")
                     .max_w_full()
                     .flex()
                     .items_center()
                     .gap_2p5()
-                    .child(self.project_icon(project, 28.0))
+                    .px_2()
+                    .rounded(ui_rems(8.0))
+                    .cursor_pointer()
+                    .hover(move |style| {
+                        style.bg(color(blend_rgb(colors.surface, colors.foreground, 0.06)))
+                    })
+                    // Before the first message, the thread can start in another project.
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        this.open_draft_project_menu(&menu_chat, event.position(), window, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(self.project_icon(Some(&project), 28.0))
                     .child(
                         div()
                             .min_w_0()
@@ -226,7 +238,8 @@ impl CompiApp {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(color(colors.foreground))
                             .child(name),
-                    ),
+                    )
+                    .child(controls::glyph(IconName::ChevronDown, muted)),
             )
             .child(
                 div()
@@ -236,7 +249,11 @@ impl CompiApp {
                     .text_color(muted)
                     .child(draft_facts(&model.repo, &model.folder_label)),
             )
-            .tooltip(controls::tooltip(model.folder.clone(), None, None));
+            .tooltip(controls::tooltip(
+                model.folder.clone(),
+                Some("Click the project to start this thread in another".into()),
+                None,
+            ));
         div()
             .id("chat-draft")
             .flex_1()
@@ -510,6 +527,116 @@ impl CompiApp {
         if !text.trim().is_empty() {
             self.chat.pending.insert(id, text);
         }
+    }
+
+    /// The projects draft `chat` can start in instead, listed at `position`: the listed
+    /// projects (Home among them), its own checked.
+    fn open_draft_project_menu(
+        &mut self,
+        chat: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pane_id, content, _)) = self.draft_place(chat) else {
+            return;
+        };
+        let current = self.section_project(self.pane_project(&pane_id).or(Some(&Project {
+            environment: content.environment.clone(),
+            root: content.folder.clone(),
+        })));
+        let entries = self
+            .listed_projects()
+            .into_iter()
+            .map(|listed| listed.project)
+            .filter(|project| !self.project_archived(project))
+            .map(|project| {
+                let checked = project == current;
+                let chat = chat.to_owned();
+                let name = self.project_name(&project);
+                menu_item(
+                    name,
+                    cx.listener(move |this, _, window, cx| {
+                        this.switch_draft_project(&chat, project.clone(), window, cx);
+                        cx.notify();
+                    }),
+                )
+                .checked(checked)
+                .into()
+            })
+            .collect();
+        self.open_menu(position, Anchor::TopLeft, entries, window, cx);
+    }
+
+    /// Draft `chat` starts again in `project`'s folder, keeping its agent and what was
+    /// typed. A draft in a tab of its own takes the tab into the project for good; one
+    /// a terminal shows leaves the terminal's tab where it is.
+    fn switch_draft_project(
+        &mut self,
+        chat: &str,
+        project: Project,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pane_id, content, view)) = self.draft_place(chat) else {
+            return;
+        };
+        let Some(model) = self.chat.chats.get(chat) else {
+            return;
+        };
+        if !model.draft(&content)
+            || (content.environment == project.environment && content.folder == project.root)
+        {
+            return;
+        }
+        let text = model.composer.read(cx).value().to_string();
+        let switched = crate::chat::new_chat(
+            content.harness,
+            project.environment.clone(),
+            project.root.clone(),
+        );
+        if !text.trim().is_empty() {
+            self.chat.pending.insert(switched.id.clone(), text);
+        }
+        if view {
+            self.show_view(&pane_id, PaneContent::Chat(switched), window, cx);
+            return;
+        }
+        let alone = self.workspace.as_ref().and_then(|workspace| {
+            workspace
+                .sessions
+                .iter()
+                .flat_map(|session| &session.tabs)
+                .find(|tab| tab.layout.leaf_pane() == Some(&pane_id))
+                .map(|tab| tab.id.clone())
+        });
+        self.replace_draft_in_project(pane_id, PaneContent::Chat(switched), alone, project);
+    }
+
+    /// Puts `content` in place of the draft in `pane_id`; `tab`, the tab the draft is
+    /// alone in, then joins `project` for good.
+    fn replace_draft_in_project(
+        &mut self,
+        pane_id: PaneId,
+        content: PaneContent,
+        tab: Option<TabId>,
+        project: Project,
+    ) {
+        let mut steps: Vec<Step> = vec![Box::new(move |_| {
+            Some(WorkspaceMutation::ReplacePane {
+                pane_id,
+                with: PaneReplacement::Content { content },
+            })
+        })];
+        if let Some(tab_id) = tab {
+            steps.push(Box::new(move |_| {
+                Some(WorkspaceMutation::SetTabProject {
+                    tab_id,
+                    project: Some(project),
+                })
+            }));
+        }
+        self.submit_steps(steps);
     }
 
     /// The agents installed in `environment` as last asked; every agent while the daemon

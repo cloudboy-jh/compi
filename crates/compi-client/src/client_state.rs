@@ -239,6 +239,10 @@ pub struct ClientState {
     /// Project headers folded in the window's sidebar.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folded_projects: Vec<FoldedProject>,
+    /// The project of the tab selected last, where new tabs start while none is
+    /// selected. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_project: Option<Project>,
 }
 
 impl Default for ClientState {
@@ -264,6 +268,7 @@ impl Default for ClientState {
             project_files: Vec::new(),
             pinned_tabs: Vec::new(),
             folded_projects: Vec::new(),
+            last_project: None,
         }
     }
 }

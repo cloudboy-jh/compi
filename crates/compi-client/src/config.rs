@@ -362,6 +362,88 @@ pub fn project_key(project: &compi_protocol::Project) -> String {
     }
 }
 
+/// The project `key` names (`project_key`), for a project listed only by its settings.
+pub fn project_from_key(key: &str) -> Option<compi_protocol::Project> {
+    use compi_protocol::{ContentEnvironment, Project};
+    if let Some(root) = key.strip_prefix("host:") {
+        return Some(Project {
+            environment: ContentEnvironment::Host,
+            root: root.to_owned(),
+        });
+    }
+    let (distribution, root) = key.strip_prefix("wsl:")?.split_once(':')?;
+    Some(Project {
+        environment: ContentEnvironment::Wsl {
+            distribution: distribution.to_owned(),
+        },
+        root: root.to_owned(),
+    })
+}
+
+/// Where `project`'s folder is on disk, the same whichever environment names it, so a tab
+/// finds the project saved for its folder under another name: a WSL drive mount
+/// (`/mnt/c/x`) is the Windows folder it names (`C:\x`), and a Windows path into a WSL
+/// distribution (`\\wsl.localhost\Ubuntu\x`) is that WSL folder. Windows folders compare
+/// without case.
+pub fn project_folder_key(project: &compi_protocol::Project) -> String {
+    use compi_protocol::ContentEnvironment;
+    fn trimmed(path: &str, separator: char) -> &str {
+        let trimmed = path.trim_end_matches(separator);
+        if trimmed.is_empty() { path } else { trimmed }
+    }
+    let windows = |path: &str| trimmed(&path.replace('/', "\\"), '\\').to_lowercase();
+    let linux = |distribution: &str, path: &str| {
+        format!("wsl:{}:{}", distribution.to_lowercase(), trimmed(path, '/'))
+    };
+    let root = project.root.as_str();
+    match &project.environment {
+        ContentEnvironment::Host => {
+            let share = ["\\\\wsl.localhost\\", "\\\\wsl$\\"]
+                .iter()
+                .find_map(|prefix| {
+                    root.get(..prefix.len())
+                        .filter(|head| head.eq_ignore_ascii_case(prefix))
+                        .map(|_| &root[prefix.len()..])
+                });
+            if let Some(rest) = share {
+                let (distribution, path) = rest.split_once('\\').unwrap_or((rest, ""));
+                return linux(distribution, &format!("/{}", path.replace('\\', "/")));
+            }
+            let bytes = root.as_bytes();
+            let windows_path = root.starts_with("\\\\")
+                || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':');
+            if windows_path {
+                windows(root)
+            } else {
+                trimmed(root, '/').to_owned()
+            }
+        }
+        ContentEnvironment::Wsl { distribution } => {
+            let drive = root.strip_prefix("/mnt/").and_then(|rest| {
+                let (mount, tail) = rest.split_once('/').unwrap_or((rest, ""));
+                (mount.len() == 1 && mount.as_bytes()[0].is_ascii_alphabetic())
+                    .then(|| format!("{mount}:\\{tail}"))
+            });
+            match drive {
+                Some(path) => windows(&path),
+                None => linux(distribution, root),
+            }
+        }
+    }
+}
+
+/// Whether `folder` (a folder as a project) is `project`'s folder or inside it, however
+/// either is named (`project_folder_key`).
+pub fn folder_in_project(
+    project: &compi_protocol::Project,
+    folder: &compi_protocol::Project,
+) -> bool {
+    let (root, inner) = (project_folder_key(project), project_folder_key(folder));
+    inner.strip_prefix(&root).is_some_and(|rest| {
+        rest.is_empty() || rest.starts_with(['/', '\\']) || root.ends_with(['/', '\\'])
+    })
+}
+
 /// Recent models a harness's model picker lists.
 pub const MAX_RECENT_CHAT_MODELS: usize = 5;
 
@@ -1325,9 +1407,63 @@ impl LoadedConfig {
     /// (`[projects."<key>"] agent`), else `[chat] agent`.
     pub fn new_thread_agent(&self, project: Option<&compi_protocol::Project>) -> ChatHarness {
         project
-            .and_then(|project| self.projects.get(&project_key(project)))
+            .and_then(|project| self.projects.get(&self.project_settings_key(project)))
             .and_then(|settings| settings.agent)
             .unwrap_or(self.chat_agent)
+    }
+
+    /// The key `[projects]` keeps `project` under: its own (`project_key`), unless a
+    /// project is kept for the same folder under another name (`project_folder_key`).
+    pub fn project_settings_key(&self, project: &compi_protocol::Project) -> String {
+        let key = project_key(project);
+        if self.projects.contains_key(&key) {
+            return key;
+        }
+        let folder = project_folder_key(project);
+        self.projects
+            .keys()
+            .filter(|saved| {
+                project_from_key(saved).is_some_and(|saved| project_folder_key(&saved) == folder)
+            })
+            .min()
+            .cloned()
+            .unwrap_or(key)
+    }
+
+    /// The project `[projects]` keeps for `project`'s folder, by whichever name.
+    pub fn kept_project(
+        &self,
+        project: &compi_protocol::Project,
+    ) -> Option<compi_protocol::Project> {
+        let key = self.project_settings_key(project);
+        self.projects
+            .contains_key(&key)
+            .then(|| project_from_key(&key))
+            .flatten()
+    }
+
+    /// The Home project: the Start folder (`[shell] working_directory`), else this
+    /// machine's home folder. Every tab outside a saved project is in it, and it is
+    /// always listed.
+    pub fn home_project(&self) -> compi_protocol::Project {
+        let root = self
+            .launch
+            .as_ref()
+            .ok()
+            .and_then(|launch| launch.profile.working_directory.clone())
+            .or_else(|| {
+                std::env::home_dir().and_then(|home| home.into_os_string().into_string().ok())
+            })
+            .unwrap_or_else(|| "~".to_owned());
+        compi_protocol::Project {
+            environment: compi_protocol::ContentEnvironment::Host,
+            root,
+        }
+    }
+
+    /// Whether `project` is Home's folder, by whichever name.
+    pub fn is_home_project(&self, project: &compi_protocol::Project) -> bool {
+        project_folder_key(project) == project_folder_key(&self.home_project())
     }
 
     /// Persist what you set for the project under `key` (`project_key`) in Settings →
@@ -3821,6 +3957,71 @@ mod tests {
             .unwrap();
         assert!(!fs::read_to_string(&path).unwrap().contains("[chat.omp]"));
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_tab_finds_the_project_kept_for_its_folder_under_another_name() {
+        let saved = compi_protocol::Project {
+            environment: compi_protocol::ContentEnvironment::Host,
+            root: r"C:\Users\me\Proj\compi".into(),
+        };
+        let mut loaded = LoadedConfig::default();
+        loaded.projects.insert(
+            project_key(&saved),
+            ProjectSettings {
+                saved: true,
+                agent: Some(ChatHarness::Codex),
+                ..ProjectSettings::default()
+            },
+        );
+        let wsl = |root: &str| compi_protocol::Project {
+            environment: compi_protocol::ContentEnvironment::Wsl {
+                distribution: "Ubuntu".into(),
+            },
+            root: root.into(),
+        };
+        let tab = wsl("/mnt/c/Users/me/Proj/compi");
+        assert_eq!(loaded.kept_project(&tab), Some(saved.clone()));
+        assert_eq!(loaded.project_settings_key(&tab), project_key(&saved));
+        assert_eq!(loaded.new_thread_agent(Some(&tab)), ChatHarness::Codex);
+        let elsewhere = wsl("/home/me/compi");
+        assert_eq!(loaded.kept_project(&elsewhere), None);
+        assert_eq!(
+            loaded.project_settings_key(&elsewhere),
+            project_key(&elsewhere)
+        );
+    }
+
+    #[test]
+    fn a_folder_is_in_a_project_by_any_of_their_names() {
+        let host = |root: &str| compi_protocol::Project {
+            environment: compi_protocol::ContentEnvironment::Host,
+            root: root.into(),
+        };
+        let wsl = |root: &str| compi_protocol::Project {
+            environment: compi_protocol::ContentEnvironment::Wsl {
+                distribution: "Ubuntu".into(),
+            },
+            root: root.into(),
+        };
+        let compi = host(r"C:\Users\me\Proj\compi");
+        assert!(folder_in_project(&compi, &compi));
+        assert!(folder_in_project(
+            &compi,
+            &wsl("/mnt/c/Users/me/Proj/compi/crates")
+        ));
+        assert!(folder_in_project(
+            &compi,
+            &host(r"c:\users\me\proj\compi\docs")
+        ));
+        // A sibling sharing the name's start is not inside.
+        assert!(!folder_in_project(
+            &compi,
+            &host(r"C:\Users\me\Proj\compi-old")
+        ));
+        assert!(!folder_in_project(&compi, &wsl("/home/me/proj/compi")));
+        assert!(folder_in_project(&wsl("/home/me"), &wsl("/home/me/site")));
+        assert!(folder_in_project(&host(r"D:\"), &host(r"D:\work")));
     }
 
     #[test]

@@ -6289,8 +6289,9 @@ impl CompiApp {
                 &catalog.pane == pane_id && catalog.target == CatalogTarget::Both
             });
         let page = if terminal_page || appearance_page {
-            // The grid's own padding (room for a tile's ring) comes off the page width.
-            let columns = super::catalog::theme_grid_columns(page_width - 8.0);
+            // The grid's frame, padding and scrollbar come off the page width.
+            let columns =
+                super::catalog::theme_grid_columns(page_width - super::catalog::THEME_GRID_INSET);
             pane.grid_columns.set(columns);
             let grid_row = RowCx {
                 host: host.clone(),
