@@ -4,18 +4,18 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 
 ## Release state
 
-- [**0.9.0**](https://github.com/cloudboy-jh/compi/releases/tag/v0.9.0) is the latest public release (2026-11-21 23:04 UTC, tag at `cd2b7e8`, [Core CI](https://github.com/cloudboy-jh/compi/actions/runs/44954939463), [release run](https://github.com/cloudboy-jh/compi/actions/runs/44958925248)). Daemon protocol 41, workspace format 11. Windows portable and macOS copied-bundle checks passed. Verified all 12 downloads were present, the package checksums and three metadata signatures matched, and the installed 0.8.2 updater found 0.9.0 and showed its signed summary without downloading or restarting. The advisory Windows installer run stalled and was cancelled; the packaging rerun skipped it. An actual 0.8.2 upgrade was not tested.
-- [**0.8.2**](https://github.com/cloudboy-jh/compi/releases/tag/v0.8.2) was published 2026-11-19 (`382509d`, [release run](https://github.com/cloudboy-jh/compi/actions/runs/44435599983)). Daemon protocol 40, workspace format 10. The daily Windows install is still on 0.8.2. Windows installs on 0.8.0 or 0.8.1 should use Setup because their in-app updater can hang.
+- [**0.9.1**](https://github.com/cloudboy-jh/compi/releases/tag/v0.9.1) is the latest public release (2026-11-22 19:57 UTC, tag at `da61ba0`, [Core CI](https://github.com/cloudboy-jh/compi/actions/runs/45048287151), [release run](https://github.com/cloudboy-jh/compi/actions/runs/45050713719)). Daemon protocol 42, workspace format 11. Both native jobs passed, the Windows installed-update check included. Verified all 12 downloads, signed update and Setup metadata with version 0.9.1, protocol 42 and the 0.9.1 notes, and package hashes matching `SHA256SUMS.txt`. The installed 0.9.0 CLI's `compi update --check` reports 0.9.1 with its headline. Core CI's Windows job first failed the known handle-count flake and passed on rerun; locally it passed 6/6 on both 0.9.1 and 0.9.0 source.
+- [**0.9.0**](https://github.com/cloudboy-jh/compi/releases/tag/v0.9.0) was published 2026-11-21 23:04 UTC (tag at `cd2b7e8`, [release run](https://github.com/cloudboy-jh/compi/actions/runs/44958925248)). Daemon protocol 41, workspace format 11. The daily Windows install is on 0.9.0.
+- [**0.8.2**](https://github.com/cloudboy-jh/compi/releases/tag/v0.8.2) was published 2026-11-19 (`382509d`, [release run](https://github.com/cloudboy-jh/compi/actions/runs/44435599983)). Daemon protocol 40, workspace format 10. Windows installs on 0.8.0 or 0.8.1 should use Setup because their in-app updater can hang.
 - **0.8.1**: published 2026-11-11 21:20 UTC, tagged `v0.8.1` at `d5fb6e3`, release run [43099782821](https://github.com/cloudboy-jh/compi/actions/runs/43099782821), 12 assets. Its in-app update from 0.8.0 rolled back on the working instance (the window hang, fixed in 0.8.2); Setup installed it.
 - **0.8.0**: published 2026-11-11 16:10 UTC, tagged `v0.8.0` at `7c12262`, release run [43053398818](https://github.com/cloudboy-jh/compi/actions/runs/43053398818), 12 assets.
 
-## v0.9.1
+## v0.9.1 follow-through
 
-The batch: tabs finding their project (WSL and linked folders included), Home replacing Loose tabs, sidebar card dragging (`SetTabProject`, protocol **42**), new tabs and threads in the selected tab's project with a draft's project switch, one-line indented sidebar cards, and the theme grid's own scroll. Workspace format stays **11** (`chosen_projects` is additive). See [Completed work](COMPLETED.md#chat-first-v090). Checked only in Windows `cargo dev`.
+This release adds tabs finding their project (WSL and linked folders included), Home in place of Loose tabs, sidebar card dragging (`SetTabProject`, protocol 42), new tabs and threads in the selected tab's project with a draft's project switch, one-line indented sidebar cards, and the theme grid's own scroll. See [Completed work](COMPLETED.md#chat-first-v090).
 
-1. Tag `v0.9.1` on the release-prep commit; check both draft packages, checksums, signed metadata with `daemon_protocol` 42 and the 0.9.1 notes, and the Setup metadata.
-2. After it is published, check that the installed 0.9.0 finds 0.9.1 with its signed notes. Protocol 41 → 42 restarts the local daemon, ending open shells and chats.
-3. Not seen: native macOS, the actual in-app upgrade from 0.9.0.
+- Run the in-app upgrade from 0.9.0 on the daily Windows install when convenient; protocol 41 → 42 restarts the local daemon, ending open shells and chats.
+- Not seen natively: the macOS app, sidebar dragging on macOS.
 
 ## v0.9.0 follow-through
 
