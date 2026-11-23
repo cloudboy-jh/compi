@@ -2636,6 +2636,7 @@ mod tests {
             harness: ChatHarness::Omp,
             environment: ContentEnvironment::Host,
             folder: "/work".into(),
+            prefer: None,
             session: None,
         });
         let row = content_row(&session, &tab, &PaneId::new("chat"), &chat);

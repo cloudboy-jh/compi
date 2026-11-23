@@ -761,7 +761,12 @@ impl CompiApp {
                 return None;
             }
         };
-        let chat = crate::chat::new_chat(harness, environment, folder);
+        let chat = crate::chat::new_chat(
+            harness,
+            environment,
+            folder,
+            self.config.chat_prefer(harness),
+        );
         let id = chat.id.clone();
         let content = PaneContent::Chat(chat);
         // A terminal already carrying a chat keeps it as its view; the new one goes beside.

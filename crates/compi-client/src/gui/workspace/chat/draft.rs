@@ -183,6 +183,7 @@ impl CompiApp {
             source.harness,
             source.environment.clone(),
             source.folder.clone(),
+            source.prefer,
         );
         self.open_content_split(beside, axis, PaneContent::Chat(draft));
     }
@@ -559,7 +560,12 @@ impl CompiApp {
             return;
         }
         let text = model.composer.read(cx).value().to_string();
-        let switched = crate::chat::new_chat(harness, content.environment, content.folder);
+        let switched = crate::chat::new_chat(
+            harness,
+            content.environment,
+            content.folder,
+            self.config.chat_prefer(harness),
+        );
         let id = switched.id.clone();
         self.put_in_draft_place(&pane_id, view, PaneContent::Chat(switched), window, cx);
         if !text.trim().is_empty() {
@@ -632,6 +638,7 @@ impl CompiApp {
             content.harness,
             project.environment.clone(),
             project.root.clone(),
+            content.prefer,
         );
         if !text.trim().is_empty() {
             self.chat.pending.insert(switched.id.clone(), text);
@@ -872,7 +879,7 @@ impl CompiApp {
                 None => return,
             },
         };
-        let chat = crate::chat::new_chat(chat.harness, chat.environment, chat.folder);
+        let chat = crate::chat::new_chat(chat.harness, chat.environment, chat.folder, chat.prefer);
         let id = chat.id.clone();
         let content = PaneContent::Chat(chat);
         let opened = match place {
@@ -957,6 +964,7 @@ mod tests {
             harness: ChatHarness::Omp,
             environment: ContentEnvironment::Host,
             folder: "/work".into(),
+            prefer: None,
             session: None,
         }
     }

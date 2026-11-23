@@ -154,6 +154,8 @@ pub(super) enum SettingsAction {
     CopyInstallCommand(ChatHarness),
     /// Updates an agent's program on one side to its newest version.
     UpdateAgent(ChatHarness, AgentSide),
+    /// Which of an agent's two programs its new chats use (Ubuntu or Windows).
+    AgentSide(ChatHarness),
     OpenConfiguration,
     /// A command's shortcut, by its index in `commands::REGISTRY`: pressing it records
     /// the next keys pressed.
@@ -3102,6 +3104,13 @@ impl CompiApp {
                 self.settings.install_copied = Some(agent);
             }
             SettingsAction::UpdateAgent(agent, side) => self.update_agent(agent, side, cx),
+            SettingsAction::AgentSide(agent) => {
+                let side = match self.config.chat_prefer(agent) {
+                    Some(AgentSide::Windows) => AgentSide::Linux,
+                    _ => AgentSide::Windows,
+                };
+                self.set_agent_side(agent, side);
+            }
             SettingsAction::ToggleChatAgentsBar => {
                 self.set_chat_agents_bar(!self.config.chat_agents_bar, cx);
             }
@@ -4637,13 +4646,42 @@ impl CompiApp {
                     .agent_places(agent)
                     .is_some_and(|places| places.is_empty())
                     .then_some(SettingsAction::CopyInstallCommand(agent));
-                copy.into_iter().chain(
+                let side = self
+                    .agent_on_both_sides(agent)
+                    .then_some(SettingsAction::AgentSide(agent));
+                copy.into_iter().chain(side).chain(
                     self.agent_update_offers(agent)
                         .into_iter()
                         .map(move |(side, _, _)| SettingsAction::UpdateAgent(agent, side)),
                 )
             })
             .collect()
+    }
+
+    /// Whether `agent` has both a Windows and a Linux program here, so its card offers
+    /// the choice of the one new chats use.
+    fn agent_on_both_sides(&self, agent: ChatHarness) -> bool {
+        let Some(Ok(installs)) = &self.settings.agent_installs else {
+            return false;
+        };
+        installs.agents.iter().any(|install| {
+            install.harness == agent && install.windows.is_some() && install.linux.is_some()
+        })
+    }
+
+    /// New chats with `agent` use its program on `side` (`[chat.<program>] side`; Linux,
+    /// the default, is written as no setting). Open chats keep theirs.
+    fn set_agent_side(&mut self, agent: ChatHarness, side: AgentSide) {
+        let mut models = self
+            .config
+            .chat_models
+            .get(&agent)
+            .cloned()
+            .unwrap_or_default();
+        models.side = (side == AgentSide::Windows).then_some(side);
+        if let Err(error) = self.config.save_chat_models(agent, models) {
+            self.global_error = Some(error);
+        }
     }
 
     /// Updates `agent` on `side` through the daemon, off the UI thread; once it worked,
@@ -4707,10 +4745,23 @@ impl CompiApp {
         let colors = *self.colors();
         let places = self.agent_places(agent);
         let missing = places.as_ref().is_some_and(Vec::is_empty);
+        let both = self.agent_on_both_sides(agent);
+        let windows_used = self.config.chat_prefer(agent) == Some(AgentSide::Windows);
         let status = match (&self.settings.agent_installs, places) {
             (None, _) => "Looking for it…".to_owned(),
             (Some(Err(error)), _) => format!("Couldn't look for it: {error}"),
-            (Some(Ok(_)), Some(places)) if !places.is_empty() => places.join(" · "),
+            // Linux first, then Windows (`agent_places`).
+            (Some(Ok(_)), Some(places)) if both && places.len() == 2 => {
+                let (used, other) = if windows_used {
+                    (&places[1], &places[0])
+                } else {
+                    (&places[0], &places[1])
+                };
+                format!("Chats use {used} · {other} not used")
+            }
+            (Some(Ok(_)), Some(places)) if !places.is_empty() => {
+                format!("Chats use {}", places.join(" · "))
+            }
             (Some(Ok(_)), _) => {
                 format!("Not installed. Install it with {}", agent.entry().install)
             }
@@ -4786,18 +4837,44 @@ impl CompiApp {
                 )
             })
             .collect();
-        let action = match (copy, update_buttons.is_empty()) {
-            (Some(copy), _) => Some(copy),
-            (None, true) => None,
-            (None, false) => Some(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .children(update_buttons)
-                    .into_any_element(),
-            ),
-        };
+        // Which program new chats use, when there are two.
+        let switch = both.then(|| {
+            let distribution = installs.and_then(|installs| installs.distribution.as_deref());
+            let option = |side: AgentSide, index: usize| {
+                controls::text_button(
+                    ("agent-side", agent as usize * 2 + index),
+                    side_name(distribution, side).to_owned(),
+                )
+                .selected((side == AgentSide::Windows) == windows_used)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.set_agent_side(agent, side);
+                    cx.notify();
+                }))
+            };
+            controls::highlight(
+                self.settings_focused(row, SettingsAction::AgentSide(agent)),
+                controls::segmented(
+                    ("agent-sides", agent as usize),
+                    [option(AgentSide::Linux, 0), option(AgentSide::Windows, 1)],
+                ),
+                cx,
+            )
+            .into_any_element()
+        });
+        let actions: Vec<AnyElement> = copy
+            .into_iter()
+            .chain(switch)
+            .chain(update_buttons)
+            .collect();
+        let action = (!actions.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_1()
+                .children(actions)
+                .into_any_element()
+        });
         let default = (self.config.chat_agent == agent).then(|| {
             controls::chip("Default", controls::ChipTone::Tint(colors.accent)).into_any_element()
         });

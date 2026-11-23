@@ -58,7 +58,7 @@ text_size = 15 # 8 through 32; unset follows font.size
 - **Settings → Chat → Enter while the agent works**: **Steer** (the default) sends the message into the running turn and Ctrl+Enter (Cmd+Enter on macOS) queues it for after; **Queue** swaps the two.
 - **Settings → Chat → Opening a chat**: **In place of the shell** (the default) shows the chat over the terminal it starts from; **Beside it** opens it in a new pane next to that terminal.
 
-The model picker remembers, per agent, the model and thinking level you last picked, which new sessions start on, your favorite models and your five latest picks, under `[chat.<program>]`: `[chat.omp]`, `[chat.claude]`, `[chat.codex]` and `[chat.opencode]`. Values are the agent's own names for its choices (Claude Code's and Codex's are bare, such as `opus` or `gpt-5.5`; OpenCode's name their provider, such as `openai/gpt-5.5`, and its thinking levels are the model's variants); one it no longer lists is skipped.
+The model picker remembers, per agent, the model and thinking level you last picked, which new sessions start on, your favorite models and your five latest picks, under `[chat.<program>]`: `[chat.omp]`, `[chat.claude]`, `[chat.codex]` and `[chat.opencode]`. Values are the agent's own names for its choices (Claude Code's and Codex's are bare, such as `opus` or `gpt-5.5`; OpenCode's name their provider, such as `openai/gpt-5.5`, and its thinking levels are the model's variants); one it no longer lists is skipped. On Windows, `side` picks which of an agent's programs new chats use in every folder, `linux` (in WSL, the default) or `windows`, as the **Ubuntu | Windows** switch in **Settings → Agents** does; an agent with only one uses that one.
 
 ```toml
 [chat]
@@ -75,6 +75,7 @@ model = "anthropic/claude-opus-5-5" # new sessions start on it; unset uses OMP's
 thinking = "high"
 favorites = ["anthropic/claude-opus-5-5", "openai-codex/gpt-5.5"]
 recent = ["anthropic/claude-opus-5-5"] # newest first, at most five
+side = "linux" # Windows only: linux (WSL, the default) or windows
 
 [chat.claude]
 model = "opus" # unset uses Claude Code's own

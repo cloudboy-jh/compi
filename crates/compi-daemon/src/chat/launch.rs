@@ -130,10 +130,14 @@ pub(super) struct Prepared {
     /// Compi's agent shell, for a Windows program in a WSL chat.
     #[cfg(windows)]
     agent_shell: Option<std::path::PathBuf>,
-    /// The distribution a chat in a Windows folder runs the agent's Linux program in,
-    /// when it has no Windows one.
+    /// The distribution a chat in a Windows folder runs the agent's Linux program in:
+    /// the one it prefers, or the only one there is.
     #[cfg(windows)]
     fallback: Option<String>,
+    /// A chat in WSL runs the Windows program, which it prefers, though there is a Linux
+    /// one.
+    #[cfg(windows)]
+    windows_only: bool,
 }
 
 impl Prepared {
@@ -151,20 +155,32 @@ impl Prepared {
 }
 
 /// Where the agent's programs are for `content`: enough to start it, as the approval
-/// lookup does, without the bridge and notes `prepare` adds.
+/// lookup does, without the bridge and notes `prepare` adds. The program the chat
+/// prefers (`ChatContent::prefer`) wins where there is one: a Windows folder runs the
+/// Linux program through the default distribution, a WSL folder the Windows program.
 pub(super) fn programs(content: &ChatContent) -> Prepared {
     #[cfg(windows)]
     {
-        let windows_program = windows_program(content.harness.entry());
-        let fallback = match &content.environment {
-            ContentEnvironment::Host if windows_program.is_none() => {
-                compi_protocol::wsl::directory_distribution(None).ok()
-            }
-            _ => None,
+        use compi_protocol::chat::AgentSide;
+        let entry = content.harness.entry();
+        let windows = windows_program(entry);
+        let host = matches!(content.environment, ContentEnvironment::Host);
+        let distribution = || compi_protocol::wsl::directory_distribution(None).ok();
+        let linux_wanted = (host && content.prefer == Some(AgentSide::Linux))
+            .then(distribution)
+            .flatten()
+            .filter(|distribution| linux_found(entry, distribution));
+        let (windows_program, fallback) = match (host, linux_wanted, windows) {
+            (true, Some(distribution), _) => (None, Some(distribution)),
+            (true, None, None) => (None, distribution()),
+            (_, _, windows) => (windows, None),
         };
+        let windows_only =
+            !host && content.prefer == Some(AgentSide::Windows) && windows_program.is_some();
         Prepared {
             windows_program,
             fallback,
+            windows_only,
             ..Prepared::default()
         }
     }
@@ -173,6 +189,16 @@ pub(super) fn programs(content: &ChatContent) -> Prepared {
         let _ = content;
         Prepared::default()
     }
+}
+
+/// Whether `distribution` has `entry`'s Linux program, as its launch finds it, within
+/// `LOOKUP_TIMEOUT`.
+#[cfg(windows)]
+fn linux_found(entry: &AgentEntry, distribution: &str) -> bool {
+    succeeds(
+        wsl_command(distribution, None, &[], &script(entry, &[], true)),
+        LOOKUP_TIMEOUT,
+    )
 }
 
 /// Everything `content`'s agent needs before it starts: where its programs are, Compi's
@@ -236,15 +262,25 @@ pub(super) fn prepare(content: &ChatContent) -> Prepared {
 /// (`COMPI_AGENT_WINDOWS_BASH`) in its variable (`AgentEntry::windows_bash`), which can
 /// be one a Linux program reads too (OpenCode's `SHELL`).
 fn script(entry: &AgentEntry, args: &[Arg], locate: bool) -> String {
+    launch_script(entry, args, locate, true)
+}
+
+/// `script`, without looking for the Linux program unless `linux`: the Windows one runs
+/// (`Prepared::windows_only`).
+fn launch_script(entry: &AgentEntry, args: &[Arg], locate: bool, linux: bool) -> String {
     let folders: String = entry
         .linux_folders
         .iter()
         .map(|folder| format!(":$HOME/{folder}"))
         .collect();
     let program = entry.program;
-    let find = format!(
-        r#"found=; dirs="$PATH{folders}"; set -f; IFS=:; for dir in $dirs; do case $dir in /mnt/[a-zA-Z]/*) ;; *) if [ -f "$dir/{program}" ] && [ -x "$dir/{program}" ]; then found=$dir/{program}; break; fi;; esac; done; unset IFS; set +f"#
-    );
+    let find = if linux {
+        format!(
+            r#"found=; dirs="$PATH{folders}"; set -f; IFS=:; for dir in $dirs; do case $dir in /mnt/[a-zA-Z]/*) ;; *) if [ -f "$dir/{program}" ] && [ -x "$dir/{program}" ]; then found=$dir/{program}; break; fi;; esac; done; unset IFS; set +f"#
+        )
+    } else {
+        "found=".to_owned()
+    };
     if locate {
         return format!(r#"{SCRIPT_START}; {find}; [ -n "$found" ]"#);
     }
@@ -371,7 +407,7 @@ pub(super) fn command(
                     distribution,
                     Some(&content.folder),
                     &environment,
-                    &script(entry, args, false),
+                    &launch_script(entry, args, false, !prepared.windows_only),
                 ),
                 None,
             ))

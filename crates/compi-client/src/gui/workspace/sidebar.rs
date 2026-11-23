@@ -1204,10 +1204,12 @@ impl CompiApp {
     /// New thread here: a chat at the project's root with the agent its new threads
     /// start with, in a new tab of workspace `session`.
     pub(super) fn new_project_thread(&mut self, session: SessionId, project: &Project) {
+        let harness = self.new_thread_agent(Some(project));
         let chat = crate::chat::new_chat(
-            self.new_thread_agent(Some(project)),
+            harness,
             project.environment.clone(),
             project.root.clone(),
+            self.config.chat_prefer(harness),
         );
         self.mutate(
             WorkspaceMutation::CreateContentTab {

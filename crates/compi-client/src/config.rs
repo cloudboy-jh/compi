@@ -16,7 +16,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
-use compi_protocol::chat::{ChatApproval, ChatHarness, ChatPicks};
+use compi_protocol::chat::{AgentSide, ChatApproval, ChatHarness, ChatPicks};
 use compi_protocol::{LaunchContext, MAX_GRAPHICS_BYTES, SplitAxis, WindowsShell};
 use serde::{Deserialize, Serialize};
 
@@ -451,11 +451,12 @@ pub fn folder_in_project(
 /// Recent models a harness's model picker lists.
 pub const MAX_RECENT_CHAT_MODELS: usize = 5;
 
-/// What Compi remembers of one chat harness's models, `[chat.<program>]` (`[chat.omp]`):
-/// the model and thinking level its new sessions start on (`model`, `thinking`), the
-/// favorite models (`favorites`) and the models picked last, newest first (`recent`).
-/// Values are the harness's own (`anthropic/claude-opus-5-5`); Compi never writes the
-/// harness's settings.
+/// What Compi remembers of one chat harness, `[chat.<program>]` (`[chat.omp]`): the
+/// model and thinking level its new sessions start on (`model`, `thinking`), the
+/// favorite models (`favorites`), the models picked last, newest first (`recent`), and,
+/// on Windows, which of its programs new chats use (`side`: `linux` or `windows`;
+/// Linux when unset). Values are the harness's own (`anthropic/claude-opus-5-5`);
+/// Compi never writes the harness's settings.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatModels {
     #[serde(default)]
@@ -464,6 +465,8 @@ pub struct ChatModels {
     pub favorites: Vec<String>,
     #[serde(default)]
     pub recents: Vec<String>,
+    #[serde(default)]
+    pub side: Option<AgentSide>,
 }
 
 impl ChatModels {
@@ -1398,6 +1401,12 @@ impl LoadedConfig {
             text("thinking", &models.picks.thought_level, models_table);
             list("favorites", &models.favorites, models_table);
             list("recent", &models.recents, models_table);
+            match models.side {
+                Some(side) => set_table_value(models_table, "side", side_name(side).into()),
+                None => {
+                    models_table.remove("side");
+                }
+            }
         })?;
         if models == ChatModels::default() {
             self.chat_models.remove(&harness);
@@ -1405,6 +1414,18 @@ impl LoadedConfig {
             self.chat_models.insert(harness, models);
         }
         Ok(())
+    }
+
+    /// The program a new chat with `harness` prefers: on Windows the side
+    /// `[chat.<program>] side` names, else its Linux one (in WSL, where a Windows folder
+    /// can run it too); `None` elsewhere, where there is one.
+    pub fn chat_prefer(&self, harness: ChatHarness) -> Option<AgentSide> {
+        cfg!(windows).then(|| {
+            self.chat_models
+                .get(&harness)
+                .and_then(|models| models.side)
+                .unwrap_or(AgentSide::Linux)
+        })
     }
 
     /// The agent a new thread in `project` starts with: the project's
@@ -2999,8 +3020,28 @@ fn load_chat_models(table: &toml::Table, key: &str, loaded: &mut LoadedConfig) -
             }
         }
     }
+    if let Some(value) = table.get("side") {
+        match value.as_str() {
+            Some("linux") => models.side = Some(AgentSide::Linux),
+            Some("windows") => models.side = Some(AgentSide::Windows),
+            _ => invalid(
+                loaded,
+                &format!("{key}.side"),
+                "linux or windows",
+                "configuration",
+            ),
+        }
+    }
     models.recents.truncate(MAX_RECENT_CHAT_MODELS);
     models
+}
+
+/// `side` as `[chat.<program>] side` writes it.
+fn side_name(side: AgentSide) -> &'static str {
+    match side {
+        AgentSide::Linux => "linux",
+        AgentSide::Windows => "windows",
+    }
 }
 
 fn project_icon_to_toml(icon: &ProjectIcon) -> toml_edit::Value {

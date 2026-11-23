@@ -360,6 +360,12 @@ pub struct ChatContent {
     pub environment: ContentEnvironment,
     /// Absolute folder in `environment` the harness works in.
     pub folder: String,
+    /// The agent's program the chat prefers, on a Windows PC with both: its Linux one in
+    /// WSL, which then works in a Windows folder too, or its Windows one, also in a WSL
+    /// folder. The other is used when it has no such program. `None` (threads from
+    /// before Compi chose) takes the program of the folder's side first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer: Option<AgentSide>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
 }
@@ -1302,6 +1308,7 @@ mod tests {
             harness: ChatHarness::Omp,
             environment: ContentEnvironment::Host,
             folder: "/work".into(),
+            prefer: None,
             session: None,
         };
         assert!(chat("chat-01ab").validate().is_ok());

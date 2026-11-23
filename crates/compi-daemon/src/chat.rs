@@ -2679,6 +2679,7 @@ mod tests {
                 harness: ChatHarness::Omp,
                 environment: ContentEnvironment::Host,
                 folder: "/work".into(),
+                prefer: None,
                 session: None,
             })
         };
@@ -3560,6 +3561,7 @@ mod tests {
                 harness: ChatHarness::Omp,
                 environment: ContentEnvironment::Host,
                 folder: "/w".into(),
+                prefer: None,
                 session: None,
             },
             instance: None,
@@ -3725,6 +3727,7 @@ mod tests {
             harness: ChatHarness::Omp,
             environment: ContentEnvironment::Host,
             folder: "/work".into(),
+            prefer: None,
             session: Some("s1".into()),
         }
     }

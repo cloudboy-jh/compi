@@ -1,18 +1,22 @@
 //! New native agent chats, as the palette's New chat and `compi chat` start them, and
 //! how the palette's Threads and `compi threads` describe a thread.
 use compi_protocol::ContentEnvironment;
-use compi_protocol::chat::{AgentEntry, ChatContent, ChatHarness, ThreadActivity, ThreadInfo};
+use compi_protocol::chat::{
+    AgentEntry, AgentSide, ChatContent, ChatHarness, ThreadActivity, ThreadInfo,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT_CHAT: AtomicU64 = AtomicU64::new(0);
 
-/// A new chat with `harness` in `folder` of `environment`, under an ID no other chat has:
-/// the time, this process and a counter, in hex.
+/// A new chat with `harness` in `folder` of `environment`, preferring the agent's
+/// program on `prefer`'s side (`LoadedConfig::chat_prefer`), under an ID no other chat
+/// has: the time, this process and a counter, in hex.
 pub fn new_chat(
     harness: ChatHarness,
     environment: ContentEnvironment,
     folder: String,
+    prefer: Option<AgentSide>,
 ) -> ChatContent {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -23,6 +27,7 @@ pub fn new_chat(
         harness,
         environment,
         folder,
+        prefer,
         session: None,
     }
 }
@@ -92,11 +97,17 @@ mod tests {
 
     #[test]
     fn new_chats_are_valid_and_distinct() {
-        let first = new_chat(ChatHarness::Omp, ContentEnvironment::Host, "/work".into());
+        let first = new_chat(
+            ChatHarness::Omp,
+            ContentEnvironment::Host,
+            "/work".into(),
+            None,
+        );
         let second = new_chat(
             ChatHarness::Claude,
             ContentEnvironment::Host,
             "/work".into(),
+            None,
         );
         assert!(first.validate().is_ok(), "{}", first.id);
         assert_ne!(first.id, second.id);
@@ -134,7 +145,12 @@ mod tests {
     #[test]
     fn threads_read_by_title_and_status() {
         let mut thread = ThreadInfo {
-            chat: new_chat(ChatHarness::Omp, ContentEnvironment::Host, "/work".into()),
+            chat: new_chat(
+                ChatHarness::Omp,
+                ContentEnvironment::Host,
+                "/work".into(),
+                None,
+            ),
             title: Some("  ".into()),
             created_ms: 0,
             updated_ms: 0,

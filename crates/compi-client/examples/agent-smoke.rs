@@ -423,6 +423,7 @@ mod smoke {
                     harness: args.harness,
                     environment: folder.environment(),
                     folder: path,
+                    prefer: None,
                     session: None,
                 };
                 in_tab(&mut control, chat, &folder, &args)

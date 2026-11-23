@@ -106,7 +106,9 @@ use std::fmt;
 // `AnswerChatSignIn`, `CancelChatSignIn`, `SignOutChat`, `ChatState::login`), and
 // updates agents (`UpdateChatAgent`, `ChatState::update`, `UpdateAgent`,
 // `AgentInstall::latest`).
-pub const PROTOCOL_VERSION: u32 = 43;
+// Version 44 lets a chat prefer the agent's Linux or Windows program
+// (`ChatContent::prefer`): one install for every folder.
+pub const PROTOCOL_VERSION: u32 = 44;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
 /// A content file of `MAX_CONTENT_FILE_BYTES` stays within this even if JSON escapes every

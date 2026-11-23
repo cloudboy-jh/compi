@@ -1575,6 +1575,7 @@ mod tests {
                     distribution: "Ubuntu".into(),
                 },
                 folder: "/home/me/project".into(),
+                prefer: None,
                 session: Some("01a1bc23-56d5".into()),
             }),
         };

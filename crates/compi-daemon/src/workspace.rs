@@ -7514,6 +7514,7 @@ mod tests {
             harness: Default::default(),
             environment: ContentEnvironment::Host,
             folder: host_folder(&[]).root,
+            prefer: None,
             session: None,
         }
     }

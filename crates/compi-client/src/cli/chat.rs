@@ -51,7 +51,12 @@ pub(super) fn run(
         // The chat shows in the caller's tab, so it is in that tab's project.
         None => config.new_thread_agent(tab.project.as_ref()),
     };
-    let chat = crate::chat::new_chat(agent, caller.environment.clone(), folder);
+    let chat = crate::chat::new_chat(
+        agent,
+        caller.environment.clone(),
+        folder,
+        config.chat_prefer(agent),
+    );
     chat.validate().map_err(CliError::usage)?;
     let content = PaneContent::Chat(chat.clone());
     let placed = match (config.chat_open, caller.surface) {

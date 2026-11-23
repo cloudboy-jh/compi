@@ -1520,6 +1520,7 @@ mod tests {
             compi_protocol::chat::ChatHarness::Omp,
             ContentEnvironment::Host,
             folder.into(),
+            None,
         );
         chat.id = id.into();
         ThreadInfo {

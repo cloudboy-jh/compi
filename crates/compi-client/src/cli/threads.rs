@@ -70,6 +70,7 @@ mod tests {
             ChatHarness::Omp,
             ContentEnvironment::Host,
             "/work/compi".into(),
+            None,
         );
         chat.id = "chat-1".into();
         let now = 10 * 3_600_000;

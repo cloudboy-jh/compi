@@ -2085,6 +2085,7 @@ mod tests {
                 harness: ChatHarness::Claude,
                 environment: compi_protocol::ContentEnvironment::Host,
                 folder: "/w".into(),
+                prefer: None,
                 session: None,
             },
             instance: None,

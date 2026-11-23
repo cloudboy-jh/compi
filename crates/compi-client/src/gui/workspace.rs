@@ -1988,6 +1988,7 @@ impl CompiApp {
                     harness,
                     place.environment,
                     place.root,
+                    self.config.chat_prefer(harness),
                 )),
             },
             true,
