@@ -7,8 +7,8 @@ use crate::{
     GitCommitLookup, GitFileContent, GitRevision, GitWriteResult, IMAGE_UPLOAD_CHUNK_BYTES,
     MAX_IMAGE_UPLOAD_BYTES, MutationId, MutationReceipt, MutationRequest, PROTOCOL_VERSION,
     Project, ProjectIconImage, RuntimeMetrics, SCREEN_FRAME, SearchEntry, ServerMessage, SurfaceId,
-    SurfaceInfo, SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSnapshot,
-    decode_server, decode_terminal_frame, encode_client,
+    SurfaceInfo, SurfaceStatus, TerminalTarget, WorkspaceMutation, WorkspaceSession,
+    WorkspaceSnapshot, decode_server, decode_terminal_frame, encode_client,
 };
 use crate::{identity, pipe};
 use sha2::{Digest, Sha256};
@@ -1273,6 +1273,33 @@ impl DaemonClient {
         }
     }
 
+    /// Submits `mutation`, made against `sessions`: the tabs and layouts as the caller read
+    /// them. A stale revision is resubmitted under the same id (a refused mutation leaves no
+    /// receipt) while tabs and layouts are still those, because the newer revision then
+    /// only records shell status or size updates, or a project the daemon found for a tab.
+    /// Any other change to tabs still fails, so a concurrent edit is never overwritten.
+    pub fn submit_mutation_rebasing(
+        &mut self,
+        mut mutation: MutationRequest,
+        sessions: &[WorkspaceSession],
+    ) -> Result<MutationReceipt> {
+        let mut attempts = 0;
+        loop {
+            let result = self.submit_mutation(mutation.clone());
+            attempts += 1;
+            if !result.as_ref().err().is_some_and(is_revision_conflict) || attempts >= 5 {
+                return result;
+            }
+            let current = self.workspace()?;
+            if current.server_generation != mutation.expected_generation
+                || user_tabs(&current.sessions) != user_tabs(sessions)
+            {
+                return result;
+            }
+            mutation.expected_revision = current.revision;
+        }
+    }
+
     pub fn mutate(&mut self, operation: WorkspaceMutation) -> Result<MutationReceipt> {
         for _ in 0..8 {
             let workspace = self.workspace()?;
@@ -1731,6 +1758,24 @@ fn terminal_operation(message: &ClientMessage) -> bool {
             | ClientMessage::RequestSnapshot
             | ClientMessage::ClearScrollback
     )
+}
+
+/// The daemon refused a mutation because the workspace moved past the revision it was
+/// made against; nothing was applied.
+pub fn is_revision_conflict(error: &crate::Error) -> bool {
+    error
+        .downcast_ref::<DaemonError>()
+        .is_some_and(|daemon| daemon.code == ErrorCode::RevisionConflict)
+}
+
+/// Tabs and layouts as people change them: `sessions` without tab projects, which the
+/// daemon also sets on its own as it finds where a tab works.
+fn user_tabs(sessions: &[WorkspaceSession]) -> Vec<WorkspaceSession> {
+    let mut sessions = sessions.to_vec();
+    for tab in sessions.iter_mut().flat_map(|session| &mut session.tabs) {
+        tab.project = None;
+    }
+    sessions
 }
 
 fn next_mutation_id() -> String {

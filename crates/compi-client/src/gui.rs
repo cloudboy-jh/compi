@@ -755,6 +755,29 @@ static MUTATION_RUN_NONCE: LazyLock<u128> = LazyLock::new(|| {
         .unwrap_or_default()
         .as_nanos()
 });
+
+fn next_mutation_id() -> MutationId {
+    MutationId::new(format!(
+        "gui-{}-{:x}-{}",
+        std::process::id(),
+        *MUTATION_RUN_NONCE,
+        NEXT_MUTATION_ID.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// What the error bar says about a workspace change that failed. A stale revision left
+/// after `submit_mutation_rebasing` means tabs changed meanwhile and nothing was applied;
+/// anything else may have been.
+fn mutation_failure(error: crate::Error) -> String {
+    if compi_protocol::is_revision_conflict(&error) {
+        "Tabs changed while this change was on its way, so nothing was changed. Try again.".into()
+    } else {
+        format!(
+            "Workspace change outcome is unconfirmed: {error}. Refreshing authoritative state; the operation will not be retried automatically."
+        )
+    }
+}
+
 static EVENT_ROUTES: LazyLock<Mutex<HashMap<u64, async_channel::Sender<UiEvent>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 

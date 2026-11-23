@@ -410,6 +410,18 @@ fn chat_escape(editing: bool, empty: bool, permission: bool, working: bool) -> C
     }
 }
 
+/// Whether `key` pastes into a chat: Ctrl+V (Cmd+V on macOS), and with Shift whether the
+/// text is typed in whatever its length.
+fn chat_paste_key(key: &Keystroke) -> Option<bool> {
+    let modifiers = &key.modifiers;
+    let paste_modifier = if cfg!(target_os = "macos") {
+        modifiers.platform && !modifiers.control
+    } else {
+        modifiers.control && !modifiers.platform
+    };
+    (key.key == "v" && paste_modifier && !modifiers.alt).then_some(modifiers.shift)
+}
+
 /// Tokens as the footer shows them: `950`, `31k`, `1.2M`.
 fn token_label(tokens: u64) -> String {
     let scaled = |value: u64, unit: u64, suffix: &str| {
@@ -1942,13 +1954,8 @@ impl CompiApp {
             return false;
         };
         let modifiers = &key.modifiers;
-        let paste_modifier = if cfg!(target_os = "macos") {
-            modifiers.platform && !modifiers.control
-        } else {
-            modifiers.control && !modifiers.platform
-        };
-        if key.key == "v" && paste_modifier && !modifiers.alt {
-            if modifiers.shift {
+        if let Some(inline) = chat_paste_key(key) {
+            if inline {
                 return self.paste_chat_text(&chat, true, window, cx);
             }
             return self.paste_chat_image(cx) || self.paste_chat_text(&chat, false, window, cx);
@@ -2095,6 +2102,19 @@ impl CompiApp {
         let escape = key.key == "escape" && plain;
         if !model.focus.is_focused(window) && !escape {
             // The transcript's text or a question's field has the keyboard.
+            return;
+        }
+        // A paste with the chat itself focused (after a click on its thumbnails or page)
+        // goes to the draft, as it would with the draft focused.
+        if let Some(inline) = chat_paste_key(key) {
+            window.focus(&model.composer.focus_handle(cx), cx);
+            let handled = !inline
+                && (self.paste_chat_image(cx) || self.paste_chat_text(&chat, false, window, cx));
+            if !handled {
+                self.paste_chat_text(&chat, true, window, cx);
+            }
+            cx.stop_propagation();
+            cx.notify();
             return;
         }
         let permission = model

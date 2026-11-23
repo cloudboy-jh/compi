@@ -10,9 +10,9 @@ use compi_protocol::system_metrics::{
 };
 use compi_protocol::{
     ClientMessage, ContentEnvironment, DaemonClient, DaemonError, ErrorCode, FolderContent,
-    LayoutNode, PROTOCOL_VERSION, PaneContent, PaneSide, PaneView, ScreenSnapshot, ServerEvent,
-    ServerMessage, SplitAxis, SplitGeometry, SurfaceId, SurfaceInfo, SurfaceStatus,
-    WorkspaceMutation,
+    LayoutNode, MutationId, MutationRequest, PROTOCOL_VERSION, PaneContent, PaneSide, PaneView,
+    ScreenSnapshot, ServerEvent, ServerMessage, SplitAxis, SplitGeometry, SurfaceId, SurfaceInfo,
+    SurfaceStatus, WorkspaceMutation,
 };
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -579,6 +579,54 @@ fn alternate_scroll_filters_only_synthetic_arrows_when_disabled() {
     });
     control.end_surface(&session).unwrap();
     wait_status(&mut control, &session.id, SurfaceStatus::Exited);
+    daemon.shutdown();
+}
+
+#[test]
+fn a_stale_change_goes_through_after_a_resize_but_not_after_a_tab_change() {
+    let mut daemon = DaemonGuard::start();
+    let mut control = daemon.client();
+    let surface = control.create_surface(80, 24, None).unwrap();
+    wait_status(&mut control, &surface.id, SurfaceStatus::Running);
+    let read = control.workspace().unwrap();
+    let tab_id = read.sessions[0].tabs[0].id.clone();
+    let rename = |label: &str, id: &str| MutationRequest {
+        server_id: read.server_id.clone(),
+        expected_generation: read.server_generation.clone(),
+        expected_revision: read.revision,
+        mutation_id: MutationId::new(id),
+        operation: WorkspaceMutation::RenameTab {
+            tab_id: tab_id.clone(),
+            label: label.into(),
+        },
+        launch: None,
+    };
+    // A window resizing the shell records its size in a newer revision, and the daemon
+    // may meanwhile find the tab's project; neither is a change to the tabs as read.
+    let attached = Controller::attach(&daemon, &surface, 100, 30);
+    let deadline = Instant::now() + TIMEOUT;
+    while control.workspace().unwrap().revision == read.revision {
+        assert!(
+            Instant::now() < deadline,
+            "the resize never reached the workspace"
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
+    control
+        .submit_mutation_rebasing(rename("renamed", "stale-after-resize"), &read.sessions)
+        .unwrap();
+    // The rename changed the tabs, so a change made against the first read is refused.
+    let error = control
+        .submit_mutation_rebasing(rename("again", "stale-after-rename"), &read.sessions)
+        .unwrap_err();
+    assert!(compi_protocol::is_revision_conflict(&error), "{error}");
+    assert_eq!(
+        control.workspace().unwrap().sessions[0].tabs[0].label,
+        "renamed"
+    );
+    drop(attached);
+    control.end_surface(&surface).unwrap();
+    wait_status(&mut control, &surface.id, SurfaceStatus::Exited);
     daemon.shutdown();
 }
 

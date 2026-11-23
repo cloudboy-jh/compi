@@ -1375,52 +1375,31 @@ fn presentation(
     })
 }
 
-/// Submit one change. A stale revision is retried when tabs and layouts are exactly as
-/// this command read them, because the newer revision then only records shell status or
-/// size updates (for example a window resizing panes a previous command created). Any
-/// structural change still fails, so a concurrent edit is never overwritten.
+/// Submit one change; a stale revision is retried as `submit_mutation_rebasing` says.
 fn submit(
     client: &mut DaemonClient,
     state: &WorkspaceSnapshot,
     operation: WorkspaceMutation,
     launch: Option<compi_protocol::LaunchContext>,
 ) -> Result<compi_protocol::MutationReceipt> {
-    let launch = launch.map(Box::new);
-    let mut revision = state.revision;
-    let mut attempts = 0;
-    loop {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos();
-        let result = client.submit_mutation(MutationRequest {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    client.submit_mutation_rebasing(
+        MutationRequest {
             server_id: state.server_id.clone(),
             expected_generation: state.server_generation.clone(),
-            expected_revision: revision,
+            expected_revision: state.revision,
             mutation_id: MutationId::new(format!(
                 "cli-{}-{stamp}-{}",
                 std::process::id(),
                 NEXT_MUTATION.fetch_add(1, Ordering::Relaxed)
             )),
-            operation: operation.clone(),
-            launch: launch.clone(),
-        });
-        let conflict = result.as_ref().err().is_some_and(|error| {
-            error
-                .downcast_ref::<compi_protocol::DaemonError>()
-                .is_some_and(|daemon| daemon.code == compi_protocol::ErrorCode::RevisionConflict)
-        });
-        attempts += 1;
-        if !conflict || attempts >= 5 {
-            return result;
-        }
-        let current = client.workspace()?;
-        if current.server_generation != state.server_generation
-            || current.sessions != state.sessions
-        {
-            return result;
-        }
-        revision = current.revision;
-    }
+            operation,
+            launch: launch.map(Box::new),
+        },
+        &state.sessions,
+    )
 }
 
 /// Whether a person can answer a prompt on stdin. From a WSL terminal, Windows gives the

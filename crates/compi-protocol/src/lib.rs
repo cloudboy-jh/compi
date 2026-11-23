@@ -28,7 +28,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub use client::{
     ClientIo, ConnectionFailure, ConnectionFailureKind, DaemonClient, DaemonError, LocalDaemon,
-    ServerEvent,
+    ServerEvent, is_revision_conflict,
 };
 pub use lifecycle_inventory::{LocalDaemonProcess, local_daemon_processes};
 

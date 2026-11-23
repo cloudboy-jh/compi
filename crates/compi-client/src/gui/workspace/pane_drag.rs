@@ -589,12 +589,7 @@ impl CompiApp {
                 server_id: workspace.server_id.clone(),
                 expected_generation: workspace.server_generation.clone(),
                 expected_revision: workspace.revision,
-                mutation_id: MutationId::new(format!(
-                    "gui-{}-{:x}-{}",
-                    std::process::id(),
-                    *MUTATION_RUN_NONCE,
-                    NEXT_MUTATION_ID.fetch_add(1, Ordering::Relaxed)
-                )),
+                mutation_id: next_mutation_id(),
                 operation,
                 launch: None,
             };
@@ -612,12 +607,15 @@ impl CompiApp {
                 let source =
                     tab_of(&workspace, &pane_id).ok_or("The moved pane no longer exists")?;
                 if matches!(source.layout, LayoutNode::Split { .. }) {
-                    client.submit_mutation(request(
-                        &workspace,
-                        WorkspaceMutation::DetachPane {
-                            pane_id: pane_id.clone(),
-                        },
-                    ))?;
+                    client.submit_mutation_rebasing(
+                        request(
+                            &workspace,
+                            WorkspaceMutation::DetachPane {
+                                pane_id: pane_id.clone(),
+                            },
+                        ),
+                        &workspace.sessions,
+                    )?;
                     workspace = client.workspace()?;
                 }
                 let source =
@@ -629,17 +627,20 @@ impl CompiApp {
                     .find(|tab| tab.id == tab_id)
                     .ok_or("The target tab no longer exists")?;
                 let layout = placed(&receiving.layout, source.layout.clone(), &placement);
-                let receipt = client.submit_mutation(request(
-                    &workspace,
-                    WorkspaceMutation::MergeTabs {
-                        tab_id: tab_id.clone(),
-                        sources: vec![source.id.clone()],
-                        layout,
-                    },
-                ))?;
+                let receipt = client.submit_mutation_rebasing(
+                    request(
+                        &workspace,
+                        WorkspaceMutation::MergeTabs {
+                            tab_id: tab_id.clone(),
+                            sources: vec![source.id.clone()],
+                            layout,
+                        },
+                    ),
+                    &workspace.sessions,
+                )?;
                 Ok((client.workspace()?, receipt))
             })()
-            .map_err(|error| error.to_string());
+            .map_err(mutation_failure);
             sender.send(UiEvent::MutationFinished {
                 result,
                 select_created: false,

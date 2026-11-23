@@ -1812,16 +1812,12 @@ impl CompiApp {
                 .divider_drag
                 .as_ref()
                 .map_or(workspace.revision, |drag| drag.revision),
-            mutation_id: MutationId::new(format!(
-                "gui-{}-{:x}-{}",
-                std::process::id(),
-                *MUTATION_RUN_NONCE,
-                NEXT_MUTATION_ID.fetch_add(1, Ordering::Relaxed)
-            )),
+            mutation_id: next_mutation_id(),
             operation,
             launch: launch.map(Box::new),
         };
         let mutation_id = mutation.mutation_id.clone();
+        let sessions = workspace.sessions.clone();
         self.mutation_pending = true;
         let sender = self.event_tx.clone();
         let target = self.target.clone();
@@ -1831,11 +1827,11 @@ impl CompiApp {
                 let receipt = if let Some((tab_id, tree)) = layout_guard {
                     Self::commit_divider(&mut client, mutation, &tab_id, &tree)?
                 } else {
-                    client.submit_mutation(mutation)?
+                    client.submit_mutation_rebasing(mutation, &sessions)?
                 };
                 Ok((client.workspace()?, receipt))
             })()
-            .map_err(|error| error.to_string());
+            .map_err(mutation_failure);
             sender.send(UiEvent::MutationFinished {
                 result,
                 select_created,
@@ -1877,12 +1873,7 @@ impl CompiApp {
                         })
                         && attempt < 7 =>
                 {
-                    mutation.mutation_id = MutationId::new(format!(
-                        "gui-{}-{:x}-{}",
-                        std::process::id(),
-                        *MUTATION_RUN_NONCE,
-                        NEXT_MUTATION_ID.fetch_add(1, Ordering::Relaxed)
-                    ));
+                    mutation.mutation_id = next_mutation_id();
                     thread::sleep(Duration::from_millis(20));
                 }
                 Err(error) => return Err(error),
@@ -2042,24 +2033,22 @@ impl CompiApp {
                     let Some(operation) = step(&workspace) else {
                         continue;
                     };
-                    receipt = Some(client.submit_mutation(MutationRequest {
-                        server_id: workspace.server_id.clone(),
-                        expected_generation: workspace.server_generation.clone(),
-                        expected_revision: workspace.revision,
-                        mutation_id: MutationId::new(format!(
-                            "gui-{}-{:x}-{}",
-                            std::process::id(),
-                            *MUTATION_RUN_NONCE,
-                            NEXT_MUTATION_ID.fetch_add(1, Ordering::Relaxed)
-                        )),
-                        operation,
-                        launch: None,
-                    })?);
+                    receipt = Some(client.submit_mutation_rebasing(
+                        MutationRequest {
+                            server_id: workspace.server_id.clone(),
+                            expected_generation: workspace.server_generation.clone(),
+                            expected_revision: workspace.revision,
+                            mutation_id: next_mutation_id(),
+                            operation,
+                            launch: None,
+                        },
+                        &workspace.sessions,
+                    )?);
                 }
                 let receipt = receipt.ok_or("the workspace changed before the change was sent")?;
                 Ok((client.workspace()?, receipt))
             })()
-            .map_err(|error| error.to_string());
+            .map_err(mutation_failure);
             sender.send(UiEvent::MutationFinished {
                 result,
                 select_created: false,
@@ -2446,9 +2435,7 @@ impl CompiApp {
                         self.draft_mutation_finished(Some(&receipt), cx);
                     }
                     Err(error) => {
-                        self.global_error = Some(format!(
-                            "Workspace change outcome is unconfirmed: {error}. Refreshing authoritative state; the operation will not be retried automatically."
-                        ));
+                        self.global_error = Some(error);
                         self.view_mutation_finished(None, cx);
                         self.refresh_surfaces(false);
                         self.remote_split_finished(None);
