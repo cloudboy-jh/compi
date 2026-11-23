@@ -10,11 +10,17 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 - **0.8.1**: published 2026-11-11 21:20 UTC, tagged `v0.8.1` at `d5fb6e3`, release run [43099782821](https://github.com/cloudboy-jh/compi/actions/runs/43099782821), 12 assets. Its in-app update from 0.8.0 rolled back on the working instance (the window hang, fixed in 0.8.2); Setup installed it.
 - **0.8.0**: published 2026-11-11 16:10 UTC, tagged `v0.8.0` at `7c12262`, release run [43053398818](https://github.com/cloudboy-jh/compi/actions/runs/43053398818), 12 assets.
 
+## v0.9.2 follow-through
+
+This release adds providers, sign-in and sign-out from the chat for all four agents (`/providers`, `/login`, `/logout`), `/update` and Settings → Agents updates, dragged project order with Home pinned by default, the linked-WSL new-tab fix, the model picker lined up with the message box, and a new thread's box growing with its pane. Protocol 42 → 43. See [Completed work](COMPLETED.md#providers-and-agent-updates-v092).
+
+- Not run yet: Claude Code's and Codex's browser sign-ins and sign-outs from the chat, and the expired-sign-in card live.
+- Run the in-app upgrade from 0.9.1 on the daily Windows install when convenient; protocol 42 → 43 restarts the local daemon, ending open shells and chats.
+- Not seen natively: the macOS app, providers and project dragging on macOS.
+
 ## v0.9.1 follow-through
 
 This release adds tabs finding their project (WSL and linked folders included), Home in place of Loose tabs, sidebar card dragging (`SetTabProject`, protocol 42), new tabs and threads in the selected tab's project with a draft's project switch, one-line indented sidebar cards, and the theme grid's own scroll. See [Completed work](COMPLETED.md#chat-first-v090).
-
-- **Unreleased fix:** new tabs/threads from a linked WSL project keep the focused folder's environment instead of switching to Windows OMP and its separate logins/sessions. Reproduced in installed 0.9.1 and verified in Windows `cargo dev`; [evidence](COMPLETED.md#after-091-unreleased). Ship with the next release.
 
 - Run the in-app upgrade from 0.9.0 on the daily Windows install when convenient; protocol 41 → 42 restarts the local daemon, ending open shells and chats.
 - Not seen natively: the macOS app, sidebar dragging on macOS.
