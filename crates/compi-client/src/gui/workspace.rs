@@ -353,6 +353,8 @@ pub(super) enum TextPurpose {
     CreateWorkspace,
     RenameWorkspace(SessionId),
     RenameTab(TabId),
+    /// A chat's thread, by chat ID: its name shows wherever the thread does.
+    RenameThread(String),
     SaveArrangement(TabId),
     /// A new group holding the tab; the name may be empty.
     NewTabGroup(TabId),
@@ -4166,16 +4168,8 @@ impl CompiApp {
                 }
             }
             Command::RenameTab => {
-                if let Some(tab) = self.selected_tab() {
-                    let id = tab.id.clone();
-                    let label = tab.label.clone();
-                    self.open_overlay(
-                        Overlay::Text {
-                            purpose: TextPurpose::RenameTab(id),
-                            title: "Rename terminal tab",
-                        },
-                        &label,
-                    );
+                if let Some(id) = self.selected_tab().map(|tab| tab.id.clone()) {
+                    self.rename_tab(&id);
                 }
             }
             Command::MoveTabLeft | Command::MoveTabRight => {
@@ -4728,6 +4722,12 @@ impl CompiApp {
                     TextPurpose::RenameTab(tab_id) => {
                         WorkspaceMutation::RenameTab { tab_id, label }
                     }
+                    TextPurpose::RenameThread(chat) => {
+                        self.rename_thread(&chat, label, window, cx);
+                        window.focus(&self.focus_handle, cx);
+                        cx.notify();
+                        return;
+                    }
                     TextPurpose::SaveArrangement(tab_id) => {
                         self.save_arrangement(&tab_id, &label);
                         window.focus(&self.focus_handle, cx);
@@ -5069,9 +5069,11 @@ impl CompiApp {
                         compi_protocol::PaneContent::Browser(browser) => {
                             (self.browser_title(&pane_id, &browser.url), None)
                         }
-                        compi_protocol::PaneContent::Chat(chat) => {
-                            (chat.harness.name().to_owned(), Some(chat.folder))
-                        }
+                        compi_protocol::PaneContent::Chat(chat) => (
+                            self.thread_name(&chat.id)
+                                .unwrap_or_else(|| chat.harness.name().to_owned()),
+                            Some(chat.folder),
+                        ),
                     };
                     Some(TabPane {
                         floating: self.state.is_floating(&pane_id),

@@ -128,7 +128,8 @@ gpui_kit_assets::icon_assets!(
     ]
 );
 
-/// Agents' brand marks (`AgentMark::Brand`), drawn in their own colours with `img`.
+/// Brand marks drawn in their own colours with `img`: agents' (`AgentMark::Brand`), and
+/// the two sides of a Windows PC an agent can run on.
 const BRAND_MARKS: &[(&str, &[u8])] = &[
     (
         "brands/omp.svg",
@@ -137,6 +138,14 @@ const BRAND_MARKS: &[(&str, &[u8])] = &[
     (
         "brands/opencode.svg",
         include_bytes!("../../assets/brands/opencode.svg"),
+    ),
+    (
+        "brands/ubuntu.svg",
+        include_bytes!("../../assets/brands/ubuntu.svg"),
+    ),
+    (
+        "brands/windows.svg",
+        include_bytes!("../../assets/brands/windows.svg"),
     ),
 ];
 

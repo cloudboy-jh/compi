@@ -26,7 +26,7 @@ use compi_protocol::chat::{
     newer_version,
 };
 use compi_protocol::{PaneContent, Project, SettingsContent, SettingsSection, WindowsShell};
-use gpui::Entity;
+use gpui::{Animation, AnimationExt, Entity, ease_out_quint};
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
 use std::rc::Rc;
@@ -1661,9 +1661,10 @@ fn agent_places(distribution: Option<&str>, install: Option<&AgentInstall>) -> V
     .into_iter()
     .filter_map(|(side, program)| {
         let program: &AgentProgram = program.as_ref()?;
-        Some(match &program.version {
-            Some(version) => format!("{side} {version}"),
-            None => side.to_owned(),
+        Some(match (&program.version, side.is_empty()) {
+            (Some(version), true) => version.clone(),
+            (Some(version), false) => format!("{side} {version}"),
+            (None, _) => side.to_owned(),
         })
     })
     .collect()
@@ -1674,11 +1675,9 @@ fn agent_places(distribution: Option<&str>, install: Option<&AgentInstall>) -> V
 fn side_name(distribution: Option<&str>, side: AgentSide) -> &str {
     match side {
         AgentSide::Windows => "Windows",
-        AgentSide::Linux => distribution.unwrap_or(if cfg!(target_os = "macos") {
-            "macOS"
-        } else {
-            "Linux"
-        }),
+        // Off Windows the host's own programs are the only ones: they go unnamed.
+        AgentSide::Linux if !cfg!(windows) => "",
+        AgentSide::Linux => distribution.unwrap_or("Linux"),
     }
 }
 
@@ -4750,17 +4749,18 @@ impl CompiApp {
         let status = match (&self.settings.agent_installs, places) {
             (None, _) => "Looking for it…".to_owned(),
             (Some(Err(error)), _) => format!("Couldn't look for it: {error}"),
-            // Linux first, then Windows (`agent_places`).
-            (Some(Ok(_)), Some(places)) if both && places.len() == 2 => {
-                let (used, other) = if windows_used {
-                    (&places[1], &places[0])
-                } else {
-                    (&places[0], &places[1])
-                };
-                format!("Chats use {used} · {other} not used")
+            (Some(Ok(_)), Some(_)) if both => {
+                "New chats use the one picked, in every folder".to_owned()
             }
             (Some(Ok(_)), Some(places)) if !places.is_empty() => {
-                format!("Chats use {}", places.join(" · "))
+                let lead = if cfg!(windows) {
+                    "Chats use"
+                } else {
+                    "Installed"
+                };
+                format!("{lead} {}", places.join(" · "))
+                    .trim_end()
+                    .to_owned()
             }
             (Some(Ok(_)), _) => {
                 format!("Not installed. Install it with {}", agent.entry().install)
@@ -4798,19 +4798,26 @@ impl CompiApp {
             .iter()
             .filter(|(updated, ..)| *updated == agent)
             .map(|(_, on, result)| {
+                // Off Windows there is one side, which goes unnamed.
                 let name = side(*on);
+                let named = if name.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {name}")
+                };
                 let (text, tint) = match result {
-                    None => (format!("Updating {name}…"), colors.muted),
+                    None => (format!("Updating{named}…"), colors.muted),
                     Some(Ok(AgentUpdated { from, to })) => (
                         match (from, to) {
                             (Some(from), Some(to)) if from != to => {
-                                format!("Updated {name}: {from} → {to}")
+                                format!("Updated{named}: {from} → {to}")
                             }
+                            _ if name.is_empty() => "Up to date".to_owned(),
                             _ => format!("{name} is up to date"),
                         },
                         colors.muted,
                     ),
-                    Some(Err(error)) => (format!("Couldn't update {name}: {error}"), colors.error),
+                    Some(Err(error)) => (format!("Couldn't update{named}: {error}"), colors.error),
                 };
                 self.item_detail(text, tint)
             });
@@ -4830,7 +4837,11 @@ impl CompiApp {
                     SettingsAction::UpdateAgent(agent, on),
                     controls::text_button(
                         ("agent-update", agent as usize * 2 + on as usize),
-                        format!("Update {name} to {latest}"),
+                        if name.is_empty() {
+                            format!("Update to {latest}")
+                        } else {
+                            format!("Update {name} to {latest}")
+                        },
                     )
                     .header(),
                     cx,
@@ -4838,41 +4849,30 @@ impl CompiApp {
             })
             .collect();
         // Which program new chats use, when there are two.
-        let switch = both.then(|| {
-            let distribution = installs.and_then(|installs| installs.distribution.as_deref());
-            let option = |side: AgentSide, index: usize| {
-                controls::text_button(
-                    ("agent-side", agent as usize * 2 + index),
-                    side_name(distribution, side).to_owned(),
-                )
-                .selected((side == AgentSide::Windows) == windows_used)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.set_agent_side(agent, side);
-                    cx.notify();
-                }))
-            };
-            controls::highlight(
-                self.settings_focused(row, SettingsAction::AgentSide(agent)),
-                controls::segmented(
-                    ("agent-sides", agent as usize),
-                    [option(AgentSide::Linux, 0), option(AgentSide::Windows, 1)],
-                ),
-                cx,
-            )
-            .into_any_element()
-        });
-        let actions: Vec<AnyElement> = copy
-            .into_iter()
-            .chain(switch)
-            .chain(update_buttons)
-            .collect();
-        let action = (!actions.is_empty()).then(|| {
+        let switch = both
+            .then(|| {
+                let installs = installs?;
+                let install = installs
+                    .agents
+                    .iter()
+                    .find(|install| install.harness == agent)?;
+                Some(self.render_side_switch(
+                    row,
+                    agent,
+                    install,
+                    installs.distribution.as_deref(),
+                    windows_used,
+                    cx,
+                ))
+            })
+            .flatten();
+        let update_row = (!update_buttons.is_empty()).then(|| {
             div()
+                .pt_1()
                 .flex()
                 .flex_wrap()
-                .items_center()
                 .gap_1()
-                .children(actions)
+                .children(update_buttons)
                 .into_any_element()
         });
         let default = (self.config.chat_agent == agent).then(|| {
@@ -4885,12 +4885,137 @@ impl CompiApp {
                         .size(px(AGENT_MARK_SIZE))
                         .when(missing, |mark| mark.opacity(0.5)),
                     std::iter::once(div().child(agent.name()).into_any_element()).chain(default),
-                    std::iter::once(self.item_detail(status, colors.muted)).chain(updates),
-                    action,
+                    std::iter::once(self.item_detail(status, colors.muted))
+                        .chain(updates)
+                        .chain(update_row),
+                    copy.or(switch),
                     row.compact,
                 ),
             )
             .into_any_element()
+    }
+
+    /// The switch between `agent`'s two programs: a pill with each side's mark, name and
+    /// version, the one new chats use on a thumb that slides to it. A narrow card's pill
+    /// leaves the versions out to fit.
+    fn render_side_switch(
+        &self,
+        row: &RowCx,
+        agent: ChatHarness,
+        install: &AgentInstall,
+        distribution: Option<&str>,
+        windows_used: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let half_width = if row.compact { 104.0 } else { 132.0 };
+        const PAD: f32 = 3.0;
+        const HEIGHT: f32 = 34.0;
+        let colors = *self.colors();
+        let foreground = color(colors.foreground);
+        let muted = color(modal_text_color(colors.muted, &colors));
+        let chosen = usize::from(windows_used);
+        let half = |side: AgentSide, index: usize| {
+            let program = match side {
+                AgentSide::Linux => &install.linux,
+                AgentSide::Windows => &install.windows,
+            };
+            let version = program
+                .as_ref()
+                .and_then(|program| program.version.clone())
+                .filter(|_| !row.compact);
+            let name = side_name(distribution, side);
+            let picked = index == chosen;
+            let mark = match side {
+                AgentSide::Windows => Some("brands/windows.svg"),
+                AgentSide::Linux if name.starts_with("Ubuntu") => Some("brands/ubuntu.svg"),
+                AgentSide::Linux => None,
+            };
+            let mark = match mark {
+                Some(path) => gpui::img(path).size(px(15.0)).into_any_element(),
+                None => {
+                    controls::glyph(IconName::Terminal, if picked { foreground } else { muted })
+                        .into_any_element()
+                }
+            };
+            div()
+                .id(("agent-side", agent as usize * 2 + index))
+                .w(px(half_width))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(7.0))
+                .rounded_full()
+                .cursor_pointer()
+                .text_size(px(UI_SMALL_TEXT_SIZE))
+                .text_color(if picked { foreground } else { muted })
+                .when(!picked, |half| {
+                    half.hover(move |half| half.text_color(foreground))
+                })
+                .child(div().when(!picked, |mark| mark.opacity(0.55)).child(mark))
+                .child(
+                    div()
+                        .font_weight(if picked {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::MEDIUM
+                        })
+                        .child(name.to_owned()),
+                )
+                .children(version.map(|version| {
+                    div()
+                        .text_size(px(UI_MICRO_TEXT_SIZE))
+                        .text_color(muted)
+                        .child(version)
+                }))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.set_agent_side(agent, side);
+                    cx.notify();
+                }))
+        };
+        let (from, to) = (
+            px(PAD + half_width * (1 - chosen) as f32),
+            px(PAD + half_width * chosen as f32),
+        );
+        let reduced = *super::focus::REDUCED_MOTION;
+        let thumb = div()
+            .absolute()
+            .top(px(PAD))
+            .bottom(px(PAD))
+            .left(to)
+            .w(px(half_width))
+            .rounded_full()
+            .bg(color(colors.accent).opacity(0.16))
+            .border_1()
+            .border_color(color(colors.accent).opacity(0.7))
+            .with_animation(
+                SharedString::from(format!("agent-side-thumb-{}-{chosen}", agent as usize)),
+                Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                move |thumb, progress| {
+                    let progress = if reduced { 1.0 } else { progress };
+                    thumb.left(from + (to - from) * progress)
+                },
+            );
+        let track = div()
+            .relative()
+            .flex_none()
+            .flex()
+            .items_center()
+            .h(px(HEIGHT))
+            .p(px(PAD))
+            .rounded_full()
+            .border_1()
+            .border_color(color(colors.border))
+            .bg(color(colors.background))
+            .child(thumb)
+            .child(half(AgentSide::Linux, 0))
+            .child(half(AgentSide::Windows, 1));
+        controls::highlight(
+            self.settings_focused(row, SettingsAction::AgentSide(agent)),
+            track,
+            cx,
+        )
+        .into_any_element()
     }
 
     /// Default agent from the keyboard: the next installed agent after the current one,
@@ -7349,21 +7474,30 @@ mod tests {
             }),
             latest: None,
         };
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                agent_places(
+                    Some("Ubuntu"),
+                    Some(&install(Some("19.0.0"), Some("19.0.1")))
+                ),
+                ["Ubuntu 19.0.0", "Windows 19.0.1"]
+            );
+            // A program that reports no version is named alone.
+            assert_eq!(
+                agent_places(Some("Ubuntu"), Some(&install(None, Some("")))),
+                ["Windows"]
+            );
+            assert_eq!(
+                agent_places(Some("Debian"), Some(&install(Some(""), None))),
+                ["Debian"]
+            );
+        }
+        // Off Windows the host's own program is the only one: its version alone.
+        #[cfg(not(windows))]
         assert_eq!(
-            agent_places(
-                Some("Ubuntu"),
-                Some(&install(Some("19.0.0"), Some("19.0.1")))
-            ),
-            ["Ubuntu 19.0.0", "Windows 19.0.1"]
-        );
-        // A program that reports no version is named alone.
-        assert_eq!(
-            agent_places(Some("Ubuntu"), Some(&install(None, Some("")))),
-            ["Windows"]
-        );
-        assert_eq!(
-            agent_places(Some("Debian"), Some(&install(Some(""), None))),
-            ["Debian"]
+            agent_places(None, Some(&install(Some("19.0.0"), None))),
+            ["19.0.0"]
         );
         assert!(agent_places(Some("Ubuntu"), Some(&install(None, None))).is_empty());
         assert!(agent_places(Some("Ubuntu"), None).is_empty());

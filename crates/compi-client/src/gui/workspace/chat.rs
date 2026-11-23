@@ -1381,6 +1381,21 @@ impl CompiApp {
         self.chat_request(chat, message, None, window, cx);
     }
 
+    /// Names thread `chat` `title` for good, wherever it shows.
+    pub(super) fn rename_thread(
+        &mut self,
+        chat: &str,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let message = ClientMessage::RenameThread {
+            chat: chat.to_owned(),
+            title,
+        };
+        self.chat_action(chat, message, window, cx);
+    }
+
     /// Sends the composer's text, with its attachments: as the next prompt when the chat
     /// waits for one, else into the running turn or after it as `ChatModel::delivery`
     /// says for Enter or, with `secondary`, Ctrl/Cmd+Enter. Runs Compi's own `/` command

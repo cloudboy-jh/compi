@@ -330,6 +330,13 @@ impl CompiApp {
         }
     }
 
+    /// What the program in pane `pane_id` most needs the user for, or is doing.
+    pub(super) fn pane_program_state(&self, pane_id: &PaneId) -> Option<ProgramState> {
+        self.pane_records(pane_id)
+            .headline()
+            .map(|headline| headline.state)
+    }
+
     /// The state the tab's panes most need the user for.
     pub(super) fn tab_program_headline(&self, tab: &WorkspaceTab) -> Option<Headline> {
         let mut leaves = Vec::new();

@@ -26,6 +26,9 @@ pub(super) struct ThreadRecord {
     pub chat: ChatContent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The user named it: the agent's own titles no longer replace `title`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub named: bool,
     pub created_ms: u64,
     /// When its transcript last changed.
     pub updated_ms: u64,
@@ -44,6 +47,7 @@ impl ThreadRecord {
             format: FORMAT,
             chat,
             title,
+            named: false,
             created_ms,
             updated_ms,
             entries,

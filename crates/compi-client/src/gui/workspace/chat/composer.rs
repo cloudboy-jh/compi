@@ -1344,11 +1344,13 @@ impl CompiApp {
                             .font_weight(FontWeight::NORMAL),
                     )
                     .when(empty, |draft| {
+                        // The hint ends in "…" where the card is too narrow for it.
                         draft.child(
                             div()
                                 .absolute()
                                 .top(ui_rems(12.0))
                                 .left(ui_rems(12.0))
+                                .right(ui_rems(12.0))
                                 .flex()
                                 .items_center()
                                 .gap_1p5()
@@ -1358,7 +1360,7 @@ impl CompiApp {
                                         .flex_none()
                                         .size(ui_rems(MARK_SIZE)),
                                 )
-                                .child(if working {
+                                .child(div().min_w_0().truncate().child(if working {
                                     let harness = chat.harness.name();
                                     match self.config.chat_enter {
                                         crate::config::ChatEnter::Steer => format!(
@@ -1373,7 +1375,7 @@ impl CompiApp {
                                         "Ask {} anything  ·  / commands  ·  @ files",
                                         chat.harness.name()
                                     )
-                                }),
+                                })),
                         )
                     }),
             )
@@ -1692,7 +1694,10 @@ impl CompiApp {
             }
             div()
                 .id("chat-usage")
-                .flex_none()
+                .min_w_0()
+                // Shrinks well before the model button does.
+                .flex_shrink(8.0)
+                .truncate()
                 .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                 .text_color(muted)
                 .child(label)
@@ -1744,16 +1749,25 @@ impl CompiApp {
                 cx.notify();
             }),
         );
+        // Narrow, the usage gives way first, then the model button; + and Send stay.
         div()
             .flex()
             .items_center()
             .gap_0p5()
             .min_w_0()
-            .child(attach)
-            .children(pickers)
-            .when(!others.is_empty(), |row| {
-                row.child(self.render_chat_more(chat, model, &others, cx))
-            })
+            .child(div().flex_none().child(attach))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .children(pickers)
+                    .when(!others.is_empty(), |row| {
+                        row.child(self.render_chat_more(chat, model, &others, cx))
+                    }),
+            )
             .child(div().flex_1())
             .children(usage)
             // Inset like the + glyph and the draft on the left, not flush with the row.

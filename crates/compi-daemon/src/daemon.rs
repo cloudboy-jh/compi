@@ -1071,6 +1071,11 @@ fn handle_connection(
                 ClientMessage::UpdateChatAgent { chat } => {
                     answer_chat(&sink, request_id, crate::chat::hub().update_chat(&chat))?
                 }
+                ClientMessage::RenameThread { chat, title } => answer_chat(
+                    &sink,
+                    request_id,
+                    crate::chat::hub().rename_thread(&chat, title),
+                )?,
                 // The updater can take minutes: it answers from a thread of its own.
                 ClientMessage::UpdateAgent { harness, side } => {
                     let sink = sink.clone();

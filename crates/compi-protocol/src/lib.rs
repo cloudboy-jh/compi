@@ -107,7 +107,8 @@ use std::fmt;
 // updates agents (`UpdateChatAgent`, `ChatState::update`, `UpdateAgent`,
 // `AgentInstall::latest`).
 // Version 44 lets a chat prefer the agent's Linux or Windows program
-// (`ChatContent::prefer`): one install for every folder.
+// (`ChatContent::prefer`): one install for every folder; and names a thread for good
+// (`RenameThread`).
 pub const PROTOCOL_VERSION: u32 = 44;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
@@ -662,6 +663,12 @@ pub enum ClientMessage {
     UpdateAgent {
         harness: chat::ChatHarness,
         side: chat::AgentSide,
+    },
+    /// Names thread `chat` `title` for good: the agent's own titles no longer replace it.
+    /// Answered by `ChatAccepted`.
+    RenameThread {
+        chat: String,
+        title: String,
     },
     ShutdownDaemon,
 }

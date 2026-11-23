@@ -134,6 +134,33 @@ struct SidebarCard {
     hidden: bool,
     pinned: bool,
     selected: bool,
+    /// One line per pane: what it is and what runs in it, for the card's hover.
+    panes: Vec<String>,
+    /// How many panes the tab has, by kind, when it has more than one ("2 threads").
+    count: Option<String>,
+}
+
+/// What a pane holds, for a card's count.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaneKind {
+    Thread,
+    Terminal,
+    Other,
+}
+
+/// The count a card shows for its tab's panes: none for one, "2 threads" or "2
+/// terminals" when all are one kind, else "3 panes".
+fn pane_count(kinds: &[PaneKind]) -> Option<String> {
+    let count = kinds.len();
+    if count < 2 {
+        return None;
+    }
+    let noun = match kinds[0] {
+        PaneKind::Thread if kinds.iter().all(|kind| *kind == PaneKind::Thread) => "threads",
+        PaneKind::Terminal if kinds.iter().all(|kind| *kind == PaneKind::Terminal) => "terminals",
+        _ => "panes",
+    };
+    Some(format!("{count} {noun}"))
 }
 
 impl SidebarCard {
@@ -503,8 +530,7 @@ impl CompiApp {
         let title = match chat {
             Some(_) if draft => "New thread".to_owned(),
             Some(chat) => self
-                .watched_chat_title(&chat.id)
-                .or_else(|| listed.map(|thread| thread_title(thread).to_owned()))
+                .thread_name(&chat.id)
                 .unwrap_or_else(|| "New thread".to_owned()),
             None => self.tab_label(tab),
         };
@@ -515,6 +541,7 @@ impl CompiApp {
             .filter(|_| self.config.program_status.sidebar)
             .map(|headline| headline.state)
             .filter(|state| *state != ProgramState::Idle);
+        let panes = self.tab_pane_lines(tab);
         SidebarCard {
             tab: tab.id.clone(),
             session: session.clone(),
@@ -530,7 +557,51 @@ impl CompiApp {
             hidden: self.state.hidden_tabs.contains(&tab.id),
             pinned: self.state.pinned_tabs.contains(&tab.id),
             selected: selected_tab == Some(&tab.id),
+            count: pane_count(&panes.iter().map(|(kind, _)| *kind).collect::<Vec<_>>()),
+            panes: panes.into_iter().map(|(_, line)| line).collect(),
         }
+    }
+
+    /// Each of the tab's panes, in layout order: its kind, and a line naming it and what
+    /// runs in it ("OMP · fix login · Working", "Terminal · npm run dev").
+    fn tab_pane_lines(&self, tab: &WorkspaceTab) -> Vec<(PaneKind, String)> {
+        crate::arrangement::leaves(&tab.layout)
+            .into_iter()
+            .zip(self.tab_panes(tab))
+            .map(|(leaf, pane)| {
+                let state = self
+                    .pane_program_state(&pane.pane_id)
+                    .filter(|state| *state != ProgramState::Idle)
+                    .map(crate::program_status::state_label);
+                // A terminal showing a chat (its view) counts as the thread it shows.
+                let (kind, mut line) = match leaf.shown_content() {
+                    Some(PaneContent::Chat(chat)) => {
+                        let title = self
+                            .thread_name(&chat.id)
+                            .unwrap_or_else(|| "New thread".to_owned());
+                        (
+                            PaneKind::Thread,
+                            format!("{} · {title}", chat.harness.name()),
+                        )
+                    }
+                    Some(content) => {
+                        let label = content.label();
+                        let line = if pane.title == label {
+                            label.to_owned()
+                        } else {
+                            format!("{label} · {}", pane.title)
+                        };
+                        (PaneKind::Other, line)
+                    }
+                    None => (PaneKind::Terminal, format!("Terminal · {}", pane.title)),
+                };
+                if let Some(state) = state {
+                    line.push_str(" · ");
+                    line.push_str(state);
+                }
+                (kind, line)
+            })
+            .collect()
     }
 
     /// The chat the tab shows: a chat pane's, or a terminal's showing its chat view.
@@ -618,18 +689,40 @@ impl CompiApp {
         cx.notify();
     }
 
-    /// Asks to rename tab `id`, as Rename terminal tab does for the selected one.
-    fn rename_tab(&mut self, id: &TabId) {
-        let Some(label) = self.tab_by_id(id).map(|tab| tab.label.clone()) else {
+    /// Asks to rename tab `id`: a chat's thread, whose name shows wherever the thread
+    /// does, else the tab's label.
+    pub(super) fn rename_tab(&mut self, id: &TabId) {
+        let Some(tab) = self.tab_by_id(id) else {
             return;
         };
-        self.open_overlay(
-            Overlay::Text {
-                purpose: TextPurpose::RenameTab(id.clone()),
-                title: "Rename terminal tab",
-            },
-            &label,
-        );
+        let (purpose, title, name) = match self.tab_chat_content(tab) {
+            Some(chat) => {
+                let name = self.thread_name(&chat.id).unwrap_or_default();
+                (
+                    TextPurpose::RenameThread(chat.id.clone()),
+                    "Rename thread",
+                    name,
+                )
+            }
+            None => (
+                TextPurpose::RenameTab(id.clone()),
+                "Rename terminal tab",
+                tab.label.clone(),
+            ),
+        };
+        self.open_overlay(Overlay::Text { purpose, title }, &name);
+    }
+
+    /// Thread `chat`'s name: its header's while this window watches it, else the
+    /// daemon's list.
+    pub(super) fn thread_name(&self, chat: &str) -> Option<String> {
+        self.watched_chat_title(chat).or_else(|| {
+            self.sidebar
+                .threads
+                .iter()
+                .find(|thread| thread.chat.id == chat)
+                .map(|thread| thread_title(thread).to_owned())
+        })
     }
 
     /// New workspace: makes "Workspace N" at once and renames its label in place; with
@@ -1914,10 +2007,18 @@ impl CompiApp {
         if card.hidden {
             detail.push("Hidden".to_owned());
         }
+        // What runs in each pane comes first, then where the tab is.
+        let hover: Vec<String> = card
+            .panes
+            .iter()
+            .cloned()
+            .chain(std::iter::once(String::new()))
+            .chain(detail)
+            .collect();
         let tooltip = self
             .context_menu
             .is_none()
-            .then(|| controls::tooltip(card.title.clone(), Some(detail.join("\n").into()), None));
+            .then(|| controls::tooltip(card.title.clone(), Some(hover.join("\n").into()), None));
         let background = if card.selected {
             Some(blend_rgb(colors.surface, colors.foreground, 0.09))
         } else if highlighted {
@@ -2008,6 +2109,13 @@ impl CompiApp {
                         }
                     })),
             )
+            .children(card.count.clone().map(|count| {
+                div()
+                    .flex_none()
+                    .text_size(px(UI_MICRO_TEXT_SIZE))
+                    .text_color(muted)
+                    .child(count)
+            }))
             .children(card_note(&card, now).map(|note| {
                 div()
                     .flex_none()
@@ -2068,7 +2176,24 @@ mod tests {
             hidden: false,
             pinned: false,
             selected: false,
+            panes: Vec::new(),
+            count: None,
         }
+    }
+
+    #[test]
+    fn a_card_counts_its_panes_by_kind_when_it_has_several() {
+        use PaneKind::{Other, Terminal, Thread};
+        assert_eq!(pane_count(&[Thread]), None);
+        assert_eq!(pane_count(&[Thread, Thread]).as_deref(), Some("2 threads"));
+        assert_eq!(
+            pane_count(&[Terminal, Terminal]).as_deref(),
+            Some("2 terminals")
+        );
+        assert_eq!(
+            pane_count(&[Thread, Terminal, Other]).as_deref(),
+            Some("3 panes")
+        );
     }
 
     #[test]

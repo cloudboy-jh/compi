@@ -59,6 +59,8 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 const WATCH_STATE_BYTES: usize = 6 * 1024 * 1024;
 /// The longest line a sub-agent's activity keeps, in characters.
 const AGENT_ACTIVITY_CHARS: usize = 160;
+/// The longest name a user gives a thread, in characters.
+const MAX_THREAD_TITLE_CHARS: usize = 200;
 #[cfg(windows)]
 pub(crate) const WSL_EXE: &str = r"C:\Windows\System32\wsl.exe";
 
@@ -266,6 +268,25 @@ impl ChatHub {
 
     pub fn check_providers(&self, id: &str) -> Result<(), String> {
         self.get(id)?.check_providers();
+        Ok(())
+    }
+
+    /// Names thread `id` `title`, for good: the agent's own titles no longer replace it.
+    pub fn rename_thread(&self, id: &str, title: String) -> Result<(), String> {
+        let title = title.trim();
+        if title.is_empty() || title.chars().count() > MAX_THREAD_TITLE_CHARS {
+            return Err(format!(
+                "a thread's name is 1–{MAX_THREAD_TITLE_CHARS} characters"
+            ));
+        }
+        let chat = self.get(id)?;
+        let mut inner = chat.lock();
+        inner.named = false;
+        inner.emit(ChatEvent::Title {
+            title: Some(title.to_owned()),
+        });
+        inner.named = true;
+        inner.save_thread(false);
         Ok(())
     }
 
@@ -838,6 +859,8 @@ struct Inner {
     /// The agent's providers want asking for: it started, a turn failed, or a sign-in
     /// ended.
     providers_due: bool,
+    /// The user named the thread (`rename`), so the agent's own titles leave its title.
+    named: bool,
 }
 
 /// A sign-in running for the chat.
@@ -1702,6 +1725,7 @@ impl Inner {
             .collect();
         self.state.entries = entries;
         self.state.title = thread.title;
+        self.named = thread.named;
         if thread.chat.session.is_some() {
             self.state.session = thread.chat.session;
         }
@@ -1744,7 +1768,7 @@ impl Inner {
             return None;
         }
         let times = self.thread?;
-        Some(ThreadRecord::new(
+        let mut record = ThreadRecord::new(
             ChatContent {
                 session: self.state.session.clone(),
                 ..content.clone()
@@ -1753,7 +1777,9 @@ impl Inner {
             times.created_ms,
             times.updated_ms,
             self.state.entries.clone(),
-        ))
+        );
+        record.named = self.named;
+        Some(record)
     }
 
     /// Notes `surface`, the terminal whose view shows the chat now, if one does.
@@ -1773,7 +1799,15 @@ impl Inner {
     }
 
     /// Applies `event` and sends it to every watcher still listening.
-    fn emit(&mut self, event: ChatEvent) {
+    fn emit(&mut self, mut event: ChatEvent) {
+        // A thread the user named keeps its name: the agent's titles leave it.
+        if self.named {
+            match &mut event {
+                ChatEvent::Title { .. } => return,
+                ChatEvent::Reset { state } => state.title.clone_from(&self.state.title),
+                _ => {}
+            }
+        }
         match &event {
             ChatEvent::Reset { .. } => {
                 self.tools.clear();
@@ -2668,6 +2702,27 @@ mod tests {
             ChatEntry::Tool(tool) => tool,
             other => panic!("entry {index} is {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_thread_the_user_named_keeps_its_name_over_the_agents_titles() {
+        let mut inner = Inner::default();
+        inner.emit(ChatEvent::Title {
+            title: Some("Fix login".into()),
+        });
+        inner.named = true;
+        inner.emit(ChatEvent::Title {
+            title: Some("Agent's own title".into()),
+        });
+        assert_eq!(inner.state.title.as_deref(), Some("Fix login"));
+        // Starting the agent again replaces the whole state but not the name.
+        inner.emit(ChatEvent::Reset {
+            state: Box::new(ChatState {
+                title: Some("Fresh title".into()),
+                ..ChatState::default()
+            }),
+        });
+        assert_eq!(inner.state.title.as_deref(), Some("Fix login"));
     }
 
     #[test]
