@@ -317,10 +317,14 @@ pub struct ProjectSettings {
     pub name: Option<String>,
     pub icon: Option<ProjectIcon>,
     /// Pinned projects come first in the sidebar's project headers and the palette.
+    /// Home starts pinned until something is set for it.
     pub pinned: bool,
     /// Archived projects leave the palette's Projects and Settings → Projects' main
     /// list (they sit under Archived there); their threads and settings stay.
     pub archived: bool,
+    /// Its place among the projects in the sidebar and Settings → Projects, set by
+    /// dragging its heading; projects without one follow the others of their group.
+    pub order: Option<u32>,
     /// The agent new threads in the project start with.
     pub agent: Option<ChatHarness>,
     /// The model new threads in the project start on (the agent's own model id).
@@ -1466,6 +1470,29 @@ impl LoadedConfig {
         project_folder_key(project) == project_folder_key(&self.home_project())
     }
 
+    /// What `project` has before anything is set for it: nothing, but Home is pinned.
+    fn new_project_settings(&self, project: &compi_protocol::Project) -> ProjectSettings {
+        ProjectSettings {
+            pinned: self.is_home_project(project),
+            ..ProjectSettings::default()
+        }
+    }
+
+    /// What is set for `project`, else what it has before anything is set.
+    pub fn project_settings_or_new(&self, project: &compi_protocol::Project) -> ProjectSettings {
+        self.projects
+            .get(&self.project_settings_key(project))
+            .cloned()
+            .unwrap_or_else(|| self.new_project_settings(project))
+    }
+
+    /// Whether `project` is pinned; Home is until something is set for it.
+    pub fn project_pinned(&self, project: &compi_protocol::Project) -> bool {
+        self.projects
+            .get(&self.project_settings_key(project))
+            .map_or_else(|| self.is_home_project(project), |settings| settings.pinned)
+    }
+
     /// Persist what you set for the project under `key` (`project_key`) in Settings →
     /// Projects; nothing set removes its table.
     pub fn save_project_settings(
@@ -1475,38 +1502,44 @@ impl LoadedConfig {
     ) -> Result<(), String> {
         update_table(&self.path, "projects", |projects| {
             projects.set_implicit(true);
-            if settings == ProjectSettings::default() {
-                projects.remove(key);
-                return;
-            }
-            let item = projects
-                .entry(key)
-                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
-            if !item.is_table() {
-                *item = toml_edit::Item::Table(toml_edit::Table::new());
-            }
-            let Some(table) = item.as_table_mut() else {
-                return;
-            };
-            let mut set = |field: &str, value: Option<toml_edit::Value>| match value {
-                Some(value) => set_table_value(table, field, value),
-                None => {
-                    table.remove(field);
-                }
-            };
-            set("saved", settings.saved.then(|| true.into()));
-            set("name", settings.name.as_deref().map(Into::into));
-            set("icon", settings.icon.as_ref().map(project_icon_to_toml));
-            set("pinned", settings.pinned.then(|| true.into()));
-            set("archived", settings.archived.then(|| true.into()));
-            set("agent", settings.agent.map(|agent| agent.program().into()));
-            set("model", settings.model.as_deref().map(Into::into));
+            write_project_table(projects, key, &settings);
         })?;
         if settings == ProjectSettings::default() {
             self.projects.remove(key);
         } else {
             self.projects.insert(key.to_owned(), settings);
         }
+        Ok(())
+    }
+
+    /// Persist the projects' order: each of `keys` (`project_settings_key`) is numbered
+    /// by its place. A project with nothing set yet keeps what it has before (Home
+    /// stays pinned).
+    pub fn save_project_order(&mut self, keys: &[String]) -> Result<(), String> {
+        let ordered: Vec<(&String, ProjectSettings)> = keys
+            .iter()
+            .zip(0..)
+            .map(|(key, place)| {
+                let mut settings = self.projects.get(key).cloned().unwrap_or_else(|| {
+                    project_from_key(key)
+                        .map(|project| self.new_project_settings(&project))
+                        .unwrap_or_default()
+                });
+                settings.order = Some(place);
+                (key, settings)
+            })
+            .collect();
+        update_table(&self.path, "projects", |projects| {
+            projects.set_implicit(true);
+            for (key, settings) in &ordered {
+                write_project_table(projects, key, settings);
+            }
+        })?;
+        self.projects.extend(
+            ordered
+                .into_iter()
+                .map(|(key, settings)| (key.clone(), settings)),
+        );
         Ok(())
     }
 
@@ -2278,6 +2311,37 @@ fn set_table_value(table: &mut toml_edit::Table, key: &str, mut value: toml_edit
     table[key] = toml_edit::Item::Value(value);
 }
 
+/// Writes `settings` as `[projects]`'s table `key`; nothing set removes it.
+fn write_project_table(projects: &mut toml_edit::Table, key: &str, settings: &ProjectSettings) {
+    if *settings == ProjectSettings::default() {
+        projects.remove(key);
+        return;
+    }
+    let item = projects
+        .entry(key)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    if !item.is_table() {
+        *item = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let Some(table) = item.as_table_mut() else {
+        return;
+    };
+    let mut set = |field: &str, value: Option<toml_edit::Value>| match value {
+        Some(value) => set_table_value(table, field, value),
+        None => {
+            table.remove(field);
+        }
+    };
+    set("saved", settings.saved.then(|| true.into()));
+    set("name", settings.name.as_deref().map(Into::into));
+    set("icon", settings.icon.as_ref().map(project_icon_to_toml));
+    set("pinned", settings.pinned.then(|| true.into()));
+    set("archived", settings.archived.then(|| true.into()));
+    set("order", settings.order.map(|order| i64::from(order).into()));
+    set("agent", settings.agent.map(|agent| agent.program().into()));
+    set("model", settings.model.as_deref().map(Into::into));
+}
+
 fn update_appearance(
     path: &Path,
     update: impl FnOnce(&mut toml_edit::Table),
@@ -3041,6 +3105,20 @@ fn apply_projects(document: &toml::Table, loaded: &mut LoadedConfig) {
                         "configuration",
                     ),
                 }
+            }
+        }
+        if let Some(value) = table.get("order") {
+            match value
+                .as_integer()
+                .and_then(|order| u32::try_from(order).ok())
+            {
+                Some(order) => settings.order = Some(order),
+                None => invalid(
+                    loaded,
+                    &format!("{field}.order"),
+                    "a place, 0 or more",
+                    "configuration",
+                ),
             }
         }
         if let Some(value) = table.get("agent") {
@@ -4060,6 +4138,7 @@ mod tests {
             }),
             pinned: true,
             archived: true,
+            order: Some(3),
             agent: Some(ChatHarness::Omp),
             model: Some("anthropic/claude-opus-5-5".into()),
         };
@@ -4143,7 +4222,7 @@ mod tests {
         fs::write(
             &path,
             "version = 1\n[projects.'host:/a']\nname = ''\npinned = 'yes'\nagent = 'nonesuch'\n\
-             archived = 1\n\
+             archived = 1\norder = -1\n\
              icon = { kind = 'monogram', text = 'ABC', color = 3 }\nmodel = 'm'\n\
              [projects.'host:/b']\nicon = { kind = 'lucide', name = 'rocket', color = 16 }\n\
              [projects.'host:/c']\nicon = { kind = 'sticker' }\n",
@@ -4159,7 +4238,7 @@ mod tests {
         );
         assert!(!invalid.projects.contains_key("host:/b"));
         assert!(!invalid.projects.contains_key("host:/c"));
-        assert_eq!(invalid.diagnostics.len(), 7, "{:?}", invalid.diagnostics);
+        assert_eq!(invalid.diagnostics.len(), 8, "{:?}", invalid.diagnostics);
         fs::remove_dir_all(root).ok();
     }
 

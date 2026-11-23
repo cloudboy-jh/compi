@@ -883,6 +883,21 @@ impl DaemonClient {
         }
     }
 
+    /// Updates `harness`'s program on `side`, waiting for the updater to finish.
+    pub fn update_agent(
+        &mut self,
+        harness: crate::chat::ChatHarness,
+        side: crate::chat::AgentSide,
+    ) -> Result<crate::chat::AgentUpdated> {
+        match self.request_bounded(
+            ClientMessage::UpdateAgent { harness, side },
+            Duration::from_secs(20 * 60),
+        )? {
+            ServerMessage::AgentUpdated { updated } => Ok(updated),
+            message => Err(unexpected_response(message)),
+        }
+    }
+
     /// Every thread the daemon keeps, newest change first.
     pub fn list_threads(&mut self) -> Result<Vec<crate::chat::ThreadInfo>> {
         match self.request_bounded(ClientMessage::ListThreads, Duration::from_secs(10))? {

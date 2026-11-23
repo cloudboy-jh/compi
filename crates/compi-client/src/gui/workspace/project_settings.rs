@@ -3,7 +3,8 @@
 //! Settings → Projects, where you set it. Every place a project shows reads it through
 //! these helpers, so a change applies in every window at once.
 //!
-//! Settings lists saved projects, pinned first, with archived projects folded away.
+//! Settings lists saved projects in the sidebar's order: pinned first, then as dragged
+//! there, with archived projects folded away.
 //! A row or a sidebar's Project settings… opens a dedicated detail page.
 //!
 //! Archiving hides a project from the palette's Projects and the page's main list; its
@@ -58,7 +59,16 @@ pub(super) enum ProjectControl {
 
 pub(super) struct ListedProject {
     pub(super) project: Project,
-    archived: bool,
+    pub(super) pinned: bool,
+    pub(super) archived: bool,
+}
+
+impl ListedProject {
+    /// Its group in the list: pinned, the others, then archived. Dragging keeps a
+    /// project in its group.
+    pub(super) fn group(&self) -> (bool, bool) {
+        (self.archived, !self.pinned)
+    }
 }
 
 /// New threads' agent choices: Default (Settings → General's), then each agent.
@@ -72,9 +82,9 @@ const AGENT_CHOICES: [Option<ChatHarness>; ChatHarness::ALL.len() + 1] = {
     choices
 };
 
-/// The saved projects and `home`, which is listed even unsaved and is never archived.
-/// Archived projects come last; within each section pinned projects come first, and
-/// Home after the other unpinned ones.
+/// The saved projects and `home`, which is listed even unsaved (pinned then) and is
+/// never archived. Archived projects come last and pinned projects first; within each
+/// group projects keep their dragged order, and those never dragged follow by key.
 fn listed_order(projects: &HashMap<String, ProjectSettings>, home: &Project) -> Vec<ListedProject> {
     let home_folder = project_folder_key(home);
     let mut entries: Vec<_> = projects
@@ -82,26 +92,27 @@ fn listed_order(projects: &HashMap<String, ProjectSettings>, home: &Project) -> 
         .filter_map(|(key, settings)| {
             let project = project_from_key(key)?;
             let is_home = project_folder_key(&project) == home_folder;
-            Some((
+            let listed = ListedProject {
                 project,
-                settings.archived && !is_home,
-                settings.pinned,
-                is_home,
-                key,
-            ))
+                pinned: settings.pinned,
+                archived: settings.archived && !is_home,
+            };
+            Some((listed, settings.order, key, is_home))
         })
         .collect();
     let home_key = crate::config::project_key(home);
     if !entries.iter().any(|entry| entry.3) {
-        entries.push((home.clone(), false, false, true, &home_key));
+        let home = ListedProject {
+            project: home.clone(),
+            pinned: true,
+            archived: false,
+        };
+        entries.push((home, None, &home_key, true));
     }
-    entries.sort_unstable_by_key(|&(_, archived, pinned, is_home, key)| {
-        (archived, !pinned, is_home, key)
+    entries.sort_unstable_by_key(|(listed, order, key, _)| {
+        (listed.group(), order.unwrap_or(u32::MAX), *key)
     });
-    entries
-        .into_iter()
-        .map(|(project, archived, ..)| ListedProject { project, archived })
-        .collect()
+    entries.into_iter().map(|(listed, ..)| listed).collect()
 }
 
 /// Whether every word of `query` (lowercase) is in the project's `name` or `place`.
@@ -324,7 +335,7 @@ impl CompiApp {
 
     /// Saves (or restores) the project chosen by Add project without launching it.
     pub(super) fn save_added_project(&mut self, project: &Project, cx: &mut Context<Self>) -> bool {
-        let mut settings = self.project_settings(project).cloned().unwrap_or_default();
+        let mut settings = self.config.project_settings_or_new(project);
         settings.saved = true;
         settings.archived = false;
         self.persist_project_settings(project, settings, cx)
@@ -351,6 +362,28 @@ impl CompiApp {
         true
     }
 
+    /// Saves `order`, the listed projects in their new order, for every window.
+    pub(super) fn save_project_order(&mut self, order: &[Project], cx: &mut Context<Self>) {
+        let keys: Vec<String> = order
+            .iter()
+            .map(|project| self.config.project_settings_key(project))
+            .collect();
+        if let Err(error) = self.config.save_project_order(&keys) {
+            self.global_error = Some(error);
+            return;
+        }
+        let saved: Vec<(String, ProjectSettings)> = keys
+            .into_iter()
+            .filter_map(|key| {
+                let settings = self.config.projects.get(&key)?.clone();
+                Some((key, settings))
+            })
+            .collect();
+        share_config_change(cx, move |config| {
+            config.projects.extend(saved.iter().cloned());
+        });
+    }
+
     /// Changes what you set for `project` with `change`, and saves it.
     fn edit_project(
         &mut self,
@@ -358,7 +391,7 @@ impl CompiApp {
         change: impl FnOnce(&mut ProjectSettings),
         cx: &mut Context<Self>,
     ) {
-        let mut settings = self.project_settings(project).cloned().unwrap_or_default();
+        let mut settings = self.config.project_settings_or_new(project);
         change(&mut settings);
         self.set_project_settings(project, settings, cx);
     }
@@ -1212,7 +1245,7 @@ impl CompiApp {
                     .child(self.project_icon(Some(project), ROW_ICON_SIZE)),
             )
             .child(text)
-            .when(settings.is_some_and(|settings| settings.pinned), |line| {
+            .when(self.config.project_pinned(project), |line| {
                 line.child(controls::chip("Pinned", ChipTone::Neutral))
             })
             .children(agent)
@@ -1369,7 +1402,7 @@ impl CompiApp {
         let pin_row = row.clone();
         let pin = controls::highlight(
             pin_focused,
-            controls::switch("project-pin", settings.pinned)
+            controls::switch("project-pin", self.config.project_pinned(project))
                 .label("Pin")
                 .on_toggle(cx.listener(move |this, _: &bool, window, cx| {
                     this.focus_settings_control(&pin_row, pin_action);
@@ -1644,41 +1677,112 @@ mod tests {
             environment: ContentEnvironment::Host,
             root: "/home/me".into(),
         };
-        let listed = listed_order(&saved, &home);
-        let order: Vec<_> = listed
-            .iter()
-            .map(|listed| (listed.project.root.as_str(), listed.archived))
-            .collect();
-        // Home is listed unsaved, after the other unpinned projects.
+        let roots = |saved: &HashMap<String, ProjectSettings>| -> Vec<_> {
+            listed_order(saved, &home)
+                .into_iter()
+                .map(|listed| (listed.project.root, listed.pinned, listed.archived))
+                .collect()
+        };
+        // Home is listed unsaved and starts pinned; never dragged, each group is by key.
         assert_eq!(
-            order,
+            roots(&saved),
             [
-                ("/b", false),
-                ("/a", false),
-                ("/c", false),
-                ("/home/me", false),
-                ("/d", true)
+                ("/b".into(), true, false),
+                ("/home/me".into(), true, false),
+                ("/a".into(), false, false),
+                ("/c".into(), false, false),
+                ("/d".into(), true, true)
             ]
         );
-        // Saved Home is listed once, and never archived.
+        // Saved Home is listed once and never archived; unpinned, it is ordered like
+        // any other project.
         let mut saved = saved;
         saved.insert(
             "host:/home/me".into(),
             ProjectSettings {
-                pinned: true,
                 archived: true,
                 ..Default::default()
             },
         );
-        let order: Vec<_> = listed_order(&saved, &home)
-            .iter()
-            .map(|listed| (listed.project.root.clone(), listed.archived))
-            .collect();
         assert_eq!(
-            order[..2],
-            [("/b".into(), false), ("/home/me".into(), false)]
+            roots(&saved),
+            [
+                ("/b".into(), true, false),
+                ("/a".into(), false, false),
+                ("/c".into(), false, false),
+                ("/home/me".into(), false, false),
+                ("/d".into(), true, true)
+            ]
         );
-        assert_eq!(order.len(), 5);
+    }
+
+    #[test]
+    fn a_dragged_project_order_is_saved_and_new_projects_join_their_group_last() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-project-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        std::fs::write(
+            &path,
+            "version = 1\n[projects.'host:/a']\nsaved = true\n[projects.'host:/b']\n\
+             saved = true\n[projects.'host:/c']\nsaved = true\npinned = true\n",
+        )
+        .unwrap();
+        let load = || crate::config::load(Some(&path), crate::config::FontOverrides::default());
+        let mut config = load();
+        let home = config.home_project();
+        let host = |root: &str| Project {
+            environment: ContentEnvironment::Host,
+            root: root.into(),
+        };
+        let roots = |config: &crate::config::LoadedConfig| -> Vec<Project> {
+            listed_order(&config.projects, &home)
+                .into_iter()
+                .map(|listed| listed.project)
+                .collect()
+        };
+        // Dragged: /c before Home among the pinned, /b before /a among the others.
+        let dragged = [host("/c"), home.clone(), host("/b"), host("/a")];
+        let keys: Vec<String> = dragged
+            .iter()
+            .map(|project| config.project_settings_key(project))
+            .collect();
+        config.save_project_order(&keys).unwrap();
+        let reloaded = load();
+        assert_eq!(roots(&reloaded), dragged);
+        // Home, saved only for its place, stays pinned.
+        assert!(reloaded.project_pinned(&home));
+        // New projects come last in their group.
+        for (key, pinned) in [("host:/d", false), ("host:/e", true)] {
+            config
+                .save_project_settings(
+                    key,
+                    ProjectSettings {
+                        saved: true,
+                        pinned,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            roots(&load()),
+            [
+                host("/c"),
+                home.clone(),
+                host("/e"),
+                host("/b"),
+                host("/a"),
+                host("/d")
+            ]
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

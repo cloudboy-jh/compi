@@ -17,6 +17,7 @@
 //! (`rules`). Models are every provider's OpenCode is set up with, as
 //! `provider/model`; thinking levels are the model's variants and modes its primary
 //! agents. 2.x takes a prompt into the running turn (steering); 1.x queues it.
+mod accounts;
 mod http;
 #[cfg(test)]
 mod tests;
@@ -25,6 +26,7 @@ mod v1;
 mod v2;
 
 use super::launch::Arg;
+pub(super) use accounts::{SignIn, answer_sign_in, check_providers, sign_in, sign_out};
 use super::{Chat, Driver, Inner, Prompt, SessionsReply, Wire, rfc3339};
 use compi_protocol::chat::{
     ChatAnswer, ChatAnswers, ChatChoice, ChatEntry, ChatEvent, ChatField, ChatHarness, ChatOption,
@@ -117,6 +119,8 @@ pub(super) struct OpenCode {
     chosen: Option<&'static str>,
     /// Where requests go to be sent, once the server listens.
     jobs: Option<mpsc::Sender<Job>>,
+    /// The server, once it listens, for the requests that wait on the user (sign-ins).
+    server: Option<http::Server>,
     dialect: Option<Dialect>,
     /// The models, agents and defaults are loaded: the event stream connected once.
     loading: bool,
@@ -329,6 +333,7 @@ fn line(chat: &Arc<Chat>, inner: &mut Inner, line: &str) {
     };
     let (jobs, queue) = mpsc::channel();
     opencode.jobs = Some(jobs);
+    opencode.server = Some(server.clone());
     let generation = inner.generation;
     let folder = inner.agent_folder().to_owned();
     let sender = (Arc::downgrade(chat), server.clone());
@@ -1582,6 +1587,7 @@ fn forget_asks(inner: &mut Inner) {
 fn fail_pending(inner: &mut Inner) {
     let opencode = inner.opencode();
     opencode.jobs = None;
+    opencode.server = None;
     for (_, pending) in opencode.pending.drain() {
         if let Pending::List(reply) = pending {
             let _ = reply.send(Err(format!("{} stopped", ChatHarness::OpenCode.name())));

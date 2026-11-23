@@ -231,19 +231,32 @@ fn wanted(text: &str, cursor: usize) -> Option<Wanted<'_>> {
     (starts_word && !query.contains(char::is_whitespace)).then_some(Wanted::File { at, query })
 }
 
-/// A `/` command Compi runs itself, whatever the harness; offered unless the harness has
-/// a command of the same name, which then wins. `/model` always opens Compi's picker,
-/// and a harness command of that name is not listed.
+/// A `/` command Compi runs itself, whatever the harness. `/new`, `/resume` and
+/// `/sessions` give way to a harness command of the same name; the rest are always
+/// Compi's (`always_compi`), and a harness command of their name is not listed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CompiCommand {
     New,
     Resume,
     Sessions,
     Model,
+    Providers,
+    Login,
+    Logout,
+    Update,
 }
 
 impl CompiCommand {
-    const ALL: [Self; 4] = [Self::New, Self::Resume, Self::Sessions, Self::Model];
+    const ALL: [Self; 8] = [
+        Self::New,
+        Self::Resume,
+        Self::Sessions,
+        Self::Model,
+        Self::Providers,
+        Self::Login,
+        Self::Logout,
+        Self::Update,
+    ];
 
     fn name(self) -> &'static str {
         match self {
@@ -251,13 +264,18 @@ impl CompiCommand {
             Self::Resume => "resume",
             Self::Sessions => "sessions",
             Self::Model => "model",
+            Self::Providers => "providers",
+            Self::Login => "login",
+            Self::Logout => "logout",
+            Self::Update => "update",
         }
     }
 
     fn hint(self) -> Option<&'static str> {
         match self {
-            Self::New | Self::Model => None,
+            Self::New | Self::Model | Self::Providers | Self::Update => None,
             Self::Resume | Self::Sessions => Some("[title or id]"),
+            Self::Login | Self::Logout => Some("[provider]"),
         }
     }
 
@@ -267,12 +285,22 @@ impl CompiCommand {
             Self::Resume => "Pick an earlier session in this folder to continue",
             Self::Sessions => "List the sessions in this folder",
             Self::Model => "Pick the model and thinking level",
+            Self::Providers => "See the model providers and accounts this agent uses",
+            Self::Login => "Sign in to a model provider",
+            Self::Logout => "Sign out of a model provider",
+            Self::Update => "Update this agent to its newest version",
         }
+    }
+
+    /// Compi's own whatever the harness offers: what the harness's command of the same
+    /// name does needs its own window (`/login`), or Compi's does more (`/model`).
+    fn always_compi(self) -> bool {
+        !matches!(self, Self::New | Self::Resume | Self::Sessions)
     }
 
     /// Whether the harness offers a command of this name that replaces Compi's.
     fn shadowed(self, harness: &[ChatCommand]) -> bool {
-        self != Self::Model && harness.iter().any(|command| self.named(command))
+        !self.always_compi() && harness.iter().any(|command| self.named(command))
     }
 
     /// Whether `command` has this command's name.
@@ -339,7 +367,11 @@ fn matching_commands<'a>(harness: &'a [ChatCommand], query: &str) -> Vec<ListedC
         .chain(
             harness
                 .iter()
-                .filter(|command| !CompiCommand::Model.named(command))
+                .filter(|command| {
+                    !CompiCommand::ALL
+                        .iter()
+                        .any(|compi| compi.always_compi() && compi.named(command))
+                })
                 .map(ListedCommand::Harness),
         )
         .filter(|command| command.name().to_lowercase().starts_with(&query))
@@ -930,6 +962,8 @@ impl CompiApp {
                         .child(self.chat_restart_button(chat, cx)),
                 )
             })
+            .children(state.and_then(|state| self.render_chat_providers(chat, state, cx)))
+            .children(state.and_then(|state| self.render_chat_update(chat, state, cx)))
             .children(state.and_then(|state| self.render_chat_sign_in(chat, state, cx)))
             .when_some(orphan, |footer, permission| {
                 footer.child(rows::render_permission_block(None, permission, &frame))

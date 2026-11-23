@@ -3852,7 +3852,7 @@ impl CompiApp {
             cx.notify();
             return true;
         }
-        if key.key == "escape" && self.cancel_card_drag(window, cx) {
+        if key.key == "escape" && self.cancel_sidebar_drag(window, cx) {
             cx.notify();
             return true;
         }

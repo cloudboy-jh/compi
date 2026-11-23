@@ -270,6 +270,10 @@ struct ChatModel {
     /// what Compi remembers of its harness, on its project's model (see
     /// `CompiApp::new_session_picks`); kept current before each frame.
     start: Arc<Mutex<ChatPicks>>,
+    /// The providers list (`/providers`) shows above the message box.
+    providers_open: bool,
+    /// The update the user dismissed; its card stays hidden while the daemon shows it.
+    update_seen: Option<compi_protocol::chat::ChatAgentUpdate>,
 }
 
 /// The chats of this window.
@@ -1178,6 +1182,8 @@ impl CompiApp {
             picker_anchor: Rc::default(),
             approval: Arc::default(),
             start: Arc::default(),
+            providers_open: false,
+            update_seen: None,
         }
     }
 
@@ -1483,6 +1489,15 @@ impl CompiApp {
             }
             CompiCommand::Model => {
                 self.open_model_picker(chat, PickerColumn::Models, window, cx);
+            }
+            CompiCommand::Providers => self.open_chat_providers(chat, window, cx),
+            CompiCommand::Login => self.login_command(chat, &argument, false, window, cx),
+            CompiCommand::Logout => self.login_command(chat, &argument, true, window, cx),
+            CompiCommand::Update => {
+                let message = ClientMessage::UpdateChatAgent {
+                    chat: chat.to_owned(),
+                };
+                self.chat_action(chat, message, window, cx);
             }
         }
     }

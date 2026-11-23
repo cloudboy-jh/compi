@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 mod drag;
 pub(in crate::gui) use drag::CardDrag;
-use drag::CardDrop;
+use drag::{CardDrop, ProjectDrag, ProjectDrop, ProjectLine};
 use gpui::DragMoveEvent;
 
 /// The cards Go to sidebar card 1–9 reach.
@@ -30,8 +30,8 @@ const CARD_GUIDE_X: f32 = 26.0;
 const FOOTER_BUTTON_HEIGHT: f32 = 32.0;
 
 /// The sidebar's own state: its search, the threads last listed, a label being
-/// renamed in place and a card being dragged. What is folded lives in the window's
-/// state.
+/// renamed in place and a card or project heading being dragged. What is folded lives
+/// in the window's state.
 pub(in crate::gui) struct SidebarUi {
     search: Entity<InputState>,
     _search_events: Subscription,
@@ -51,6 +51,8 @@ pub(in crate::gui) struct SidebarUi {
     projects_renamed: bool,
     /// Where a dragged card would land.
     drop: Option<CardDrop>,
+    /// Where a dragged project heading would land.
+    project_drop: Option<ProjectDrop>,
     /// The workspace label being renamed in place.
     rename: Option<LabelRename>,
     /// The workspace New workspace asked for, until the daemon answers.
@@ -80,6 +82,7 @@ impl SidebarUi {
             listing_due: true,
             projects_renamed: false,
             drop: None,
+            project_drop: None,
             rename: None,
             creating: None,
         }
@@ -1273,6 +1276,15 @@ impl CompiApp {
                                 this.drop_card(drag, cx);
                                 cx.stop_propagation();
                             }))
+                            .on_drag_move(cx.listener(
+                                |this, event: &DragMoveEvent<ProjectDrag>, _, cx| {
+                                    this.leave_project_drop(event, cx);
+                                },
+                            ))
+                            .on_drop(cx.listener(|this, drag: &ProjectDrag, _, cx| {
+                                this.drop_project(drag, cx);
+                                cx.stop_propagation();
+                            }))
                             .children(self.render_sidebar_rows(cx)),
                     )
                     .children(self.render_whats_new_card(cx))
@@ -1611,13 +1623,24 @@ impl CompiApp {
             );
         }
         let drop = self.card_drop(cx).cloned();
-        for section in sections {
+        let project_line = self.project_drop_line(cx).cloned();
+        let count = sections.len();
+        for (at, section) in sections.into_iter().enumerate() {
             let target = drop.as_ref().filter(|drop| drop.project == section.project);
+            // A dragged heading's line sits on the heading its project lands before, or
+            // under the list's last row.
+            let last = at + 1 == count && project_line == Some(ProjectLine::Last);
+            let cards_shown = !section.folded && !section.cards.is_empty();
+            let header_line = match &project_line {
+                Some(ProjectLine::Before(project)) if *project == section.project => Some(false),
+                _ => (last && !cards_shown).then_some(true),
+            };
             rows.push(
                 self.render_project_header(
                     rows.len(),
                     &section,
                     target.is_some_and(|drop| drop.joins),
+                    header_line,
                     cx,
                 )
                 .into_any_element(),
@@ -1630,11 +1653,13 @@ impl CompiApp {
                 let highlighted = self.sidebar.highlight == Some(shown);
                 let next = order.get(index + 1).cloned();
                 // The line sits on the card a drop lands before, or under the last one.
-                let line = target.and_then(|drop| match &drop.before {
-                    Some(before) if *before == card.tab => Some(false),
-                    None if next.is_none() => Some(true),
-                    _ => None,
-                });
+                let line = target
+                    .and_then(|drop| match &drop.before {
+                        Some(before) if *before == card.tab => Some(false),
+                        None if next.is_none() => Some(true),
+                        _ => None,
+                    })
+                    .or((last && next.is_none()).then_some(true));
                 let place = CardPlace {
                     section: section.project.clone(),
                     next,
@@ -1691,12 +1716,15 @@ impl CompiApp {
     }
 
     /// A saved project (even before a tab is open), or the Loose tabs section. While a
-    /// card from another section is dragged over it, `drop_target` lights it.
+    /// card from another section is dragged over it, `drop_target` lights it; while a
+    /// heading is dragged, `line` marks a dragged project landing over it (`false`) or
+    /// under it (`true`).
     fn render_project_header(
         &self,
         row: usize,
         section: &ProjectSection,
         drop_target: bool,
+        line: Option<bool>,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let colors = *self.colors();
@@ -1724,8 +1752,11 @@ impl CompiApp {
         let fold_project = section.project.clone();
         let menu_project = section.project.clone();
         let drop_project = section.project.clone();
+        let over_project = section.project.clone();
+        let dragged = self.project_drag(&section.project);
         div()
             .id(("sidebar-project", row))
+            .relative()
             .mx_2()
             // Room between one project's cards and the next heading.
             .mt(px(if row == 0 { 4.0 } else { 14.0 }))
@@ -1763,6 +1794,14 @@ impl CompiApp {
                     this.hover_card_drop(event, drop_project.clone(), None, cx);
                 }),
             )
+            // Dragging the heading moves the project among the others.
+            .on_drag(dragged, |dragged, _, _, cx| cx.new(|_| dragged.clone()))
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<ProjectDrag>, _, cx| {
+                    this.hover_project_drop(event, &over_project, cx);
+                }),
+            )
+            .children(line.map(|bottom| self.card_drop_line(bottom)))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {

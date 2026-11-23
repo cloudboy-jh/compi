@@ -1660,8 +1660,9 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// Under a provider's models in an OMP chat's picker: whether the agent can still use
-    /// its sign-in to it, and a button to sign it in, or in again.
+    /// Under a provider's models in the chat's picker (OMP and OpenCode list several):
+    /// whether the agent can still use its sign-in to it, and a button to sign it in,
+    /// or in again.
     fn render_picker_sign_in(
         &self,
         owner: &PickerOwner,
@@ -1669,28 +1670,36 @@ impl CompiApp {
         picker: &ModelPicker,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        let (PickerOwner::Chat(chat), ChatHarness::Omp, PickerTab::Provider(Some(provider))) =
-            (owner, harness, &picker.tab)
+        let (PickerOwner::Chat(chat), PickerTab::Provider(Some(provider))) = (owner, &picker.tab)
         else {
             return None;
         };
+        if !matches!(harness, ChatHarness::Omp | ChatHarness::OpenCode) {
+            return None;
+        }
         let state = self.chat.chats.get(chat)?.state.as_ref()?;
         let colors = *self.colors();
         let muted = modal_text_color(colors.muted, &colors);
-        let expired = state
-            .expired_logins
+        let accounts = state
+            .providers
             .iter()
-            .find(|lost| lost.provider == *provider);
+            .flatten()
+            .find(|known| known.id == *provider)
+            .map(|known| known.accounts.as_slice())
+            .unwrap_or_default();
+        let expired = accounts.iter().find_map(|account| account.expired.as_ref());
         let subscribed = state.plans.iter().any(|plan| plan.provider == *provider);
+        let signed_in = subscribed || accounts.iter().any(|account| account.expired.is_none());
         let (text, tint) = match expired {
-            Some(lost) => (format!("Sign-in expired: {}", lost.reason), colors.error),
-            None if subscribed => ("Signed in with a subscription".to_owned(), muted),
-            None => (
+            Some(reason) if !signed_in => (format!("Sign-in expired: {reason}"), colors.error),
+            _ if subscribed => ("Signed in with a subscription".to_owned(), muted),
+            _ if signed_in => ("Signed in".to_owned(), muted),
+            _ => (
                 "Sign in with a subscription, or use an API key".to_owned(),
                 muted,
             ),
         };
-        let label = if expired.is_some() || subscribed {
+        let label = if expired.is_some() || signed_in {
             "Sign in again"
         } else {
             "Sign in"
@@ -1701,7 +1710,7 @@ impl CompiApp {
                 if let Some(model) = this.chat.chats.get_mut(&id) {
                     model.menu = None;
                 }
-                this.sign_in_chat(&id, provider.clone(), window, cx);
+                this.sign_in_chat(&id, provider.clone(), None, window, cx);
                 cx.notify();
             },
         ));

@@ -128,19 +128,20 @@ A project is a saved folder in a particular environment. In a Git repository it 
 
 - **Name** is what tabs' tooltips, the sidebar's project headers and cards, the palette's project list and a new thread's draft call the project; typing it in the palette finds the project, as its folder does. Type it in the Name field: Enter saves (so does leaving the field), Escape puts back the saved name. **Reset** (or its folder's name, or nothing) goes back to the folder's.
 - **Icon** shows the icon every place uses. **Change icon…** opens a dialog with five tabs: **Automatic** (the project's favicon or logo, else its first letter on a coloured tile), **Icons** (any Lucide icon, searched by name), **Emoji**, **Monogram** (one or two letters or numbers; icons and monograms take a colour of the terminal palette) and **Image file** (**Choose file…** takes a PNG, SVG or ICO, which Compi copies into its data folder, `project-icons/`). **Save icon** saves it; **Reset** goes back to Automatic.
-- **Pin** puts the project first in the sidebar and the Settings list.
+- **Pin** puts the project first in the sidebar and the Settings list. **Home** starts pinned; unpin it like any other project.
 - **New threads' agent** is the agent new threads in the project start with (New thread here, New thread, a new tab, New chat, `compi chat` without `--agent`): **Default** follows **Settings → General → Default agent**, or pick **OMP**, **Claude Code**, **Codex** or **OpenCode**. Changing it clears the model.
 - **New threads' model** is a button with the model's mark and name; it opens the model picker chats use (providers on the left, a search, favourites and recent picks; Ctrl+D stars). No agent runs here, so it lists the models that agent listed last in any chat (Compi keeps them in its data folder, `listed-models.json`), plus your favourite and recent models of it; until a chat of that agent has listed them it says so ("Open a chat with OMP once to list its models"). **OMP's default** (and so on) goes back to what the agent starts on elsewhere. Picking a model while the agent is Default keeps the agent it belongs to as the project's.
 - **Archive** hides the project from the sidebar and the main Settings list. Open tabs move under **Home**; threads, settings and files are kept. Use **Restore** under **Archived** to bring it back.
 - **Remove from Compi…** forgets the project's settings and its place among recent projects and deletes its threads, after asking with how many ("Deletes 12 threads. Files on disk are untouched."). It is refused while a tab is open in the project, naming the tabs.
 
-Projects are kept under `[projects]`, each under its key: `host:<folder>`, or `wsl:<distribution>:<folder>` for a project in WSL. `saved = true` keeps a project listed even with no custom settings.
+Projects are kept under `[projects]`, each under its key: `host:<folder>`, or `wsl:<distribution>:<folder>` for a project in WSL. `saved = true` keeps a project listed even with no custom settings. `order` is the project's place in the sidebar and the Settings list, saved when you drag a project's heading; projects without one come after the others of their group (pinned, then the rest), by key.
 
 ```toml
 [projects."wsl:Ubuntu:/home/me/compi"]
 name = "Compi"
 icon = { kind = "lucide", name = "rocket", color = 4 } # color: terminal palette index, 0 through 15
 pinned = true
+order = 0 # set by dragging the project's heading in the sidebar
 agent = "claude" # omp, claude or codex; unset follows [chat] agent
 model = "opus" # the agent's own name for the model; unset starts on the agent's default
 

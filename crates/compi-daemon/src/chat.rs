@@ -39,6 +39,7 @@ mod login;
 mod opencode;
 mod saved;
 mod threads;
+mod update;
 
 use acp::Acp;
 use claude::Claude;
@@ -233,9 +234,10 @@ impl ChatHub {
         Ok(())
     }
 
-    /// Signs `provider` in for the chat's agent where the chat runs (OMP for now).
-    pub fn sign_in(&self, id: &str, provider: String) -> Result<(), String> {
-        self.get(id)?.sign_in(provider)
+    /// Signs `provider` in for the chat's agent where the chat runs, the way `method`
+    /// says or the agent's own.
+    pub fn sign_in(&self, id: &str, provider: String, method: Option<String>) -> Result<(), String> {
+        self.get(id)?.sign_in(provider, method)
     }
 
     pub fn answer_sign_in(&self, id: &str, code: String) -> Result<(), String> {
@@ -245,6 +247,71 @@ impl ChatHub {
     pub fn cancel_sign_in(&self, id: &str) -> Result<(), String> {
         self.get(id)?.lock().stop_sign_in(true);
         Ok(())
+    }
+
+    /// Signs `provider` out of the chat's agent: `account`, else all its accounts.
+    pub fn sign_out(
+        &self,
+        id: &str,
+        provider: String,
+        account: Option<String>,
+    ) -> Result<(), String> {
+        self.get(id)?.sign_out(provider, account)
+    }
+
+    pub fn check_providers(&self, id: &str) -> Result<(), String> {
+        self.get(id)?.check_providers();
+        Ok(())
+    }
+
+    /// Updates the program the chat runs its agent with; the chat shows how it goes.
+    pub fn update_chat(&self, id: &str) -> Result<(), String> {
+        let chat = self.get(id)?;
+        let program = update::Program::of(&chat)?;
+        let chats = self.running(&program)?;
+        update::start(program, chats, Some(chat), |_| {})
+    }
+
+    /// Updates `harness`'s program on `side`, then calls `done` with how it went.
+    pub fn update_agent(
+        &self,
+        harness: ChatHarness,
+        side: compi_protocol::chat::AgentSide,
+        done: impl FnOnce(Result<compi_protocol::chat::AgentUpdated, String>) + Send + 'static,
+    ) {
+        let program = update::Program::on(harness, side);
+        match self.running(&program) {
+            // A failure to start goes to `done` too.
+            Ok(chats) => {
+                let _ = update::start(program, chats, None, done);
+            }
+            Err(error) => done(Err(error)),
+        }
+    }
+
+    /// The chats running `program`; none may be running a turn, which an update would
+    /// end.
+    fn running(&self, program: &update::Program) -> Result<Vec<Arc<Chat>>, String> {
+        let chats: Vec<Arc<Chat>> = lock(&self.chats).values().cloned().collect();
+        let chats: Vec<Arc<Chat>> = chats
+            .into_iter()
+            .filter(|chat| update::Program::of(chat).is_ok_and(|running| running == *program))
+            .collect();
+        let working = chats
+            .iter()
+            .filter(|chat| lock(&chat.inner).state.working())
+            .count();
+        match working {
+            0 => Ok(chats),
+            1 => Err(format!(
+                "A chat is running a turn with {}; stop it or let it finish, then update.",
+                program.harness.name()
+            )),
+            working => Err(format!(
+                "{working} chats are running turns with {}; stop them or let them finish, then update.",
+                program.harness.name()
+            )),
+        }
     }
 
     /// Notes which chats a pane or view of `workspace` holds, and the terminal each shows
@@ -373,42 +440,47 @@ pub fn installed_agents(environment: &ContentEnvironment) -> Vec<ChatHarness> {
 
 /// Where every agent is installed on this PC, for Settings → Agents: its Windows program
 /// and its Linux one (in the default WSL distribution on Windows), each as a chat's
-/// launch finds it, with its version. Every program is looked for at once, each for a few
-/// seconds at most.
+/// launch finds it, with its version, and the newest version published. Everything is
+/// looked for at once, each for a few seconds at most.
 pub fn agent_installs() -> compi_protocol::chat::AgentInstalls {
-    type Lookup = std::io::Result<thread::JoinHandle<Option<compi_protocol::chat::AgentProgram>>>;
-    fn spawn(
-        find: impl FnOnce() -> Option<compi_protocol::chat::AgentProgram> + Send + 'static,
-    ) -> Lookup {
+    type Lookup<T> = std::io::Result<thread::JoinHandle<Option<T>>>;
+    fn spawn<T: Send + 'static>(find: impl FnOnce() -> Option<T> + Send + 'static) -> Lookup<T> {
         thread::Builder::new()
             .name("compi-chat-lookup".into())
             .spawn(find)
     }
-    let windows: Vec<Lookup> = ChatHarness::ALL
+    fn join<T>(lookup: Lookup<T>) -> Option<T> {
+        lookup.ok()?.join().ok()?
+    }
+    let windows: Vec<_> = ChatHarness::ALL
         .into_iter()
         .map(|harness| spawn(move || launch::windows_install(harness)))
         .collect();
     let distribution = launch::default_distribution();
-    let linux: Vec<Lookup> = ChatHarness::ALL
+    let linux: Vec<_> = ChatHarness::ALL
         .into_iter()
         .map(|harness| {
             let distribution = distribution.clone();
             spawn(move || launch::linux_install(harness, distribution.as_deref()))
         })
         .collect();
-    let join = |lookup: Lookup| lookup.ok()?.join().ok()?;
+    let latest: Vec<_> = ChatHarness::ALL
+        .into_iter()
+        .map(|harness| spawn(move || launch::latest_version(harness)))
+        .collect();
     compi_protocol::chat::AgentInstalls {
         distribution,
         agents: ChatHarness::ALL
             .into_iter()
-            .zip(windows.into_iter().zip(linux))
-            .map(
-                |(harness, (windows, linux))| compi_protocol::chat::AgentInstall {
+            .zip(windows.into_iter().zip(linux).zip(latest))
+            .map(|(harness, ((windows, linux), latest))| {
+                compi_protocol::chat::AgentInstall {
                     harness,
                     windows: join(windows),
                     linux: join(linux),
-                },
-            )
+                    latest: join(latest),
+                }
+            })
             .collect(),
     }
 }
@@ -758,19 +830,30 @@ struct Inner {
     sign_in: Option<SignIn>,
     /// Sign-ins started so far, so a stopped one's reader changes nothing.
     sign_ins: u64,
-    /// The agent's sign-ins want checking for ones it can no longer use: it started, a
-    /// turn failed, or a sign-in ended.
-    logins_due: bool,
+    /// The agent's providers want asking for: it started, a turn failed, or a sign-in
+    /// ended.
+    providers_due: bool,
 }
 
-/// The agent's login, running for the chat.
+/// A sign-in running for the chat.
 struct SignIn {
     run: u64,
-    child: Child,
-    input: ChildStdin,
-    output: Arc<Mutex<login::Output>>,
-    #[cfg(windows)]
-    _job: Option<std::os::windows::io::OwnedHandle>,
+    way: SignInRun,
+}
+
+enum SignInRun {
+    /// The agent's login program. With `key`, its answer is an API key, handed over as
+    /// its whole input, which closes then.
+    Program {
+        child: Child,
+        input: Option<ChildStdin>,
+        output: Arc<Mutex<login::Output>>,
+        key: bool,
+        #[cfg(windows)]
+        _job: Option<std::os::windows::io::OwnedHandle>,
+    },
+    /// OpenCode's server, waiting for what `answer` takes.
+    Server(opencode::SignIn),
 }
 
 /// When a thread began, and when its transcript last changed.
@@ -880,7 +963,7 @@ impl Chat {
     fn spawn(self: &Arc<Self>, inner: &mut Inner) {
         inner.generation += 1;
         inner.initialized = false;
-        inner.logins_due = true;
+        inner.providers_due = true;
         let generation = inner.generation;
         let chosen = self.content.harness.approval_mode(inner.approval);
         let configured = inner.driver.wire().configured_approval;
@@ -1030,11 +1113,11 @@ impl Chat {
                 return;
             }
             (inner.driver.wire().handle)(&self, &mut inner, message);
-            // Once the agent waits, what it said of its sign-ins is checked.
-            if inner.logins_due && matches!(inner.state.status, ChatStatus::Ready) {
-                inner.logins_due = false;
+            // Once the agent waits, it is asked for its providers and accounts.
+            if inner.providers_due && matches!(inner.state.status, ChatStatus::Ready) {
+                inner.providers_due = false;
                 drop(inner);
-                self.check_logins();
+                self.check_providers();
             }
         }
         let mut inner = self.lock();
@@ -1255,23 +1338,91 @@ impl Chat {
         inner.watchers.clear();
     }
 
-    /// Runs the agent's login for `provider` where the chat runs, reporting it in
-    /// `ChatState::login`; a sign-in already running stops first.
-    fn sign_in(self: &Arc<Self>, provider: String) -> Result<(), String> {
-        if self.content.harness != ChatHarness::Omp {
-            return Err(format!(
-                "Signing in from the chat works with OMP; sign {} in with its own login.",
-                self.content.harness.name()
-            ));
+    /// Signs `provider` in for the agent where the chat runs, the way `method` says or
+    /// the agent's own, reporting it in `ChatState::login`; a sign-in already running
+    /// stops first.
+    fn sign_in(self: &Arc<Self>, provider: String, method: Option<String>) -> Result<(), String> {
+        let way = login::sign_in_way(self.content.harness, &provider, method.as_deref())?;
+        let mut inner = self.lock();
+        inner.stop_sign_in(false);
+        inner.sign_ins += 1;
+        let run = inner.sign_ins;
+        let (args, provider_arg, key) = match way {
+            login::Way::Server => {
+                return opencode::sign_in(self, &mut inner, run, provider, method);
+            }
+            login::Way::Program {
+                args,
+                provider_arg,
+                key,
+            } => (args, provider_arg, key),
+        };
+        let mut args: Vec<Arg> = args.into_iter().map(Arg::word).collect();
+        if provider_arg {
+            args.push(Arg::word(provider.as_str()));
         }
+        let step = match &key {
+            Some(prompt) => ChatLoginStep::Code {
+                prompt: prompt.clone(),
+            },
+            None => ChatLoginStep::Waiting { note: None },
+        };
+        self.run_login(&mut inner, run, &args, key.is_some())?;
+        inner.emit(ChatEvent::Login {
+            login: Some(ChatLogin {
+                provider,
+                sign_out: false,
+                url: None,
+                step,
+            }),
+        });
+        Ok(())
+    }
+
+    /// Signs `provider` out of the agent where the chat runs: `account`, else all its
+    /// accounts. It shows in `ChatState::login` as a sign-in does.
+    fn sign_out(self: &Arc<Self>, provider: String, account: Option<String>) -> Result<(), String> {
         if !compi_protocol::chat::valid_provider(&provider) {
             return Err(format!("{provider} isn't a provider name"));
         }
         let mut inner = self.lock();
         inner.stop_sign_in(false);
-        let args = [Arg::word("login"), Arg::word(provider.as_str())];
+        inner.sign_ins += 1;
+        let run = inner.sign_ins;
+        if self.content.harness == ChatHarness::OpenCode {
+            opencode::sign_out(self, &mut inner, run, provider.clone(), account)?;
+        } else {
+            let args: Vec<Arg> = login::sign_out_args(self.content.harness)?
+                .iter()
+                .map(|arg| Arg::word(*arg))
+                .collect();
+            self.run_login(&mut inner, run, &args, false)?;
+        }
+        inner.emit(ChatEvent::Login {
+            login: Some(ChatLogin {
+                provider,
+                sign_out: true,
+                url: None,
+                step: ChatLoginStep::Waiting {
+                    note: Some("Signing out…".into()),
+                },
+            }),
+        });
+        Ok(())
+    }
+
+    /// Runs the agent's program with `args` where the chat runs as sign-in `run`, its
+    /// output read as a login's (`login::Output`). With `key`, its input takes an API
+    /// key, and closes after it.
+    fn run_login(
+        self: &Arc<Self>,
+        inner: &mut Inner,
+        run: u64,
+        args: &[Arg],
+        key: bool,
+    ) -> Result<(), String> {
         let (mut command, _) =
-            launch::command(&self.content, &[], &args, &launch::programs(&self.content))?;
+            launch::command(&self.content, &[], args, &launch::programs(&self.content))?;
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1282,7 +1433,7 @@ impl Chat {
         let job = unsafe { crate::conpty::create_kill_on_close_job(&child) }.ok();
         let output = child.stdout.take().expect("stdout is piped");
         let errors = child.stderr.take().expect("stderr is piped");
-        let input = child.stdin.take().expect("stdin is piped");
+        let input = child.stdin.take();
         let stderr = Arc::new(Mutex::new(String::new()));
         {
             let stderr = stderr.clone();
@@ -1290,23 +1441,17 @@ impl Chat {
                 .name("compi-sign-in-stderr".into())
                 .spawn(move || keep_tail(errors, &stderr));
         }
-        inner.sign_ins += 1;
-        let run = inner.sign_ins;
         let parser = Arc::new(Mutex::new(login::Output::default()));
         inner.sign_in = Some(SignIn {
             run,
-            child,
-            input,
-            output: parser.clone(),
-            #[cfg(windows)]
-            _job: job,
-        });
-        inner.emit(ChatEvent::Login {
-            login: Some(ChatLogin {
-                provider,
-                url: None,
-                step: ChatLoginStep::Waiting { note: None },
-            }),
+            way: SignInRun::Program {
+                child,
+                input,
+                output: parser.clone(),
+                key,
+                #[cfg(windows)]
+                _job: job,
+            },
         });
         let chat = self.clone();
         let _ = thread::Builder::new()
@@ -1315,8 +1460,7 @@ impl Chat {
         Ok(())
     }
 
-    /// Follows sign-in `run`'s output until it ends; once it signed in, the agent starts
-    /// again on its session to use the new sign-in, unless a turn runs.
+    /// Follows sign-in `run`'s output until it ends, then reports how it went.
     fn read_sign_in(
         self: Arc<Self>,
         mut output: impl Read,
@@ -1344,92 +1488,170 @@ impl Chat {
             }
         }
         let mut inner = self.lock();
-        let Some(mut sign_in) = inner.sign_in.take_if(|sign_in| sign_in.run == run) else {
+        let Some(SignIn {
+            way: SignInRun::Program { mut child, .. },
+            ..
+        }) = inner.sign_in.take_if(|sign_in| sign_in.run == run)
+        else {
             return;
         };
-        let code = sign_in.child.wait().ok().and_then(|status| status.code());
-        let signed_in = matches!(
-            inner.state.login.as_ref().map(|login| &login.step),
-            Some(ChatLoginStep::Done { .. })
-        );
-        if !signed_in {
-            let tail = lock(stderr).trim().to_owned();
-            let said = tail
-                .lines()
-                .rev()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .map(|line| line.trim_start_matches("Login failed: ").to_owned());
-            let message = said.unwrap_or_else(|| match code {
-                Some(code) => format!("The sign-in stopped (exit code {code})."),
-                None => "The sign-in stopped.".to_owned(),
-            });
-            inner.sign_in_said(login::Signal::Failed(message));
+        let code = child.wait().ok().and_then(|status| status.code());
+        let done = inner.state.login.as_ref().is_some_and(|login| {
+            matches!(login.step, ChatLoginStep::Done { .. })
+                // A sign-out says little more than that it ended well.
+                || (login.sign_out && code == Some(0))
+        });
+        drop(inner);
+        if done {
+            self.sign_in_ended(None, Ok(None));
             return;
         }
-        let restart = !inner.state.working();
-        if !restart {
-            inner.logins_due = true;
+        let tail = lock(stderr).trim().to_owned();
+        let said = tail
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| {
+                ["Login failed: ", "Couldn't log in: ", "Error: "]
+                    .iter()
+                    .fold(line, |line, start| line.trim_start_matches(start))
+                    .to_owned()
+            });
+        let message = said.unwrap_or_else(|| match code {
+            Some(code) => format!("It stopped (exit code {code})."),
+            None => "It stopped.".to_owned(),
+        });
+        self.sign_in_ended(None, Err(message));
+    }
+
+    /// Sign-in `run` ended (`None`: the one whose program just ended), signed in or out
+    /// as `account` when it says, or not as the error says. Once it worked, the agent's
+    /// providers are asked for again and it starts again on its session to use them,
+    /// unless a turn runs.
+    fn sign_in_ended(self: &Arc<Self>, run: Option<u64>, result: Result<Option<String>, String>) {
+        let mut inner = self.lock();
+        if let Some(run) = run
+            && inner
+                .sign_in
+                .take_if(|sign_in| sign_in.run == run)
+                .is_none()
+        {
+            return;
         }
+        match result {
+            Ok(account) => inner.sign_in_said(login::Signal::Done(account)),
+            Err(message) => {
+                inner.sign_in_said(login::Signal::Failed(message));
+                return;
+            }
+        }
+        let restart = !inner.state.working();
+        inner.providers_due = true;
         drop(inner);
         if restart {
             self.restart();
         }
     }
 
-    /// Hands the running sign-in what it asked for.
-    fn answer_sign_in(&self, code: String) -> Result<(), String> {
+    /// What sign-in `run` said, unless another replaced it; whether it still runs.
+    fn sign_in_signal(&self, run: u64, signal: login::Signal) -> bool {
+        let mut inner = self.lock();
+        let current = inner
+            .sign_in
+            .as_ref()
+            .is_some_and(|sign_in| sign_in.run == run);
+        if current {
+            inner.sign_in_said(signal);
+        }
+        current
+    }
+
+    /// Hands the running sign-in what it asked for: a code, the page the provider sent
+    /// the browser to, or an API key.
+    fn answer_sign_in(self: &Arc<Self>, code: String) -> Result<(), String> {
         let code = code.trim();
         if code.is_empty() || code.len() > MAX_SIGN_IN_ANSWER_BYTES || code.contains('\n') {
-            return Err("paste the code or the page's address on one line".into());
+            return Err("paste the code, key or the page's address on one line".into());
         }
         let mut inner = self.lock();
         let Some(sign_in) = inner.sign_in.as_mut() else {
             return Err("no sign-in is running".into());
         };
-        sign_in
-            .input
-            .write_all(format!("{code}\n").as_bytes())
-            .and_then(|()| sign_in.input.flush())
-            .map_err(|error| format!("couldn't hand the code to the sign-in: {error}"))?;
-        lock(&sign_in.output).answered();
-        inner.sign_in_said(login::Signal::Note("Checking the code…".into()));
+        let run = sign_in.run;
+        let (server, key) = match &mut sign_in.way {
+            SignInRun::Program {
+                input, output, key, ..
+            } => {
+                let writer = input.as_mut().ok_or("the sign-in takes nothing more")?;
+                writer
+                    .write_all(format!("{code}\n").as_bytes())
+                    .and_then(|()| writer.flush())
+                    .map_err(|error| format!("couldn't hand it to the sign-in: {error}"))?;
+                // A key is the program's whole input.
+                if *key {
+                    *input = None;
+                }
+                lock(output).answered();
+                (None, *key)
+            }
+            SignInRun::Server(server) => (Some(server.clone()), server.takes_key()),
+        };
+        if let Some(server) = server {
+            opencode::answer_sign_in(self, run, server, code.to_owned());
+        }
+        let note = if key {
+            "Checking the key…"
+        } else {
+            "Checking the code…"
+        };
+        inner.sign_in_said(login::Signal::Note(note.into()));
         Ok(())
     }
 
-    /// Asks the agent which of its sign-ins it can no longer use (`omp usage --json`),
-    /// off any lock, and shows them.
-    fn check_logins(self: &Arc<Self>) {
-        if self.content.harness != ChatHarness::Omp {
+    /// Asks the agent for its providers and the accounts it keeps, off any lock, and
+    /// shows them.
+    fn check_providers(self: &Arc<Self>) {
+        if self.content.harness == ChatHarness::OpenCode {
+            opencode::check_providers(self);
             return;
         }
         let chat = self.clone();
         let _ = thread::Builder::new()
-            .name("compi-chat-logins".into())
+            .name("compi-chat-providers".into())
             .spawn(move || {
-                let args = [Arg::word("usage"), Arg::word("--json")];
+                let harness = chat.content.harness;
+                let args: Vec<Arg> = login::status_args(harness)
+                    .iter()
+                    .map(|arg| Arg::word(*arg))
+                    .collect();
                 let Ok((mut command, _)) =
                     launch::command(&chat.content, &[], &args, &launch::programs(&chat.content))
                 else {
                     return;
                 };
-                let Ok(output) = command.stdin(Stdio::null()).stderr(Stdio::null()).output() else {
+                let Ok(output) = command.stdin(Stdio::null()).output() else {
                     return;
                 };
-                let text = String::from_utf8_lossy(&output.stdout);
-                // The launch script's mark line comes before the program's JSON.
-                let Some(usage) = text
-                    .find('{')
-                    .and_then(|start| serde_json::from_str::<Value>(&text[start..]).ok())
-                else {
-                    return;
-                };
-                let expired = login::expired_logins(&usage);
-                let mut inner = chat.lock();
-                if !inner.closed && inner.state.expired_logins != expired {
-                    inner.emit(ChatEvent::ExpiredLogins { expired });
+                // Codex says it on standard error.
+                let said = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let model_providers = chat.lock().model_providers();
+                if let Some(providers) = login::providers(harness, &said, &model_providers) {
+                    chat.show_providers(providers);
                 }
             });
+    }
+
+    fn show_providers(&self, providers: Vec<compi_protocol::chat::ChatProvider>) {
+        let mut inner = self.lock();
+        let providers = Some(providers);
+        if !inner.closed && inner.state.providers != providers {
+            inner.emit(ChatEvent::Providers { providers });
+        }
     }
 
     /// Ends the chat once no pane or view holds it: a running turn is cancelled and ends
@@ -1568,7 +1790,7 @@ impl Inner {
             // A failed turn can be a sign-in the agent lost.
             ChatEvent::Entry {
                 entry: ChatEntry::Error { .. },
-            } => self.logins_due = true,
+            } => self.providers_due = true,
             _ => {}
         }
         self.watchers
@@ -1967,13 +2189,36 @@ impl Inner {
 
     /// Ends the running sign-in, if one is; with `clear`, the chat stops showing it.
     fn stop_sign_in(&mut self, clear: bool) {
-        if let Some(mut sign_in) = self.sign_in.take() {
-            let _ = sign_in.child.kill();
-            let _ = sign_in.child.wait();
+        if let Some(sign_in) = self.sign_in.take() {
+            match sign_in.way {
+                SignInRun::Program { mut child, .. } => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                SignInRun::Server(server) => server.cancel(),
+            }
         }
         if clear && self.state.login.is_some() {
             self.emit(ChatEvent::Login { login: None });
         }
+    }
+
+    /// The providers the agent's models come from, in their order.
+    fn model_providers(&self) -> Vec<String> {
+        let mut providers: Vec<String> = Vec::new();
+        let choices = self
+            .state
+            .option("model")
+            .into_iter()
+            .flat_map(|option| &option.choices);
+        for choice in choices {
+            if let Some(provider) = compi_protocol::chat::model_provider(&choice.value)
+                && !providers.iter().any(|known| known == provider)
+            {
+                providers.push(provider.to_owned());
+            }
+        }
+        providers
     }
 
     /// Shows what the running sign-in said.
@@ -1992,26 +2237,7 @@ impl Inner {
                 }
             }
             login::Signal::Prompt(prompt) => shown.step = ChatLoginStep::Code { prompt },
-            login::Signal::Done(account) => {
-                shown.step = ChatLoginStep::Done { account };
-                // The sign-in it replaced no longer counts as lost.
-                let provider = shown.provider.clone();
-                if self
-                    .state
-                    .expired_logins
-                    .iter()
-                    .any(|lost| lost.provider == provider)
-                {
-                    let expired = self
-                        .state
-                        .expired_logins
-                        .iter()
-                        .filter(|lost| lost.provider != provider)
-                        .cloned()
-                        .collect();
-                    self.emit(ChatEvent::ExpiredLogins { expired });
-                }
-            }
+            login::Signal::Done(account) => shown.step = ChatLoginStep::Done { account },
             login::Signal::Failed(message) => {
                 if !matches!(shown.step, ChatLoginStep::Done { .. }) {
                     shown.step = ChatLoginStep::Failed { message };

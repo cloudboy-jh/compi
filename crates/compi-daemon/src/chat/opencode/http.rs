@@ -57,7 +57,19 @@ pub(super) fn call(
     path: &str,
     body: Option<&Value>,
 ) -> Result<Value, String> {
-    let stream = connect(server, ANSWER_TIMEOUT)?;
+    call_within(server, method, path, body, ANSWER_TIMEOUT)
+}
+
+/// `call`, its answer awaited for `timeout`: one OpenCode gives only once something
+/// else happened (a sign-in finished in the browser).
+pub(super) fn call_within(
+    server: &Server,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let stream = connect(server, timeout)?;
     send(&stream, server, method, path, body, "application/json")?;
     let mut reader = BufReader::new(stream);
     let head = read_head(&mut reader)?;

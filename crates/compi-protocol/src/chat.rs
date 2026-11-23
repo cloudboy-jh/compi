@@ -96,6 +96,11 @@ pub struct AgentEntry {
     /// The command that installs it, in a terminal in WSL or on Windows (Settings →
     /// Agents shows it for an agent installed nowhere).
     pub install: &'static str,
+    /// Its npm package, whose newest published version Settings → Agents compares with
+    /// the installed ones.
+    pub package: &'static str,
+    /// The arguments that update it to the newest version, however it was installed.
+    pub update: &'static [&'static str],
 }
 
 /// How an agent's mark is drawn.
@@ -145,6 +150,8 @@ static ENTRIES: [AgentEntry; 4] = [
         ],
         windows_bash: Some("COMPI_AGENT_SHELL"),
         install: "bun install -g @oh-my-pi/pi-coding-agent",
+        package: "@oh-my-pi/pi-coding-agent",
+        update: &["update"],
     },
     AgentEntry {
         harness: ChatHarness::Claude,
@@ -167,6 +174,8 @@ static ENTRIES: [AgentEntry; 4] = [
         ],
         windows_bash: Some("CLAUDE_CODE_GIT_BASH_PATH"),
         install: "npm install -g @anthropic-ai/claude-code",
+        package: "@anthropic-ai/claude-code",
+        update: &["update"],
     },
     AgentEntry {
         harness: ChatHarness::Codex,
@@ -217,6 +226,8 @@ static ENTRIES: [AgentEntry; 4] = [
         ],
         windows_bash: None,
         install: "npm install -g @openai/codex",
+        package: "@openai/codex",
+        update: &["update"],
     },
     AgentEntry {
         harness: ChatHarness::OpenCode,
@@ -236,6 +247,8 @@ static ENTRIES: [AgentEntry; 4] = [
         // Its Windows build runs commands with the shell `SHELL` names.
         windows_bash: Some("SHELL"),
         install: "npm install -g opencode-ai",
+        package: "opencode-ai",
+        update: &["upgrade"],
     },
 ];
 
@@ -413,12 +426,17 @@ pub struct ChatState {
     /// The model providers signed in with a subscription plan, with what is left of it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plans: Vec<ChatPlan>,
-    /// Sign-ins the agent keeps but can no longer use (an expired refresh token).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub expired_logins: Vec<ChatExpiredLogin>,
-    /// A provider being signed in from the chat (`SignInChat`), and how far it got.
+    /// The model providers the agent can sign in to, with the accounts it keeps for
+    /// them (`/providers`); `None` until the agent was asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<Vec<ChatProvider>>,
+    /// A provider being signed in or out from the chat (`SignInChat`, `SignOutChat`),
+    /// and how far it got.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login: Option<ChatLogin>,
+    /// The chat's agent being updated (`UpdateChatAgent`), and how far it got.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<ChatAgentUpdate>,
     /// The daemon keeps the chat as a thread: it was sent its first prompt, or opened
     /// from a saved thread. A chat without one is a draft, which closing leaves nothing
     /// of. A chat gets its thread with its first transcript entry, so watchers learn it
@@ -469,8 +487,9 @@ impl ChatState {
             ChatEvent::Question { question } => self.question = question,
             ChatEvent::Queued { queued } => self.queued = queued,
             ChatEvent::Plans { plans } => self.plans = plans,
-            ChatEvent::ExpiredLogins { expired } => self.expired_logins = expired,
+            ChatEvent::Providers { providers } => self.providers = providers,
             ChatEvent::Login { login } => self.login = login,
+            ChatEvent::Update { update } => self.update = update,
         }
     }
 
@@ -860,25 +879,94 @@ pub struct ChatPlanLimit {
     pub left_percent: u8,
 }
 
-/// A provider sign-in the agent keeps but can no longer use, and why: signing in again
-/// replaces it.
+/// A model provider the chat's agent can sign in to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ChatExpiredLogin {
-    /// As model values name it before their `/` (`anthropic`, `openai-codex`).
-    pub provider: String,
-    /// The account it was, when the agent says.
+pub struct ChatProvider {
+    /// What `SignInChat` names: as model values name it before their `/` (OMP's
+    /// `anthropic`, OpenCode's `openai`), or the agent's one provider (Claude Code's
+    /// `anthropic`, Codex's `openai`).
+    pub id: String,
+    /// Its name, when the agent gives one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account: Option<String>,
-    /// Why, in the provider's words (`Refresh token expired`).
-    pub reason: String,
+    pub name: Option<String>,
+    /// The accounts signed in, usable or not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<ChatAccount>,
+    /// The ways to sign in, in the agent's order; none when the agent picks one itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<ChatSignInMethod>,
+    /// The agent can sign it out from the chat (`SignOutChat`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sign_out: bool,
+    /// Signing in again adds an account beside the ones there; else it replaces them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adds_accounts: bool,
 }
 
-/// A provider being signed in from the chat, through the agent's own login, where the
-/// chat runs.
+/// One account an agent keeps for a provider.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatAccount {
+    /// What `SignOutChat` names to sign out this one alone, when the agent tells them
+    /// apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Who it is (an email address), when the agent says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// How it pays (`Max 5x`, `ChatGPT`, `API key`), when the agent says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// Why the agent can no longer use it, in the provider's words (`Refresh token
+    /// expired`); `None` while it works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expired: Option<String>,
+}
+
+/// One way to sign a provider in (`Claude subscription`, `API key`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatSignInMethod {
+    pub id: String,
+    pub label: String,
+}
+
+/// The sign-in method (`ChatSignInMethod::id`) that takes an API key pasted in the chat.
+pub const API_KEY_METHOD: &str = "api-key";
+
+/// An agent being updated from a chat, with its version before and after.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatAgentUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    pub step: ChatUpdateStep,
+}
+
+/// How far an update got.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatUpdateStep {
+    /// Running; what the updater said last.
+    Running {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    /// Finished: `to` is the version now (the same as `from` when it was up to date).
+    Done,
+    Failed {
+        message: String,
+    },
+}
+
+/// A provider being signed in or out from the chat, through the agent's own login,
+/// where the chat runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatLogin {
-    /// As model values name it before their `/`.
+    /// As `ChatProvider::id` names it.
     pub provider: String,
+    /// It signs the provider out rather than in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sign_out: bool,
     /// The page to sign in on, once the login gives it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -1041,11 +1129,14 @@ pub enum ChatEvent {
     Plans {
         plans: Vec<ChatPlan>,
     },
-    ExpiredLogins {
-        expired: Vec<ChatExpiredLogin>,
+    Providers {
+        providers: Option<Vec<ChatProvider>>,
     },
     Login {
         login: Option<ChatLogin>,
+    },
+    Update {
+        update: Option<ChatAgentUpdate>,
     },
 }
 
@@ -1070,6 +1161,56 @@ pub struct AgentInstall {
     pub windows: Option<AgentProgram>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linux: Option<AgentProgram>,
+    /// The newest version published (`AgentEntry::package`), when the registry said in
+    /// time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+}
+
+/// Which of an agent's programs `UpdateAgent` updates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSide {
+    /// Its Windows program.
+    Windows,
+    /// Its Linux program: in the default WSL distribution on Windows, the host's own
+    /// elsewhere.
+    Linux,
+}
+
+/// An agent's version before and after an update.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentUpdated {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+}
+
+/// Whether version `newer` comes after `older`, comparing their numbers in order
+/// (`1.19.6` after `1.19.0`, `1.19.6` not after `2.0.27`); a part that is no number
+/// counts as 0.
+pub fn newer_version(newer: &str, older: &str) -> bool {
+    let numbers = |version: &str| -> Vec<u64> {
+        version
+            .split(['-', '+'])
+            .next()
+            .unwrap_or_default()
+            .split('.')
+            .map(|part| part.parse().unwrap_or(0))
+            .collect()
+    };
+    let (newer, older) = (numbers(newer), numbers(older));
+    for index in 0..newer.len().max(older.len()) {
+        let (a, b) = (
+            newer.get(index).copied().unwrap_or(0),
+            older.get(index).copied().unwrap_or(0),
+        );
+        if a != b {
+            return a > b;
+        }
+    }
+    false
 }
 
 /// One installed program of an agent.

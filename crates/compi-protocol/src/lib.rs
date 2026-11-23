@@ -101,9 +101,11 @@ use std::fmt;
 // add existing or newly cloned projects on the daemon without opening a pane.
 // Version 42 lets a client choose a tab's project (`SetTabProject`), which the daemon
 // then keeps instead of finding one from the tab's folders.
-// Version 43 signs model providers in from a chat (`SignInChat`, `AnswerChatSignIn`,
-// `CancelChatSignIn`, `ChatState::login`) and reports sign-ins the agent can no longer
-// use (`ChatState::expired_logins`).
+// Version 43 shows a chat's model providers and accounts (`ChatState::providers`,
+// `CheckChatProviders`), signs them in and out from the chat (`SignInChat`,
+// `AnswerChatSignIn`, `CancelChatSignIn`, `SignOutChat`, `ChatState::login`), and
+// updates agents (`UpdateChatAgent`, `ChatState::update`, `UpdateAgent`,
+// `AgentInstall::latest`).
 pub const PROTOCOL_VERSION: u32 = 43;
 pub const CONTROL_FRAME: u8 = 1;
 pub const SCREEN_FRAME: u8 = 2;
@@ -616,14 +618,17 @@ pub enum ClientMessage {
         #[serde(default)]
         picks: chat::ChatPicks,
     },
-    /// Signs `provider` (`anthropic`, `openai-codex`) in for the chat's agent, where the
-    /// chat runs, through the agent's own login; `ChatState::login` shows how it goes.
+    /// Signs `provider` (`ChatProvider::id`) in for the chat's agent, where the chat
+    /// runs, through the agent's own login, the way `method` (`ChatSignInMethod::id`)
+    /// says or the agent's own; `ChatState::login` shows how it goes.
     SignInChat {
         chat: String,
         provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        method: Option<String>,
     },
-    /// What the chat's sign-in asked for: an authorization code, or the page the
-    /// provider redirected to.
+    /// What the chat's sign-in asked for: an authorization code, an API key, or the
+    /// page the provider redirected to.
     AnswerChatSignIn {
         chat: String,
         code: String,
@@ -631,6 +636,30 @@ pub enum ClientMessage {
     /// Stops the chat's sign-in.
     CancelChatSignIn {
         chat: String,
+    },
+    /// Signs `provider` out of the chat's agent: the account `account`
+    /// (`ChatAccount::id`), else all of them; `ChatState::login` shows how it goes.
+    SignOutChat {
+        chat: String,
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+    },
+    /// Asks the chat's agent again for its providers and accounts
+    /// (`ChatState::providers`).
+    CheckChatProviders {
+        chat: String,
+    },
+    /// Updates the chat's agent where the chat runs it; `ChatState::update` shows how
+    /// it goes. Every chat running that program starts again on its session after.
+    UpdateChatAgent {
+        chat: String,
+    },
+    /// Updates `harness`'s program on `side`, answered by `AgentUpdated` once done.
+    /// Every chat running that program starts again on its session after.
+    UpdateAgent {
+        harness: chat::ChatHarness,
+        side: chat::AgentSide,
     },
     ShutdownDaemon,
 }
@@ -822,6 +851,9 @@ pub enum ServerMessage {
     },
     AgentInstalls {
         installs: chat::AgentInstalls,
+    },
+    AgentUpdated {
+        updated: chat::AgentUpdated,
     },
     Threads {
         threads: Vec<chat::ThreadInfo>,

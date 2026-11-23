@@ -1039,10 +1039,14 @@ fn handle_connection(
                     request_id,
                     crate::chat::hub().restart(&chat, approval, picks),
                 )?,
-                ClientMessage::SignInChat { chat, provider } => answer_chat(
+                ClientMessage::SignInChat {
+                    chat,
+                    provider,
+                    method,
+                } => answer_chat(
                     &sink,
                     request_id,
-                    crate::chat::hub().sign_in(&chat, provider),
+                    crate::chat::hub().sign_in(&chat, provider, method),
                 )?,
                 ClientMessage::AnswerChatSignIn { chat, code } => answer_chat(
                     &sink,
@@ -1051,6 +1055,44 @@ fn handle_connection(
                 )?,
                 ClientMessage::CancelChatSignIn { chat } => {
                     answer_chat(&sink, request_id, crate::chat::hub().cancel_sign_in(&chat))?
+                }
+                ClientMessage::SignOutChat {
+                    chat,
+                    provider,
+                    account,
+                } => answer_chat(
+                    &sink,
+                    request_id,
+                    crate::chat::hub().sign_out(&chat, provider, account),
+                )?,
+                ClientMessage::CheckChatProviders { chat } => answer_chat(
+                    &sink,
+                    request_id,
+                    crate::chat::hub().check_providers(&chat),
+                )?,
+                ClientMessage::UpdateChatAgent { chat } => {
+                    answer_chat(&sink, request_id, crate::chat::hub().update_chat(&chat))?
+                }
+                // The updater can take minutes: it answers from a thread of its own.
+                ClientMessage::UpdateAgent { harness, side } => {
+                    let sink = sink.clone();
+                    crate::chat::hub().update_agent(harness, side, move |result| {
+                        let _ = match result {
+                            Ok(updated) => sink.send_control(&ServerControl {
+                                request_id: Some(request_id),
+                                message: ServerMessage::AgentUpdated { updated },
+                            }),
+                            Err(message) => {
+                                send_error(
+                                    &sink,
+                                    Some(request_id),
+                                    ErrorCode::InvalidRequest,
+                                    &message,
+                                );
+                                Ok(())
+                            }
+                        };
+                    });
                 }
                 ClientMessage::WatchSystemTotals { source } => match Source::resolve(&source) {
                     Ok(source) => {

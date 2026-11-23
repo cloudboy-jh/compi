@@ -21,7 +21,10 @@ use super::project_settings::{PROJECTS_ROW, ProjectControl, ProjectFields};
 use super::*;
 use crate::config::{ChatEnter, ChatOpen, DevServer, NewTab};
 use crate::gui::controls::IconName;
-use compi_protocol::chat::{AgentInstall, AgentInstalls, AgentProgram, ChatApproval, ChatHarness};
+use compi_protocol::chat::{
+    AgentInstall, AgentInstalls, AgentProgram, AgentSide, AgentUpdated, ChatApproval, ChatHarness,
+    newer_version,
+};
 use compi_protocol::{PaneContent, Project, SettingsContent, SettingsSection, WindowsShell};
 use gpui::Entity;
 use gpui_component::Sizable as _;
@@ -149,6 +152,8 @@ pub(super) enum SettingsAction {
     ToggleChatAgentsBar,
     /// Copies how to install an agent installed nowhere.
     CopyInstallCommand(ChatHarness),
+    /// Updates an agent's program on one side to its newest version.
+    UpdateAgent(ChatHarness, AgentSide),
     OpenConfiguration,
     /// A command's shortcut, by its index in `commands::REGISTRY`: pressing it records
     /// the next keys pressed.
@@ -257,6 +262,10 @@ struct SettingsPane {
     projects: ProjectFields,
 }
 
+/// An agent update asked from Settings → Agents: `None` while it runs, else its versions
+/// before and after or what went wrong.
+type AgentUpdateResult = Option<Result<AgentUpdated, String>>;
+
 /// Settings in this window: each Settings pane's state, Quick Appearance's scroll
 /// and the keyboard highlight, which follows whichever of them has the keyboard.
 #[derive(Default)]
@@ -299,6 +308,8 @@ pub(in crate::gui) struct SettingsUi {
     /// The agent whose install command was copied last, until its card is looked up
     /// again.
     install_copied: Option<ChatHarness>,
+    /// Updates asked from Settings → Agents: running (`None`), else how each went.
+    agent_updates: Vec<(ChatHarness, AgentSide, AgentUpdateResult)>,
     /// The Projects detail page, or `None` for the saved-project list.
     pub(super) project_selected: Option<Project>,
     /// The Projects page lists its archived projects.
@@ -1636,27 +1647,37 @@ fn terminal_key_notice(keys: &str) -> Option<String> {
 
 /// Where `install` has its agent, as its Settings → Agents card says: each side with its
 /// version when it reports one, the Linux side first (`Ubuntu 19.0.0`, `Windows 2.1.3`);
-/// empty when it has none. The Linux side is named for the WSL `distribution` it was
-/// looked for in, else for this computer.
+/// empty when it has none.
 fn agent_places(distribution: Option<&str>, install: Option<&AgentInstall>) -> Vec<String> {
     let Some(install) = install else {
         return Vec::new();
     };
-    let linux = distribution.unwrap_or(if cfg!(target_os = "macos") {
-        "macOS"
-    } else {
-        "Linux"
-    });
-    [(linux, &install.linux), ("Windows", &install.windows)]
-        .into_iter()
-        .filter_map(|(side, program)| {
-            let program: &AgentProgram = program.as_ref()?;
-            Some(match &program.version {
-                Some(version) => format!("{side} {version}"),
-                None => side.to_owned(),
-            })
+    [
+        (side_name(distribution, AgentSide::Linux), &install.linux),
+        (side_name(None, AgentSide::Windows), &install.windows),
+    ]
+    .into_iter()
+    .filter_map(|(side, program)| {
+        let program: &AgentProgram = program.as_ref()?;
+        Some(match &program.version {
+            Some(version) => format!("{side} {version}"),
+            None => side.to_owned(),
         })
-        .collect()
+    })
+    .collect()
+}
+
+/// What Settings → Agents calls `side`: the Linux side by the WSL `distribution` it was
+/// looked for in, else for this computer.
+fn side_name(distribution: Option<&str>, side: AgentSide) -> &str {
+    match side {
+        AgentSide::Windows => "Windows",
+        AgentSide::Linux => distribution.unwrap_or(if cfg!(target_os = "macos") {
+            "macOS"
+        } else {
+            "Linux"
+        }),
+    }
 }
 
 /// The line under `section`'s heading: what its page covers.
@@ -3080,6 +3101,7 @@ impl CompiApp {
                 ));
                 self.settings.install_copied = Some(agent);
             }
+            SettingsAction::UpdateAgent(agent, side) => self.update_agent(agent, side, cx),
             SettingsAction::ToggleChatAgentsBar => {
                 self.set_chat_agents_bar(!self.config.chat_agents_bar, cx);
             }
@@ -4566,16 +4588,98 @@ impl CompiApp {
         ))
     }
 
-    /// The Agents page's controls: Copy command on each agent installed nowhere.
+    /// The sides of `agent` with a newer version published than the one installed: each
+    /// side, its name, and the newest version.
+    fn agent_update_offers(&self, agent: ChatHarness) -> Vec<(AgentSide, String, String)> {
+        let Some(Ok(installs)) = &self.settings.agent_installs else {
+            return Vec::new();
+        };
+        let Some(install) = installs.agents.iter().find(|install| install.harness == agent)
+        else {
+            return Vec::new();
+        };
+        let Some(latest) = &install.latest else {
+            return Vec::new();
+        };
+        [
+            (
+                AgentSide::Linux,
+                side_name(installs.distribution.as_deref(), AgentSide::Linux),
+                &install.linux,
+            ),
+            (
+                AgentSide::Windows,
+                side_name(None, AgentSide::Windows),
+                &install.windows,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, _, program)| {
+            program
+                .as_ref()
+                .and_then(|program| program.version.as_deref())
+                .is_some_and(|version| newer_version(latest, version))
+        })
+        .map(|(side, name, _)| (side, name.to_owned(), latest.clone()))
+        .collect()
+    }
+
+    /// The Agents page's controls: Copy command on each agent installed nowhere, Update
+    /// on each side with a newer version.
     fn agent_stops(&self) -> Vec<SettingsAction> {
         ChatHarness::ALL
             .into_iter()
-            .filter(|agent| {
-                self.agent_places(*agent)
+            .flat_map(|agent| {
+                let copy = self
+                    .agent_places(agent)
                     .is_some_and(|places| places.is_empty())
+                    .then_some(SettingsAction::CopyInstallCommand(agent));
+                copy.into_iter().chain(
+                    self.agent_update_offers(agent)
+                        .into_iter()
+                        .map(move |(side, _, _)| SettingsAction::UpdateAgent(agent, side)),
+                )
             })
-            .map(SettingsAction::CopyInstallCommand)
             .collect()
+    }
+
+    /// Updates `agent` on `side` through the daemon, off the UI thread; once it worked,
+    /// the cards look again.
+    fn update_agent(&mut self, agent: ChatHarness, side: AgentSide, cx: &mut Context<Self>) {
+        let updates = &mut self.settings.agent_updates;
+        if updates
+            .iter()
+            .any(|(running, on, result)| (*running, *on) == (agent, side) && result.is_none())
+        {
+            return;
+        }
+        updates.retain(|(updated, on, _)| (*updated, *on) != (agent, side));
+        updates.push((agent, side, None));
+        let target = self.target.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { target.connect()?.update_agent(agent, side) })
+                .await
+                .map_err(|error| error.to_string());
+            this.update(cx, |this, cx| {
+                let worked = result.is_ok();
+                if let Some(entry) = this
+                    .settings
+                    .agent_updates
+                    .iter_mut()
+                    .find(|(updated, on, _)| (*updated, *on) == (agent, side))
+                {
+                    entry.2 = Some(result);
+                }
+                if worked {
+                    this.read_agent_installs(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Settings → Agents: a card per agent.
@@ -4623,6 +4727,69 @@ impl CompiApp {
                 cx,
             )
         });
+        let installs = match &self.settings.agent_installs {
+            Some(Ok(installs)) => Some(installs),
+            _ => None,
+        };
+        let side = |side| side_name(installs.and_then(|installs| installs.distribution.as_deref()), side);
+        // Each update asked here: running, or how it went.
+        let updates = self
+            .settings
+            .agent_updates
+            .iter()
+            .filter(|(updated, ..)| *updated == agent)
+            .map(|(_, on, result)| {
+                let name = side(*on);
+                let (text, tint) = match result {
+                    None => (format!("Updating {name}…"), colors.muted),
+                    Some(Ok(AgentUpdated { from, to })) => (
+                        match (from, to) {
+                            (Some(from), Some(to)) if from != to => {
+                                format!("Updated {name}: {from} → {to}")
+                            }
+                            _ => format!("{name} is up to date"),
+                        },
+                        colors.muted,
+                    ),
+                    Some(Err(error)) => (format!("Couldn't update {name}: {error}"), colors.error),
+                };
+                self.item_detail(text, tint)
+            });
+        let running = |on: AgentSide| {
+            self.settings
+                .agent_updates
+                .iter()
+                .any(|(updated, side, result)| *updated == agent && *side == on && result.is_none())
+        };
+        let update_buttons: Vec<AnyElement> = self
+            .agent_update_offers(agent)
+            .into_iter()
+            .filter(|(on, ..)| !running(*on))
+            .map(|(on, name, latest)| {
+                self.settings_control(
+                    row,
+                    SettingsAction::UpdateAgent(agent, on),
+                    controls::text_button(
+                        ("agent-update", agent as usize * 2 + on as usize),
+                        format!("Update {name} to {latest}"),
+                    )
+                    .header(),
+                    cx,
+                )
+            })
+            .collect();
+        let action = match (copy, update_buttons.is_empty()) {
+            (Some(copy), _) => Some(copy),
+            (None, true) => None,
+            (None, false) => Some(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(update_buttons)
+                    .into_any_element(),
+            ),
+        };
         let default = (self.config.chat_agent == agent).then(|| {
             controls::chip("Default", controls::ChipTone::Tint(colors.accent)).into_any_element()
         });
@@ -4633,8 +4800,8 @@ impl CompiApp {
                         .size(px(AGENT_MARK_SIZE))
                         .when(missing, |mark| mark.opacity(0.5)),
                     std::iter::once(div().child(agent.name()).into_any_element()).chain(default),
-                    [self.item_detail(status, colors.muted)],
-                    copy,
+                    std::iter::once(self.item_detail(status, colors.muted)).chain(updates),
+                    action,
                     row.compact,
                 ),
             )
@@ -7095,6 +7262,7 @@ mod tests {
             windows: windows.map(|version| AgentProgram {
                 version: (!version.is_empty()).then(|| version.to_owned()),
             }),
+            latest: None,
         };
         assert_eq!(
             agent_places(

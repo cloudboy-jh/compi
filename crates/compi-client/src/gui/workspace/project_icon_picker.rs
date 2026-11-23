@@ -431,7 +431,7 @@ impl CompiApp {
         };
         let project = picker.project.clone();
         self.dismiss_overlay();
-        let mut settings = self.project_settings(&project).cloned().unwrap_or_default();
+        let mut settings = self.config.project_settings_or_new(&project);
         settings.icon = icon;
         self.set_project_settings(&project, settings, cx);
         window.focus(&self.focus_handle, cx);

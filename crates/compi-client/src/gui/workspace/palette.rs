@@ -931,7 +931,7 @@ impl CompiApp {
                     let settings = self.project_settings(&project);
                     ProjectLook {
                         name: settings.and_then(|settings| settings.name.clone()),
-                        pinned: settings.is_some_and(|settings| settings.pinned),
+                        pinned: self.config.project_pinned(&project),
                         archived: settings.is_some_and(|settings| settings.archived),
                     }
                 },

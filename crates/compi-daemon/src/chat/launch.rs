@@ -517,7 +517,7 @@ fn version_script(entry: &AgentEntry) -> String {
 /// The version in what `<program> --version` wrote: its first word that starts with a
 /// digit, after any `v`, and has a dot (`2.1.3` of `2.1.3 (Claude Code)`, `19.0.0` of
 /// `omp/19.0.0`, `0.169.0` of `codex-cli 0.169.0`).
-fn version(output: &str) -> Option<String> {
+pub(super) fn version(output: &str) -> Option<String> {
     output
         .split(|c: char| c.is_whitespace() || "/@,;()[]".contains(c))
         .map(|word| word.trim_end_matches(['.', ':']))
@@ -562,6 +562,75 @@ fn output_within(mut command: Command, timeout: Duration) -> Option<String> {
     let _ = child.wait();
     let written = written.lock().unwrap_or_else(PoisonError::into_inner);
     Some(String::from_utf8_lossy(&written).into_owned())
+}
+
+/// `harness`'s program on one side with `args`, in the home folder: its Windows program,
+/// else its Linux one, in `distribution` on Windows and on the host elsewhere.
+pub(super) fn side_command(
+    harness: ChatHarness,
+    windows: bool,
+    distribution: Option<&str>,
+    args: &[&str],
+) -> Result<Command, String> {
+    let entry = harness.entry();
+    if windows {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            let program = windows_program(entry)
+                .ok_or_else(|| format!("{} isn't installed on Windows.", entry.name))?;
+            let mut command = Command::new(program);
+            command
+                .args(args)
+                .creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+            if let Some(home) = std::env::var_os("USERPROFILE") {
+                command.current_dir(home);
+            }
+            return Ok(command);
+        }
+        #[cfg(unix)]
+        return Err(format!("{} has no Windows program here.", entry.name));
+    }
+    let args: Vec<Arg> = args.iter().map(|arg| Arg::word(*arg)).collect();
+    let script = script(entry, &args, false);
+    #[cfg(windows)]
+    {
+        let distribution = distribution.ok_or("WSL isn't set up on this PC.")?;
+        Ok(wsl_command(distribution, None, &[], &script))
+    }
+    #[cfg(unix)]
+    {
+        let _ = distribution;
+        let mut command = unix_command(&[], &script);
+        if let Some(home) = std::env::var_os("HOME") {
+            command.current_dir(home);
+        }
+        Ok(command)
+    }
+}
+
+/// The newest version of `harness`'s npm package (`AgentEntry::package`), as the npm
+/// registry says within `LOOKUP_TIMEOUT`; `None` when it doesn't.
+pub(super) fn latest_version(harness: ChatHarness) -> Option<String> {
+    let url = format!(
+        "https://registry.npmjs.org/{}/latest",
+        harness.entry().package
+    );
+    let seconds = LOOKUP_TIMEOUT.as_secs().to_string();
+    #[cfg(windows)]
+    let command = {
+        use std::os::windows::process::CommandExt as _;
+        let mut command = Command::new(r"C:\Windows\System32\curl.exe");
+        command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+        command
+    };
+    #[cfg(unix)]
+    let command = Command::new("curl");
+    let mut command = command;
+    command.args(["-fsSL", "--max-time", &seconds, &url]);
+    let answer = output_within(command, LOOKUP_TIMEOUT + Duration::from_secs(1))?;
+    let package: serde_json::Value = serde_json::from_str(&answer).ok()?;
+    package["version"].as_str().map(str::to_owned)
 }
 
 /// The login shell running `script`, with `environment`.
