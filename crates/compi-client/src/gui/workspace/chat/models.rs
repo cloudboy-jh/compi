@@ -1687,33 +1687,48 @@ impl CompiApp {
             .find(|known| known.id == *provider)
             .map(|known| known.accounts.as_slice())
             .unwrap_or_default();
+        let working = accounts.iter().find(|account| account.expired.is_none());
         let expired = accounts.iter().find_map(|account| account.expired.as_ref());
         let subscribed = state.plans.iter().any(|plan| plan.provider == *provider);
-        let signed_in = subscribed || accounts.iter().any(|account| account.expired.is_none());
-        let (text, tint) = match expired {
-            Some(reason) if !signed_in => (format!("Sign-in expired: {reason}"), colors.error),
-            _ if subscribed => ("Signed in with a subscription".to_owned(), muted),
-            _ if signed_in => ("Signed in".to_owned(), muted),
-            _ => (
+        // Signed in and working: it says so, nothing to press (`/providers` manages
+        // accounts).
+        let (text, tint, label) = match (working, expired) {
+            (Some(account), _) => {
+                let how = if subscribed {
+                    "Signed in with a subscription"
+                } else {
+                    "Signed in"
+                };
+                let text = match &account.label {
+                    Some(label) => format!("{how} · {label}"),
+                    None => how.to_owned(),
+                };
+                (text, muted, None)
+            }
+            _ if subscribed => ("Signed in with a subscription".to_owned(), muted, None),
+            (None, Some(reason)) => (
+                format!("Sign-in expired: {reason}"),
+                colors.error,
+                Some("Sign in again"),
+            ),
+            (None, None) => (
                 "Sign in with a subscription, or use an API key".to_owned(),
                 muted,
+                Some("Sign in"),
             ),
         };
-        let label = if expired.is_some() || signed_in {
-            "Sign in again"
-        } else {
-            "Sign in"
-        };
-        let (id, provider) = (chat.clone(), provider.clone());
-        let button = controls::text_button("chat-picker-sign-in", label).on_click(cx.listener(
-            move |this, _: &ClickEvent, window, cx| {
-                if let Some(model) = this.chat.chats.get_mut(&id) {
-                    model.menu = None;
-                }
-                this.sign_in_chat(&id, provider.clone(), None, window, cx);
-                cx.notify();
-            },
-        ));
+        let button = label.map(|label| {
+            let (id, provider) = (chat.clone(), provider.clone());
+            controls::text_button("chat-picker-sign-in", label).on_click(cx.listener(
+                move |this, _: &ClickEvent, window, cx| {
+                    if let Some(model) = this.chat.chats.get_mut(&id) {
+                        model.menu = None;
+                    }
+                    this.sign_in_chat(&id, provider.clone(), None, window, cx);
+                    cx.notify();
+                },
+            ))
+        });
         Some(
             div()
                 .flex_none()
@@ -1725,8 +1740,15 @@ impl CompiApp {
                 .items_center()
                 .gap_2()
                 .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
-                .child(div().flex_1().min_w_0().text_color(color(tint)).child(text))
-                .child(button)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(color(tint))
+                        .child(text),
+                )
+                .children(button)
                 .into_any_element(),
         )
     }
