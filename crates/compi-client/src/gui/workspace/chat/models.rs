@@ -137,11 +137,14 @@ fn project_choices(
 }
 
 /// Where the composer card and the model button were last drawn, in window
-/// coordinates: the popover opens above the card, from the button.
+/// coordinates: the popover opens above the card, as wide as it and lined up with it.
 #[derive(Default)]
 pub(super) struct PickerAnchor {
     pub(super) card_top: Cell<Pixels>,
+    pub(super) card_left: Cell<Pixels>,
+    pub(super) card_width: Cell<Pixels>,
     button_top: Cell<Pixels>,
+    button_left: Cell<Pixels>,
 }
 
 /// A row of the model list.
@@ -703,15 +706,19 @@ impl CompiApp {
         let measured = anchor.clone();
         let trigger = div().relative().child(button).child(
             canvas(
-                move |bounds, _, _| measured.button_top.set(bounds.origin.y),
+                move |bounds, _, _| {
+                    measured.button_top.set(bounds.origin.y);
+                    measured.button_left.set(bounds.origin.x);
+                },
                 |_, _, _, _| {},
             )
             .absolute()
             .size_full(),
         );
         // The popover's bottom meets the trigger's top; it rises past the rest of the
-        // card, so the draft stays in view.
+        // card, so the draft stays in view, and moves left to the card's edge.
         let rise = (anchor.button_top.get() - anchor.card_top.get()).max(px(0.)) + px(GAP);
+        let shift = (anchor.button_left.get() - anchor.card_left.get()).max(px(0.));
         let id = chat.id.clone();
         let on_open_change = cx.listener(move |this, open: &bool, window, cx| {
             if *open {
@@ -739,6 +746,7 @@ impl CompiApp {
         let popover = controls::popover("chat-models-menu", trigger, open)
             .anchor(Anchor::BottomLeft)
             .offset(rise)
+            .shift_left(shift)
             .on_open_change(on_open_change)
             .on_key(keys);
         let mut shown = vec![match content {
@@ -1490,10 +1498,12 @@ impl CompiApp {
             .child(picker_footnote(picker_keys(), muted))
             .children(modes)
             .child(self.render_picker_approval(chat, model, picker, shade, cx));
-        let width = if models.is_some() {
-            STRIP_WIDTH + LIST_WIDTH + THINKING_WIDTH
-        } else {
-            THINKING_WIDTH * 2.0
+        // As wide as the composer card once it was drawn.
+        let card = model.picker_anchor.card_width.get();
+        let width: gpui::Length = match models {
+            Some(_) if card > px(0.) => card.into(),
+            Some(_) => ui_rems(STRIP_WIDTH + LIST_WIDTH + THINKING_WIDTH).into(),
+            None => ui_rems(THINKING_WIDTH * 2.0).into(),
         };
         // Kit's popover is the frame; its padding is undone so the strip, the columns
         // and the footer reach its edges, as one panel.
@@ -1501,7 +1511,7 @@ impl CompiApp {
             .m(gpui::rems(-0.75))
             .rounded(cx.theme().radius)
             .text_size(ui_rems(UI_SMALL_TEXT_SIZE))
-            .w(ui_rems(width))
+            .w(width)
             .overflow_hidden()
             .flex()
             .flex_col()

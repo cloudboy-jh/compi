@@ -1391,7 +1391,11 @@ impl CompiApp {
             .child({
                 let anchor = model.picker_anchor.clone();
                 gpui::canvas(
-                    move |bounds, _, _| anchor.card_top.set(bounds.origin.y),
+                    move |bounds, _, _| {
+                        anchor.card_top.set(bounds.origin.y);
+                        anchor.card_left.set(bounds.origin.x);
+                        anchor.card_width.set(bounds.size.width);
+                    },
                     |_, _, _, _| {},
                 )
                 .absolute()
