@@ -79,6 +79,8 @@ pub(super) struct ModelPicker {
     /// Frames left in which the search takes the keyboard back: the popover takes it
     /// for itself a frame or two after opening.
     claim_keyboard: u8,
+    /// A draft's strip shows every installed agent, not just its own.
+    agents_open: bool,
 }
 
 /// What a model picker picks for: chat `id`'s harness, or the new threads of the project
@@ -895,6 +897,7 @@ impl CompiApp {
             approval,
             scroll: UniformListScrollHandle::new(),
             claim_keyboard: CLAIM_FRAMES,
+            agents_open: false,
         });
         self.show_model_tab(&owner, Some(tab), cx);
     }
@@ -1858,49 +1861,75 @@ impl CompiApp {
             "Favorites and recent".to_owned(),
             None,
         );
-        // A draft can still change agent: one mark per installed agent heads the strip,
-        // its own lit, another starting the draft again with that agent.
+        // A draft can still change agent. Its own mark heads the strip; a click on it
+        // lists every installed agent, another starting the draft again with that one.
         let agents: Vec<AnyElement> = match draft.filter(|chat| self.chat_draft(chat) == Some(true))
         {
-            Some(chat) => self
-                .installed_agents(&chat.environment)
-                .into_iter()
-                .enumerate()
-                .map(|(index, agent)| {
-                    let current = agent == chat.harness;
-                    let id = chat.id.clone();
-                    div()
-                        .id(("chat-agent-tab", index))
-                        .w_full()
-                        .h(ui_rems(STRIP_WIDTH - 8.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .child(img(harness_mark(agent)).flex_none().size(ui_rems(18.0)))
-                        .when(current, |button| button.bg(lit))
-                        .when(!current, |button| {
-                            button
-                                .cursor_pointer()
-                                .opacity(0.55)
-                                .hover(move |button| button.bg(lit).opacity(1.0))
-                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            Some(chat) => {
+                let installed = self.installed_agents(&chat.environment);
+                // A chevron on the draft's own mark says it opens the others.
+                let others = installed.len() > 1;
+                installed
+                    .into_iter()
+                    .filter(|agent| picker.agents_open || *agent == chat.harness)
+                    .enumerate()
+                    .map(|(index, agent)| {
+                        let current = agent == chat.harness;
+                        let id = chat.id.clone();
+                        let owner = owner.clone();
+                        div()
+                            .id(("chat-agent-tab", index))
+                            .w_full()
+                            .h(ui_rems(STRIP_WIDTH - 8.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .gap(px(2.0))
+                            .child(img(harness_mark(agent)).flex_none().size(ui_rems(18.0)))
+                            .when(current && others, |button| {
+                                button.child(controls::glyph(
+                                    if picker.agents_open {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    },
+                                    muted,
+                                ))
+                            })
+                            .when(current, |button| button.bg(lit))
+                            .when(!current, |button| {
+                                button
+                                    .opacity(0.55)
+                                    .hover(move |button| button.bg(lit).opacity(1.0))
+                            })
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                if current {
+                                    if let Some(picker) = this.owner_picker_mut(&owner) {
+                                        picker.agents_open = !picker.agents_open;
+                                    }
+                                } else {
                                     this.switch_draft_agent(&id, agent, window, cx);
-                                    cx.notify();
-                                }))
-                        })
-                        .tooltip(controls::tooltip(
-                            agent.name(),
-                            Some(if current {
-                                "This draft's agent".into()
-                            } else {
-                                "Start this draft with it instead; what you typed stays".into()
-                            }),
-                            None,
-                        ))
-                        .into_any_element()
-                })
-                .collect(),
+                                }
+                                cx.notify();
+                            }))
+                            .tooltip(controls::tooltip(
+                                agent.name(),
+                                Some(match (current, others && !picker.agents_open) {
+                                    (true, true) => "This draft's agent; click to change it".into(),
+                                    (true, false) => "This draft's agent".into(),
+                                    (false, _) => {
+                                        "Start this draft with it instead; what you typed stays"
+                                            .into()
+                                    }
+                                }),
+                                None,
+                            ))
+                            .into_any_element()
+                    })
+                    .collect()
+            }
             None => Vec::new(),
         };
         let own_models = harness.entry().own_models;
@@ -2227,6 +2256,7 @@ impl CompiApp {
                 approval: 0,
                 scroll: UniformListScrollHandle::new(),
                 claim_keyboard: CLAIM_FRAMES,
+                agents_open: false,
             },
         });
         self.show_model_tab(&PickerOwner::Project, Some(tab), cx);
