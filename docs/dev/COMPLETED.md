@@ -2,6 +2,10 @@
 
 This is an implementation history with dated verification evidence, not a claim of current cross-platform qualification. The latest recorded Windows handoff is summarized first; unfinished work is tracked in [Next steps](NEXT_STEPS.md).
 
+## After 0.9.2 (unreleased)
+
+- **Model picker clicks work again** (2026-11-22, no protocol change). 0.9.2 lined the picker up by shifting its content left of the popover (`PopoverControl::shift_left`, a negative margin); the popover's dismiss-on-outside-press still used the unshifted box, so a press on the strip or the left of the list closed the picker before it picked. Now the picker is anchored to an invisible full-width line along the composer card's top (`render_chat_model_popover`), as wide as the card (`PickerAnchor::card_width`), and the model button opens it on mouse down (a press while open only closes it). `shift_left` and the button/card position cells are gone. Windows `cargo dev`: in a new thread and in a thread with a reply, the strip switched providers (OpenAI Codex, Anthropic), picking GPT-6 Sol and Claude Haiku 5.5 changed the composer's model, and pressing the model button while open closed it.
+
 ## Providers and agent updates (v0.9.2)
 
 - **New thread box grows with its pane, model picker lines up** (2026-11-22, no protocol change). The draft column is 60% of the pane (measured by a canvas, `ChatModel::draft_width`, refreshed on change), between 544 and 760 px, and fills a narrower pane (`draft_width`). The model picker opens at the composer card's left edge and as wide as it (`PickerAnchor` card left/width, `PopoverControl::shift_left`); a provider signed in and working shows its account with no button. Windows `cargo dev`: windows 948, 1250 and 1700 px wide gave columns of 544, ~712 and 760 px, and a 520 px window filled; the picker spanned the card exactly.
