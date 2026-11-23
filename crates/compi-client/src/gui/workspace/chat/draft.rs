@@ -16,9 +16,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How long "Draft discarded · Undo" stays.
 const UNDO_LIFETIME: Duration = Duration::from_secs(5);
-/// The widest the draft's column grows: the message box and the list under it share
-/// this width, less the footer's 12 px each side.
-const DRAFT_WIDTH: f32 = 544.0;
+/// The draft's column (the message box and the list under it, less the footer's 12 px
+/// each side) takes this share of the pane's width, between these bounds; a pane
+/// narrower than the least it fills.
+const DRAFT_SHARE: f32 = 0.6;
+const DRAFT_MIN_WIDTH: f32 = 544.0;
+const DRAFT_MAX_WIDTH: f32 = 760.0;
+
+/// The draft column's width in a pane `area` wide (less its padding).
+fn draft_width(area: Pixels, least: Pixels, most: Pixels) -> Pixels {
+    (area * DRAFT_SHARE).clamp(least, most).min(area)
+}
 
 static NEXT_NOTICE: AtomicU64 = AtomicU64::new(0);
 
@@ -254,8 +262,31 @@ impl CompiApp {
                 Some("Click the project to start this thread in another".into()),
                 None,
             ));
+        // The column's width follows the pane's, measured as it is drawn: from the next
+        // frame, which a change asks for. Until then it is the least.
+        let measured = model.draft_width.clone();
+        let measure = gpui::canvas(
+            move |bounds, window, _| {
+                let rem = window.rem_size();
+                let area = (bounds.size.width - rem * 2.0).max(px(0.));
+                let width = draft_width(
+                    area,
+                    ui_rems(DRAFT_MIN_WIDTH).to_pixels(rem),
+                    ui_rems(DRAFT_MAX_WIDTH).to_pixels(rem),
+                );
+                if measured.get() != width {
+                    measured.set(width);
+                    window.refresh();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+        let width = model.draft_width.get();
         div()
             .id("chat-draft")
+            .relative()
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -265,10 +296,17 @@ impl CompiApp {
             .justify_center()
             .px_4()
             .py_8()
+            .child(measure)
             .child(
                 div()
-                    .w_full()
-                    .max_w(ui_rems(DRAFT_WIDTH))
+                    .map(|column| {
+                        if width > px(0.) {
+                            column.w(width)
+                        } else {
+                            column.w_full().max_w(ui_rems(DRAFT_MIN_WIDTH))
+                        }
+                    })
+                    .max_w_full()
                     .flex()
                     .flex_col()
                     .items_center()
@@ -902,6 +940,16 @@ impl CompiApp {
 mod tests {
     use super::*;
     use compi_protocol::SurfaceId;
+
+    #[test]
+    fn the_draft_column_grows_with_the_pane_between_its_bounds() {
+        let (least, most) = (px(544.), px(760.));
+        assert_eq!(draft_width(px(1500.), least, most), most);
+        assert_eq!(draft_width(px(1100.), least, most), px(660.));
+        assert_eq!(draft_width(px(700.), least, most), least);
+        // A pane narrower than the least is filled.
+        assert_eq!(draft_width(px(400.), least, most), px(400.));
+    }
 
     fn chat(id: &str) -> ChatContent {
         ChatContent {

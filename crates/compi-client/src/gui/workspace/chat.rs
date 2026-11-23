@@ -274,6 +274,8 @@ struct ChatModel {
     providers_open: bool,
     /// The update the user dismissed; its card stays hidden while the daemon shows it.
     update_seen: Option<compi_protocol::chat::ChatAgentUpdate>,
+    /// A draft's column width, from its pane's width as last drawn; zero until then.
+    draft_width: Rc<std::cell::Cell<Pixels>>,
 }
 
 /// The chats of this window.
@@ -1184,6 +1186,7 @@ impl CompiApp {
             start: Arc::default(),
             providers_open: false,
             update_seen: None,
+            draft_width: Rc::default(),
         }
     }
 
