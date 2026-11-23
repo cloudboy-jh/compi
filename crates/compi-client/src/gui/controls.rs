@@ -932,6 +932,60 @@ pub(super) fn glyph(icon: IconName, tint: gpui::Hsla) -> Icon {
     Icon::new(icon).with_size(Size::XSmall).text_color(tint)
 }
 
+/// How long a working spinner shows each of its eight spokes in front.
+const SPINNER_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+static SPINNER_EPOCH: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+thread_local! {
+    /// Views with a spinner step already scheduled.
+    static SPINNER_STEPS: std::cell::RefCell<std::collections::HashSet<gpui::EntityId>> =
+        Default::default();
+}
+
+/// A working spinner, `tint`, that turns one spoke every `SPINNER_STEP`. Kit's spinner
+/// animates every frame, and every frame redraws the whole window, so one running tool
+/// kept the window drawing at the display's rate and made scrolling beside it lag. This
+/// one has its view drawn again once per step, and only while it is painted.
+pub(super) fn spinner(tint: gpui::Hsla) -> AnyElement {
+    let elapsed = SPINNER_EPOCH.elapsed();
+    let step = (elapsed.as_millis() / SPINNER_STEP.as_millis()) % 8;
+    div()
+        .relative()
+        .child(
+            glyph(IconName::Loader, tint).transform(gpui::Transformation::rotate(gpui::radians(
+                step as f32 * std::f32::consts::FRAC_PI_4,
+            ))),
+        )
+        .child(
+            gpui::canvas(
+                |_, _, _| {},
+                |_, _, window, cx| next_spinner_step(window, cx),
+            )
+            .absolute()
+            .size_0(),
+        )
+        .into_any_element()
+}
+
+/// Draws the painting view again when the spinners' next spoke comes up.
+fn next_spinner_step(window: &mut Window, cx: &mut App) {
+    let view = window.current_view();
+    if !SPINNER_STEPS.with_borrow_mut(|steps| steps.insert(view)) {
+        return;
+    }
+    let step = SPINNER_STEP.as_millis();
+    let wait = step - SPINNER_EPOCH.elapsed().as_millis() % step;
+    window
+        .spawn(cx, async move |cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(wait as u64))
+                .await;
+            SPINNER_STEPS.with_borrow_mut(|steps| steps.remove(&view));
+            let _ = cx.update(|_, cx| cx.notify(view));
+        })
+        .detach();
+}
+
 /// A tooltip with `title`, an optional muted `detail` line and an optional `key`
 /// (GPUI keystroke syntax) as Kit's `Kbd`, for GPUI's `tooltip`.
 pub(super) fn tooltip(

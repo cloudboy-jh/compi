@@ -1536,10 +1536,7 @@ fn render_error(message: &SharedString, retry: bool, frame: &RowFrame) -> AnyEle
 fn tool_status(status: ChatToolStatus, frame: &RowFrame) -> AnyElement {
     let muted = frame.muted();
     match status {
-        ChatToolStatus::Pending | ChatToolStatus::Running => Spinner::new()
-            .with_size(Size::XSmall)
-            .color(muted)
-            .into_any_element(),
+        ChatToolStatus::Pending | ChatToolStatus::Running => controls::spinner(muted),
         ChatToolStatus::Completed => controls::glyph(IconName::Check, muted).into_any_element(),
         ChatToolStatus::Failed => {
             controls::glyph(IconName::CircleX, color(frame.colors.error)).into_any_element()

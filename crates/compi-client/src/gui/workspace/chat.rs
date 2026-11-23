@@ -37,7 +37,6 @@ use gpui::{
     uniform_list,
 };
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_component::spinner::Spinner;
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::{RopeExt as _, Sizable as _, Size};
 use std::rc::Rc;

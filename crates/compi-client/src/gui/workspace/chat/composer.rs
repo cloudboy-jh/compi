@@ -984,7 +984,7 @@ impl CompiApp {
                         .gap_2()
                         .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
                         .text_color(muted)
-                        .child(Spinner::new().with_size(Size::XSmall).color(muted))
+                        .child(controls::spinner(muted))
                         .child(format!(
                             "Working · {}",
                             duration_label(now_ms().saturating_sub(since_ms))
