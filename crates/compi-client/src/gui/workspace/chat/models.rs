@@ -17,7 +17,7 @@ use crate::gui::model_icons;
 use crate::listed_models::AgentModels;
 use compi_protocol::Project;
 use compi_protocol::chat::{ChatChoice, ChatOption, ChatPlan};
-use gpui::{Div, Hsla, canvas, linear_color_stop, linear_gradient, svg};
+use gpui::{Div, Hsla, linear_color_stop, linear_gradient, svg};
 use gpui_component::{ActiveTheme as _, Icon};
 use std::cell::Cell;
 
@@ -136,15 +136,11 @@ fn project_choices(
     choices
 }
 
-/// Where the composer card and the model button were last drawn, in window
-/// coordinates: the popover opens above the card, as wide as it and lined up with it.
+/// The composer card's width as last drawn: the picker, which opens above the card from
+/// its left edge, is as wide.
 #[derive(Default)]
 pub(super) struct PickerAnchor {
-    pub(super) card_top: Cell<Pixels>,
-    pub(super) card_left: Cell<Pixels>,
     pub(super) card_width: Cell<Pixels>,
-    button_top: Cell<Pixels>,
-    button_left: Cell<Pixels>,
 }
 
 /// A row of the model list.
@@ -702,23 +698,54 @@ impl CompiApp {
         if let (Some(_), Some(thinking)) = (models, thinking) {
             button = button.trailing(IconName::Brain, thinking.current_name().to_owned());
         }
-        let anchor = model.picker_anchor.clone();
-        let measured = anchor.clone();
-        let trigger = div().relative().child(button).child(
-            canvas(
-                move |bounds, _, _| {
-                    measured.button_top.set(bounds.origin.y);
-                    measured.button_left.set(bounds.origin.x);
-                },
-                |_, _, _, _| {},
-            )
-            .absolute()
-            .size_full(),
+        // The picker opens from the card's top edge (`render_chat_model_popover`). A
+        // press while it is open only closes it, as pressing anywhere outside it does.
+        let id = chat.id.clone();
+        let trigger = div().child(button).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                if !open {
+                    this.open_model_picker(&id, PickerColumn::Models, window, cx);
+                    cx.notify();
+                }
+            }),
         );
-        // The popover's bottom meets the trigger's top; it rises past the rest of the
-        // card, so the draft stays in view, and moves left to the card's edge.
-        let rise = (anchor.button_top.get() - anchor.card_top.get()).max(px(0.)) + px(GAP);
-        let shift = (anchor.button_left.get() - anchor.card_left.get()).max(px(0.));
+        let mut shown = vec![trigger.into_any_element()];
+        if let Some(mode) = mode.filter(|mode| {
+            mode.choices
+                .first()
+                .is_some_and(|first| first.value != mode.current)
+        }) {
+            let id = chat.id.clone();
+            shown.push(
+                text_button("chat-mode", mode.current_name().to_owned())
+                    .ghost()
+                    .tooltip(mode.name.clone())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.open_model_picker(&id, PickerColumn::Mode, window, cx);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        shown.extend(shield);
+        shown
+    }
+
+    /// The model picker, anchored to the composer card's top edge (an invisible full-width
+    /// line across it), so it opens above the card from its left edge; `None` while the
+    /// agent has nothing to pick. The model button opens it (`render_chat_models`).
+    pub(super) fn render_chat_model_popover(
+        &self,
+        chat: &ChatContent,
+        model: &ChatModel,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if model.picker_options().iter().all(Option::is_none) {
+            return None;
+        }
+        let open = model.menu == Some(ChatMenu::Models);
         let id = chat.id.clone();
         let on_open_change = cx.listener(move |this, open: &bool, window, cx| {
             if *open {
@@ -743,35 +770,26 @@ impl CompiApp {
             .as_ref()
             .filter(|_| open)
             .map(|picker| self.render_model_picker(chat, model, picker, cx));
-        let popover = controls::popover("chat-models-menu", trigger, open)
+        let edge = div().w_full().h_0();
+        let popover = controls::popover("chat-models-menu", edge, open)
             .anchor(Anchor::BottomLeft)
-            .offset(rise)
-            .shift_left(shift)
+            .offset(px(GAP))
+            .full_width()
             .on_open_change(on_open_change)
             .on_key(keys);
-        let mut shown = vec![match content {
+        let popover = match content {
             Some(content) => popover.content(content).into_any_element(),
             None => popover.into_any_element(),
-        }];
-        if let Some(mode) = mode.filter(|mode| {
-            mode.choices
-                .first()
-                .is_some_and(|first| first.value != mode.current)
-        }) {
-            let id = chat.id.clone();
-            shown.push(
-                text_button("chat-mode", mode.current_name().to_owned())
-                    .ghost()
-                    .tooltip(mode.name.clone())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.open_model_picker(&id, PickerColumn::Mode, window, cx);
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            );
-        }
-        shown.extend(shield);
-        shown
+        };
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .w_full()
+                .child(popover)
+                .into_any_element(),
+        )
     }
 
     /// The composer row's shield, only while this chat's permissions differ from

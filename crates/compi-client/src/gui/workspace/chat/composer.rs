@@ -1387,20 +1387,18 @@ impl CompiApp {
                     .child(self.render_chat_controls(chat, model, cx)),
             )
             .child(self.render_chat_drop_zone(&colors))
-            // Where the card is, so the model picker opens above it.
+            // The card's width, which the model picker takes, and the picker, which opens
+            // from its top edge.
             .child({
                 let anchor = model.picker_anchor.clone();
                 gpui::canvas(
-                    move |bounds, _, _| {
-                        anchor.card_top.set(bounds.origin.y);
-                        anchor.card_left.set(bounds.origin.x);
-                        anchor.card_width.set(bounds.size.width);
-                    },
+                    move |bounds, _, _| anchor.card_width.set(bounds.size.width),
                     |_, _, _, _| {},
                 )
                 .absolute()
                 .size_full()
             })
+            .children(self.render_chat_model_popover(chat, model, cx))
             .into_any_element()
     }
 

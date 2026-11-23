@@ -1175,8 +1175,6 @@ pub(super) struct PopoverControl {
     content: Option<AnyElement>,
     full_width: bool,
     offset: Pixels,
-    /// How far left of the trigger's edge the popover starts.
-    shift_left: Pixels,
 }
 
 /// A popover attached to `trigger`, open while `open`. The caller owns the state:
@@ -1197,7 +1195,6 @@ pub(super) fn popover(
         content: None,
         full_width: false,
         offset: px(0.),
-        shift_left: px(0.),
     }
 }
 
@@ -1212,13 +1209,6 @@ impl PopoverControl {
     /// Gap between the trigger and the popover, along the anchor's side.
     pub(super) fn offset(mut self, offset: Pixels) -> Self {
         self.offset = offset;
-        self
-    }
-
-    /// Moves the popover left of the trigger's edge, to line it up with what holds the
-    /// trigger (the composer card for its model button).
-    pub(super) fn shift_left(mut self, shift: Pixels) -> Self {
-        self.shift_left = shift;
         self
     }
 
@@ -1264,7 +1254,6 @@ impl RenderOnce for PopoverControl {
             self.on_open_change,
         )
         .offset(self.offset)
-        .ml(-self.shift_left)
         .track_focus(&focus)
         .when(self.full_width, |popover| {
             popover.trigger_style(StyleRefinement::default().w_full())
