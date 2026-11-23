@@ -2,7 +2,7 @@
 
 This is an implementation history with dated verification evidence, not a claim of current cross-platform qualification. The latest recorded Windows handoff is summarized first; unfinished work is tracked in [Next steps](NEXT_STEPS.md).
 
-## After 0.9.3 (unreleased)
+## One install per agent and thread names (v0.9.4)
 
 - **One install per agent, in every folder** (2026-11-23, protocol 44). New chats carry the program they prefer (`ChatContent::prefer`, `AgentSide`), from `[chat.<program>] side` (`LoadedConfig::chat_prefer`: Linux unless set; `None` off Windows), set by every new-chat path (`crate::chat::new_chat`). The daemon honours it (`launch::programs`): a Windows-folder chat preferring Linux runs the Linux program of the default distribution in that folder when one is there (`linux_found`), the existing fallback path with the shell bridge and the WSL note; a WSL chat preferring Windows runs the Windows program only (`Prepared::windows_only`, `launch_script` without the Linux search). Threads without `prefer` keep the old rule, so saved threads resume where they started. Settings → Agents says which program chats use ("Chats use Ubuntu 19.1.0 · Windows 19.1.0 not used") with an **Ubuntu | Windows** switch for agents on both sides (`SettingsAction::AgentSide`). Windows `cargo dev`: **New thread here** on the saved Windows project `C:\…\compi` ran Ubuntu OMP in `/mnt/c/Users/johns/OneDrive/Desktop/Proj/compi` (`uname` Linux, footer `WSL: Ubuntu`, still under the Compi project); a saved Windows thread in Home resumed on Windows OMP; the OMP switch wrote and cleared `side = "windows"`; Claude Code (Windows only) read "Chats use Windows 2.1.330" with no switch.
 

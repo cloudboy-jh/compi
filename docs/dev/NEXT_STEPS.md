@@ -12,6 +12,13 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 - **0.8.1**: published 2026-11-11 21:20 UTC, tagged `v0.8.1` at `d5fb6e3`, release run [43099782821](https://github.com/cloudboy-jh/compi/actions/runs/43099782821), 12 assets. Its in-app update from 0.8.0 rolled back on the working instance (the window hang, fixed in 0.8.2); Setup installed it.
 - **0.8.0**: published 2026-11-11 16:10 UTC, tagged `v0.8.0` at `7c12262`, release run [43053398818](https://github.com/cloudboy-jh/compi/actions/runs/43053398818), 12 assets.
 
+## v0.9.4 follow-through
+
+This release runs new chats on one install of each agent (WSL first on Windows, with an **Ubuntu | Windows** switch in Settings → Agents), makes thread renames stick everywhere (`RenameThread`), counts a tab's panes on its sidebar card with a hover list, and keeps the narrow message box's Send visible. Protocol 43 → 44. See [Completed work](COMPLETED.md#one-install-per-agent-and-thread-names-v094).
+
+- Flaky Windows/Linux daemon tests seen on Core CI: `closing_a_chat_pane_ends_its_terminal_like_any_other` and `lost_shell_restarts_in_its_last_reported_directory` (its 10 s save wait).
+- Not seen natively: the macOS app, the Agents card's **Installed …** line off Windows.
+
 ## v0.9.2 follow-through
 
 This release adds providers, sign-in and sign-out from the chat for all four agents (`/providers`, `/login`, `/logout`), `/update` and Settings → Agents updates, dragged project order with Home pinned by default, the linked-WSL new-tab fix, the model picker lined up with the message box, and a new thread's box growing with its pane. Protocol 42 → 43. See [Completed work](COMPLETED.md#providers-and-agent-updates-v092).
