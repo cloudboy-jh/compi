@@ -408,14 +408,9 @@ impl CompiApp {
                 .overflow_y_scroll()
                 .flex()
                 .flex_col()
-                .children(
-                    providers
-                        .iter()
-                        .enumerate()
-                        .map(|(index, provider)| {
-                            self.render_provider_row(chat, state, index, provider, cx)
-                        }),
-                )
+                .children(providers.iter().enumerate().map(|(index, provider)| {
+                    self.render_provider_row(chat, state, index, provider, cx)
+                }))
                 .into_any_element(),
         };
         Some(
@@ -511,7 +506,12 @@ impl CompiApp {
                 })
                 .collect()
         } else {
-            vec![div().text_color(muted).child("Not signed in").into_any_element()]
+            vec![
+                div()
+                    .text_color(muted)
+                    .child("Not signed in")
+                    .into_any_element(),
+            ]
         };
         div()
             .flex()
@@ -640,7 +640,11 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(state) = self.chat.chats.get(chat).and_then(|model| model.state.as_ref())
+        let Some(state) = self
+            .chat
+            .chats
+            .get(chat)
+            .and_then(|model| model.state.as_ref())
         else {
             return;
         };

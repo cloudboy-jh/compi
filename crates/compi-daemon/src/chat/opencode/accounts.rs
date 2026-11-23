@@ -168,7 +168,10 @@ fn start(
     };
     if method == API_KEY_METHOD {
         set_asks(chat, run, Asks::Key);
-        chat.sign_in_signal(run, login::Signal::Prompt(format!("Paste your {name} API key")));
+        chat.sign_in_signal(
+            run,
+            login::Signal::Prompt(format!("Paste your {name} API key")),
+        );
         return Ok(());
     }
     let id = method
@@ -269,13 +272,7 @@ fn first_method(place: &Place, provider: &str) -> Result<String, String> {
 
 /// Follows 2.x's sign-in `attempt` until it ends, or the chat's sign-in is no longer
 /// `run`.
-fn wait(
-    chat: &Chat,
-    run: u64,
-    place: &Place,
-    provider: &str,
-    attempt: &str,
-) -> Result<(), String> {
+fn wait(chat: &Chat, run: u64, place: &Place, provider: &str, attempt: &str) -> Result<(), String> {
     let path = format!(
         "/api/integration/{provider}/connect/oauth/{attempt}{}",
         place.query
@@ -405,7 +402,9 @@ fn signed_out(place: &Place, provider: &str, account: Option<String>) -> Result<
             .collect(),
     };
     if accounts.is_empty() {
-        return Err("OpenCode keeps no account for it to sign out; one from a variable stays.".into());
+        return Err(
+            "OpenCode keeps no account for it to sign out; one from a variable stays.".into(),
+        );
     }
     for account in accounts {
         place.call("DELETE", &format!("/api/credential/{account}"), None)?;
@@ -464,10 +463,7 @@ fn v1_providers(listed: &Value, auth: &Value) -> Vec<ChatProvider> {
             (signed_in || browser).then(|| ChatProvider {
                 id: id.to_owned(),
                 name: provider["name"].as_str().map(str::to_owned),
-                accounts: signed_in
-                    .then(ChatAccount::default)
-                    .into_iter()
-                    .collect(),
+                accounts: signed_in.then(ChatAccount::default).into_iter().collect(),
                 methods,
                 sign_out: true,
                 adds_accounts: false,
@@ -637,7 +633,10 @@ mod tests {
             ],
         });
         let providers = v1_providers(&listed, &auth);
-        let ids: Vec<_> = providers.iter().map(|provider| provider.id.as_str()).collect();
+        let ids: Vec<_> = providers
+            .iter()
+            .map(|provider| provider.id.as_str())
+            .collect();
         assert_eq!(ids, ["anthropic", "deepseek"]);
         assert_eq!(
             providers[0].methods,

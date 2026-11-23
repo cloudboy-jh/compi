@@ -236,7 +236,12 @@ impl ChatHub {
 
     /// Signs `provider` in for the chat's agent where the chat runs, the way `method`
     /// says or the agent's own.
-    pub fn sign_in(&self, id: &str, provider: String, method: Option<String>) -> Result<(), String> {
+    pub fn sign_in(
+        &self,
+        id: &str,
+        provider: String,
+        method: Option<String>,
+    ) -> Result<(), String> {
         self.get(id)?.sign_in(provider, method)
     }
 
@@ -473,14 +478,14 @@ pub fn agent_installs() -> compi_protocol::chat::AgentInstalls {
         agents: ChatHarness::ALL
             .into_iter()
             .zip(windows.into_iter().zip(linux).zip(latest))
-            .map(|(harness, ((windows, linux), latest))| {
-                compi_protocol::chat::AgentInstall {
+            .map(
+                |(harness, ((windows, linux), latest))| compi_protocol::chat::AgentInstall {
                     harness,
                     windows: join(windows),
                     linux: join(linux),
                     latest: join(latest),
-                }
-            })
+                },
+            )
             .collect(),
     }
 }

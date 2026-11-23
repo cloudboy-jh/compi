@@ -26,8 +26,8 @@ mod v1;
 mod v2;
 
 use super::launch::Arg;
-pub(super) use accounts::{SignIn, answer_sign_in, check_providers, sign_in, sign_out};
 use super::{Chat, Driver, Inner, Prompt, SessionsReply, Wire, rfc3339};
+pub(super) use accounts::{SignIn, answer_sign_in, check_providers, sign_in, sign_out};
 use compi_protocol::chat::{
     ChatAnswer, ChatAnswers, ChatChoice, ChatEntry, ChatEvent, ChatField, ChatHarness, ChatOption,
     ChatPermission, ChatPermissionOption, ChatQuestion, ChatSessionInfo, ChatStatus,

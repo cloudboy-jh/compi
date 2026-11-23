@@ -175,8 +175,14 @@ fn run(program: &Program, mut note: impl FnMut(String)) -> Result<AgentUpdated, 
         .map_err(|error| format!("Couldn't run {name}'s updater: {error}"))?;
     let (lines, said) = mpsc::channel::<String>();
     let readers: Vec<_> = [
-        child.stdout.take().map(|output| Box::new(output) as Box<dyn Read + Send>),
-        child.stderr.take().map(|output| Box::new(output) as Box<dyn Read + Send>),
+        child
+            .stdout
+            .take()
+            .map(|output| Box::new(output) as Box<dyn Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|output| Box::new(output) as Box<dyn Read + Send>),
     ]
     .into_iter()
     .flatten()

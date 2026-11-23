@@ -4594,7 +4594,10 @@ impl CompiApp {
         let Some(Ok(installs)) = &self.settings.agent_installs else {
             return Vec::new();
         };
-        let Some(install) = installs.agents.iter().find(|install| install.harness == agent)
+        let Some(install) = installs
+            .agents
+            .iter()
+            .find(|install| install.harness == agent)
         else {
             return Vec::new();
         };
@@ -4731,7 +4734,12 @@ impl CompiApp {
             Some(Ok(installs)) => Some(installs),
             _ => None,
         };
-        let side = |side| side_name(installs.and_then(|installs| installs.distribution.as_deref()), side);
+        let side = |side| {
+            side_name(
+                installs.and_then(|installs| installs.distribution.as_deref()),
+                side,
+            )
+        };
         // Each update asked here: running, or how it went.
         let updates = self
             .settings

@@ -1065,11 +1065,9 @@ fn handle_connection(
                     request_id,
                     crate::chat::hub().sign_out(&chat, provider, account),
                 )?,
-                ClientMessage::CheckChatProviders { chat } => answer_chat(
-                    &sink,
-                    request_id,
-                    crate::chat::hub().check_providers(&chat),
-                )?,
+                ClientMessage::CheckChatProviders { chat } => {
+                    answer_chat(&sink, request_id, crate::chat::hub().check_providers(&chat))?
+                }
                 ClientMessage::UpdateChatAgent { chat } => {
                     answer_chat(&sink, request_id, crate::chat::hub().update_chat(&chat))?
                 }

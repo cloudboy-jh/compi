@@ -308,7 +308,11 @@ fn omp_providers(usage: &Value, model_providers: &[String]) -> Vec<ChatProvider>
             }),
         );
     }
-    for credential in usage["disabledCredentials"].as_array().into_iter().flatten() {
+    for credential in usage["disabledCredentials"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
         let Some(id) = credential["provider"].as_str() else {
             continue;
         };
@@ -482,10 +486,7 @@ mod tests {
             ]
         );
         output.answered();
-        assert_eq!(
-            output.feed("Login successful.\n"),
-            [Signal::Done(None)]
-        );
+        assert_eq!(output.feed("Login successful.\n"), [Signal::Done(None)]);
     }
 
     #[test]
@@ -575,11 +576,7 @@ mod tests {
                 (
                     "anthropic",
                     vec![
-                        (
-                            Some("me@example.com".into()),
-                            Some("Max 5x".into()),
-                            None
-                        ),
+                        (Some("me@example.com".into()), Some("Max 5x".into()), None),
                         (
                             Some("old@example.com".into()),
                             None,
@@ -591,7 +588,11 @@ mod tests {
                 ("moonshot", vec![]),
             ]
         );
-        assert!(providers.iter().all(|provider| provider.adds_accounts && !provider.sign_out));
+        assert!(
+            providers
+                .iter()
+                .all(|provider| provider.adds_accounts && !provider.sign_out)
+        );
     }
 
     #[test]
@@ -602,10 +603,12 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(claude[0].accounts[0].label.as_deref(), Some("me@example.com"));
+        assert_eq!(
+            claude[0].accounts[0].label.as_deref(),
+            Some("me@example.com")
+        );
         assert_eq!(claude[0].accounts[0].plan.as_deref(), Some("Claude Max"));
-        let signed_out =
-            providers(ChatHarness::Claude, r#"{"loggedIn": false}"#, &[]).unwrap();
+        let signed_out = providers(ChatHarness::Claude, r#"{"loggedIn": false}"#, &[]).unwrap();
         assert!(signed_out[0].accounts.is_empty());
 
         let codex = providers(ChatHarness::Codex, "Logged in using ChatGPT\n", &[]).unwrap();
