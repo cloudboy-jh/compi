@@ -2,7 +2,7 @@
 
 This is an implementation history with dated verification evidence, not a claim of current cross-platform qualification. The latest recorded Windows handoff is summarized first; unfinished work is tracked in [Next steps](NEXT_STEPS.md).
 
-## After 0.9.2 (unreleased)
+## Model picker fix (v0.9.3)
 
 - **Model picker clicks work again** (2026-11-22, no protocol change). 0.9.2 lined the picker up by shifting its content left of the popover (`PopoverControl::shift_left`, a negative margin); the popover's dismiss-on-outside-press still used the unshifted box, so a press on the strip or the left of the list closed the picker before it picked. Now the picker is anchored to an invisible full-width line along the composer card's top (`render_chat_model_popover`), as wide as the card (`PickerAnchor::card_width`), and the model button opens it on mouse down (a press while open only closes it). `shift_left` and the button/card position cells are gone. Windows `cargo dev`: in a new thread and in a thread with a reply, the strip switched providers (OpenAI Codex, Anthropic), picking GPT-6 Sol and Claude Haiku 5.5 changed the composer's model, and pressing the model button while open closed it.
 
