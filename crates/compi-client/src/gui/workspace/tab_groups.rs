@@ -527,6 +527,9 @@ impl CompiApp {
     /// The strip's content x under window point `position`, when it is over the
     /// tab region.
     pub(super) fn strip_x(&self, position: Point<Pixels>, window: &Window) -> Option<f32> {
+        if !self.tab_bar_visible() {
+            return None;
+        }
         let (x, y) = (f32::from(position.x), f32::from(position.y));
         let (viewport_width, _) = logical_viewport_dimensions(window);
         let leading_width = titlebar_leading_width(window);

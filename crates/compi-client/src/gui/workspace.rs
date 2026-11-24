@@ -963,6 +963,7 @@ impl CompiApp {
             dragging_group: None,
             drag_position: None,
             tab_strip: Default::default(),
+            tab_bar_hovered: false,
             titlebar_drag: false,
             workspace: Some(snapshot),
             state_slot: Some(Arc::new(Mutex::new(slot))),
@@ -5377,7 +5378,9 @@ impl CompiApp {
         }
         self.restart_visible_lost_shell();
         self.prune_tab_menu(window, cx);
-        self.refresh_tab_strip(window);
+        if self.tab_bar_visible() {
+            self.refresh_tab_strip(window);
+        }
         if self.rebuild_layout(window, false) {
             let view_id = cx.entity_id();
             window.on_next_frame(move |_, cx| cx.notify(view_id));
@@ -5758,6 +5761,14 @@ impl CompiApp {
             .into_any_element()
     }
 
+    fn tab_bar_visible(&self) -> bool {
+        match self.config.tab_bar_visibility {
+            crate::config::TabBarVisibility::Always => true,
+            crate::config::TabBarVisibility::OnHover => self.tab_bar_hovered,
+            crate::config::TabBarVisibility::SidebarOnly => false,
+        }
+    }
+
     fn render_titlebar(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let colors = *self.colors();
         let header_alpha = self.effective_background_opacity();
@@ -6011,11 +6022,23 @@ impl CompiApp {
             }
         });
         div()
+            .id("workspace-titlebar")
             .h(px(CHROME_HEIGHT))
             .w_full()
             .flex_none()
             .relative()
             .bg(material_color(self.canvas_color(), header_alpha))
+            .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                if this.tab_bar_hovered != *hovered {
+                    this.tab_bar_hovered = *hovered;
+                    if this.config.tab_bar_visibility == crate::config::TabBarVisibility::OnHover {
+                        if *hovered {
+                            this.refresh_tab_strip(window);
+                        }
+                        cx.notify();
+                    }
+                }
+            }))
             // Comfy's gutter already separates the header from the pane islands.
             .when(!self.comfy(), |bar| {
                 bar.border_b_1().border_color(color(colors.border))
@@ -6123,45 +6146,47 @@ impl CompiApp {
                     )
                 },
             )
-            .child(
-                div()
-                    .id("terminal-tabs")
-                    .absolute()
-                    .left(px(leading_width))
-                    .right(px(trailing_width))
-                    .h_full()
-                    .flex()
-                    .overflow_x_scroll()
-                    .track_scroll(&self.tab_scroll_handle)
-                    .on_scroll_wheel(cx.listener(Self::on_tab_scroll))
-                    .children(tabs)
-                    .when(new_tab_drop, |strip| {
-                        strip.child(
-                            div()
-                                .relative()
-                                .h_full()
-                                .w(px(metrics.tab_width))
-                                .flex_none()
-                                .px_3()
-                                .flex()
-                                .items_center()
-                                .text_color(color(colors.accent))
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left(px(2.0))
-                                        .right(px(2.0))
-                                        .top(px(4.0))
-                                        .bottom(px(4.0))
-                                        .rounded(px(4.0))
-                                        .border_1()
-                                        .border_color(color(colors.accent))
-                                        .bg(color(colors.accent).opacity(0.12)),
-                                )
-                                .child("New tab"),
-                        )
-                    }),
-            )
+            .when(self.tab_bar_visible(), |bar| {
+                bar.child(
+                    div()
+                        .id("terminal-tabs")
+                        .absolute()
+                        .left(px(leading_width))
+                        .right(px(trailing_width))
+                        .h_full()
+                        .flex()
+                        .overflow_x_scroll()
+                        .track_scroll(&self.tab_scroll_handle)
+                        .on_scroll_wheel(cx.listener(Self::on_tab_scroll))
+                        .children(tabs)
+                        .when(new_tab_drop, |strip| {
+                            strip.child(
+                                div()
+                                    .relative()
+                                    .h_full()
+                                    .w(px(metrics.tab_width))
+                                    .flex_none()
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .text_color(color(colors.accent))
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .left(px(2.0))
+                                            .right(px(2.0))
+                                            .top(px(4.0))
+                                            .bottom(px(4.0))
+                                            .rounded(px(4.0))
+                                            .border_1()
+                                            .border_color(color(colors.accent))
+                                            .bg(color(colors.accent).opacity(0.12)),
+                                    )
+                                    .child("New tab"),
+                            )
+                        }),
+                )
+            })
             .child(
                 div()
                     .id("new-terminal-slot")
@@ -7454,6 +7479,21 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.dragging()
+            && self.config.tab_bar_visibility == crate::config::TabBarVisibility::OnHover
+        {
+            let (width, _) = logical_viewport_dimensions(window);
+            let x = f32::from(event.position.x);
+            let y = f32::from(event.position.y);
+            let hovered = (0.0..width).contains(&x) && (0.0..CHROME_HEIGHT).contains(&y);
+            if self.tab_bar_hovered != hovered {
+                self.tab_bar_hovered = hovered;
+                if hovered {
+                    self.refresh_tab_strip(window);
+                }
+                cx.notify();
+            }
+        }
         if !event.dragging() {
             return;
         }

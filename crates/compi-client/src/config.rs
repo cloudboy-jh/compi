@@ -489,6 +489,42 @@ impl ChatModels {
     }
 }
 
+/// When the workspace tab bar is visible, `[workspace] tab_bar_visibility`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabBarVisibility {
+    #[default]
+    Always,
+    OnHover,
+    SidebarOnly,
+}
+
+impl TabBarVisibility {
+    pub const ALL: [Self; 3] = [Self::Always, Self::OnHover, Self::SidebarOnly];
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::OnHover => "on_hover",
+            Self::SidebarOnly => "sidebar_only",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Always => "Always",
+            Self::OnHover => "On hover",
+            Self::SidebarOnly => "Sidebar only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|visibility| visibility.id() == value)
+    }
+}
+
 /// What a terminal does when a local server it printed an address for answers,
 /// `[workspace] dev_server`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -852,6 +888,9 @@ pub struct LoadedConfig {
     /// How the focused pane is marked when several are visible.
     #[serde(default)]
     pub focus_indicator: FocusIndicator,
+    /// When the workspace tab bar is visible.
+    #[serde(default)]
+    pub tab_bar_visibility: TabBarVisibility,
     /// Message text size of every chat; see [`DEFAULT_CHAT_TEXT_SIZE`].
     #[serde(default = "default_chat_text_size")]
     pub chat_text_size: f32,
@@ -917,6 +956,7 @@ impl Default for LoadedConfig {
             notifications: NotificationSettings::default(),
             confirm_close: false,
             focus_indicator: FocusIndicator::default(),
+            tab_bar_visibility: TabBarVisibility::default(),
             chat_text_size: DEFAULT_CHAT_TEXT_SIZE,
             file_text_size: None,
             chat_approval: ChatApproval::Harness,
@@ -1561,6 +1601,18 @@ impl LoadedConfig {
                 .into_iter()
                 .map(|(key, settings)| (key.clone(), settings)),
         );
+        Ok(())
+    }
+
+    /// Persist tab bar visibility; the default leaves no key behind.
+    pub fn save_tab_bar_visibility(&mut self, visibility: TabBarVisibility) -> Result<(), String> {
+        update_table(&self.path, "workspace", |table| match visibility {
+            TabBarVisibility::Always => {
+                table.remove("tab_bar_visibility");
+            }
+            visibility => set_table_value(table, "tab_bar_visibility", visibility.id().into()),
+        })?;
+        self.tab_bar_visibility = visibility;
         Ok(())
     }
 
@@ -2779,6 +2831,17 @@ fn apply_source(source: &str, loaded: &mut LoadedConfig) {
                 ),
             }
         }
+        if let Some(value) = workspace.get("tab_bar_visibility") {
+            match value.as_str().and_then(TabBarVisibility::parse) {
+                Some(visibility) => loaded.tab_bar_visibility = visibility,
+                None => invalid(
+                    loaded,
+                    "workspace.tab_bar_visibility",
+                    "\"always\", \"on_hover\" or \"sidebar_only\"",
+                    "configuration",
+                ),
+            }
+        }
         if let Some(value) = workspace.get("dev_server") {
             match value.as_str().and_then(DevServer::parse) {
                 Some(action) => loaded.dev_server = action,
@@ -3981,6 +4044,53 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|message| message.contains("workspace.focus_indicator"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tab_bar_visibility_round_trips_and_rejects_invalid_values() {
+        let root = std::env::temp_dir().join(format!(
+            "compi-tab-bar-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        fs::write(&path, "version = 1\n[workspace]\nconfirm_close = true\n").unwrap();
+        let mut loaded = load(Some(&path), FontOverrides::default());
+        assert_eq!(loaded.tab_bar_visibility, TabBarVisibility::Always);
+        for visibility in [TabBarVisibility::OnHover, TabBarVisibility::SidebarOnly] {
+            loaded.save_tab_bar_visibility(visibility).unwrap();
+            let reloaded = load(Some(&path), FontOverrides::default());
+            assert_eq!(reloaded.tab_bar_visibility, visibility);
+            assert!(reloaded.confirm_close);
+        }
+        loaded
+            .save_tab_bar_visibility(TabBarVisibility::Always)
+            .unwrap();
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("tab_bar_visibility")
+        );
+        assert_eq!(
+            load(Some(&path), FontOverrides::default()).tab_bar_visibility,
+            TabBarVisibility::Always
+        );
+        let invalid = parse(
+            "version = 1\n[workspace]\ntab_bar_visibility = 'hidden'",
+            FontOverrides::default(),
+        );
+        assert_eq!(invalid.tab_bar_visibility, TabBarVisibility::Always);
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("workspace.tab_bar_visibility"))
         );
         fs::remove_dir_all(root).unwrap();
     }

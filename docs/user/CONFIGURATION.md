@@ -14,6 +14,13 @@ Import copies the family into `themes` under Compi’s data directory. Copying a
 
 Compact rounded-rectangle tabs use a subtle active fill, transparent inactive tabs, and a faint hover fill. Hover reveals a close button in a reserved slot without moving the label. Tab geometry, keyboard cycling, overflow, reorder, and tear-off are shared across themes.
 
+**Settings → General → Tab bar** chooses **Always** (the default), **On hover** (move the pointer to the top of the workspace to reveal it), or **Sidebar only** (no tab bar). Changes apply to every open window. Show the sidebar with Ctrl+Shift+B (Cmd+B on macOS).
+
+```toml
+[workspace]
+tab_bar_visibility = "always" # always, on_hover, or sidebar_only
+```
+
 Five interface-font choices apply globally to Compi's chrome and controls. Four terminal-font choices apply independently to the fixed-width terminal grid.
 
 The native system fonts remain the defaults. Interface selection uses a stable bundled ID, while terminal selection updates the existing `font.family` setting:

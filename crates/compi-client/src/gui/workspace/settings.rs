@@ -19,7 +19,7 @@ use super::catalog::{CatalogTarget, GridStep};
 use super::chat::SECONDARY_KEY;
 use super::project_settings::{PROJECTS_ROW, ProjectControl, ProjectFields};
 use super::*;
-use crate::config::{ChatEnter, ChatOpen, DevServer, NewTab};
+use crate::config::{ChatEnter, ChatOpen, DevServer, NewTab, TabBarVisibility};
 use crate::gui::controls::IconName;
 use compi_protocol::chat::{
     AgentInstall, AgentInstalls, AgentProgram, AgentSide, AgentUpdated, ChatApproval, ChatHarness,
@@ -141,6 +141,8 @@ pub(super) enum SettingsAction {
     ChatAgent,
     /// New tabs: Chat first or Terminal first.
     NewTab,
+    /// When the workspace tab bar is visible.
+    TabBarVisibility,
     /// Shell (Windows): Automatic, PowerShell or WSL.
     Shell,
     /// When a dev server starts.
@@ -529,6 +531,15 @@ static ROWS: &[Row] = &[
         "chat first terminal first new tab plus ctrl+t thread shell default",
         |_| vec![SettingsAction::NewTab],
         |app, row, cx| app.render_new_tab_row(row, cx),
+    ),
+    row(
+        "tab-bar-visibility",
+        SettingsSection::General,
+        "Tab bar",
+        "Choose when the workspace tab bar is visible.",
+        "tabs tab bar strip always hover sidebar hide",
+        |_| vec![SettingsAction::TabBarVisibility],
+        |app, row, cx| app.render_tab_bar_visibility_row(row, cx),
     ),
     row(
         "chat-agent",
@@ -3090,6 +3101,7 @@ impl CompiApp {
             | SettingsAction::ChatOpen
             | SettingsAction::ChatAgent
             | SettingsAction::NewTab
+            | SettingsAction::TabBarVisibility
             | SettingsAction::Shell
             | SettingsAction::DevServer
             | SettingsAction::Density
@@ -3299,6 +3311,15 @@ impl CompiApp {
             SettingsAction::NewTab => {
                 let current = self.config.new_tab.unwrap_or_default();
                 self.set_new_tab(next(&NewTab::ALL, current, forward, wrap), cx);
+            }
+            SettingsAction::TabBarVisibility => {
+                let visibility = next(
+                    &TabBarVisibility::ALL,
+                    self.config.tab_bar_visibility,
+                    forward,
+                    wrap,
+                );
+                self.set_tab_bar_visibility(visibility, cx);
             }
             SettingsAction::Shell => {
                 if let Some(current) = self.windows_shell() {
@@ -4434,6 +4455,31 @@ impl CompiApp {
         )
     }
 
+    fn render_tab_bar_visibility_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
+        let current = self.config.tab_bar_visibility;
+        let detail = match current {
+            TabBarVisibility::Always => "The tab bar stays visible.",
+            TabBarVisibility::OnHover => "Move the pointer to the top of the workspace to reveal the tab bar.",
+            TabBarVisibility::SidebarOnly => "The tab bar is hidden; tabs remain in the sidebar.",
+        };
+        self.render_choice_row(
+            row,
+            SettingsAction::TabBarVisibility,
+            TabBarVisibility::ALL.map(|visibility| (
+                visibility.label(),
+                match visibility {
+                    TabBarVisibility::Always => "Always show the tab bar",
+                    TabBarVisibility::OnHover => "Reveal at the top of the workspace",
+                    TabBarVisibility::SidebarOnly => "Use the sidebar for tabs",
+                },
+                visibility == current,
+            )),
+            |app, index, cx| app.set_tab_bar_visibility(TabBarVisibility::ALL[index], cx),
+            detail.into(),
+            cx,
+        )
+    }
+
     /// New tabs: Chat first or Terminal first, as tiles of a new thread and a new shell.
     /// Unset reads as Terminal first, what + opens until it is chosen.
     fn render_new_tab_row(&self, row: &RowCx, cx: &Context<Self>) -> AnyElement {
@@ -5229,6 +5275,14 @@ impl CompiApp {
             return;
         }
         share_config_change(cx, move |config| config.new_tab = Some(new_tab));
+    }
+
+    fn set_tab_bar_visibility(&mut self, visibility: TabBarVisibility, cx: &mut Context<Self>) {
+        if let Err(error) = self.config.save_tab_bar_visibility(visibility) {
+            self.global_error = Some(error);
+            return;
+        }
+        share_config_change(cx, move |config| config.tab_bar_visibility = visibility);
     }
 
     /// Saves what a terminal does when a dev server starts and gives it to every

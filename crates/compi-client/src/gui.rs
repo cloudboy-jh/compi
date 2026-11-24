@@ -1004,6 +1004,8 @@ struct CompiApp {
     drag_position: Option<Point<Pixels>>,
     /// The tab strip's chips as this frame lays them out; see `workspace::tab_groups`.
     tab_strip: workspace::tab_groups::TabStrip,
+    /// Whether the pointer is over the titlebar's hover-reveal region.
+    tab_bar_hovered: bool,
     titlebar_drag: bool,
     workspace: Option<WorkspaceSnapshot>,
     state_slot: Option<Arc<Mutex<StateSlot>>>,
