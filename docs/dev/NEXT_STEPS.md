@@ -4,17 +4,18 @@ Open work only. Product scope and order live in the vault's `feat and bugs.md`; 
 
 Latest public release: [0.9.4](https://github.com/cloudboy-jh/compi/releases/tag/v0.9.4), daemon protocol 44, workspace format 11.
 
+## Next
+
+- **Pi native chat** is likely next. Add its RPC driver through the [agent recipe](ADDING_AN_AGENT.md), check it on Windows and WSL, and only show controls its driver supports.
+
 ## Release follow-through
 
 - Flaky Windows/Linux daemon tests seen on Core CI: `closing_a_chat_pane_ends_its_terminal_like_any_other` and `lost_shell_restarts_in_its_last_reported_directory` (its 10 s save wait).
 - Not seen natively: the macOS app, the Agents card's **Installed …** line off Windows.
 - Not run yet: Claude Code's and Codex's browser sign-ins and sign-outs from the chat, and the expired-sign-in card live.
-- Run the in-app upgrade from 0.9.1 on the daily Windows install when convenient; protocol 42 → 43 restarts the local daemon, ending open shells and chats.
+- Recheck the 0.8.1 and 0.8.2 fixes on an installed Windows build: PowerShell → WSL routing, chat code colours, sub-agents, question cards, `compi` in agent shells, one-line tool cards, File text size, Background service, the WSL chat note and `compi screenshot`.
 - Not seen natively: the macOS app, providers and project dragging on macOS.
-- Run the in-app upgrade from 0.9.0 on the daily Windows install when convenient; protocol 41 → 42 restarts the local daemon, ending open shells and chats.
 - Not seen natively: the macOS app, sidebar dragging on macOS.
-- Check an actual in-app upgrade from installed Windows 0.8.2 on an isolated machine. Protocol 40 → 41 and workspace format 10 → 11 require restarting the local daemon, which ends open shells and chats. Leave the daily install alone.
-- Try the physical Ctrl/Cmd+T chord in both new-tab modes. Check the project picker on a native Mac and clone a private repo over SSH; the Windows dev check used public HTTPS.
 
 ## 0.7.4: not seen yet
 
@@ -28,12 +29,13 @@ Latest public release: [0.9.4](https://github.com/cloudboy-jh/compi/releases/tag
 ## 0.8.0: checks left
 
 - Added/removed markers in chat diffs; a finished sub-agent no longer looking busy.
-- macOS browser views and icon rendering: the only known Mac, `bruisedpear`, was offline on 2026-11-11, with no Mac SSH host configured. Native checks could not run. Physical Ctrl/Cmd-click on a local link and the view-toggle chord while the web page has the keyboard also remain unobserved.
+- macOS browser views and icon rendering remain unchecked. Physical Ctrl/Cmd-click on a local link and the view-toggle chord while the web page has the keyboard also remain unobserved.
 
 ## Planned, later
 
-- **Pi native chat** is the next agent, after v0.9.0. Add its RPC driver through the [agent recipe](ADDING_AN_AGENT.md), check it on Windows and WSL, and only show controls its driver supports.
-- **Chat → OMP's TUI in the same pane** (asked 2026-11-10). Today Ctrl/Cmd+Shift+E shows the plain shell under the chat. The ⋯ menu gets **Open in terminal**: the daemon stops the chat's `omp acp` (two OMP processes must not write one session file), the pane shows its shell, and Compi types `omp --resume <session>` there, in the session's saved folder. Going back loads the session again with `session/load`, turns made in the TUI included (OMP shares sessions between ACP and its TUI both ways). Open: a shell already running a program (ask, or open a new tab as **Jump to project** does), PowerShell panes (`omp.exe`), noticing the TUI's exit to offer the chat again.
+- **Remote:** attach to another machine's sessions over Tailscale when wanted; no cloud component or phone app.
+- **More Windows shells:** PowerShell 7 and cmd.
+
 - **Updates that keep shells.** Release metadata qualifies only the release's own daemon (`qualified_daemons = [version]` in the smoke scripts), so every update restarts the daemon, even with the protocol unchanged. Qualify the previous daemon when protocol and workspace format did not change.
 - **Updater upkeep.** A repair from Settings → Apps after Setup removed its run folder is untested. Root `Compi-Setup.exe` still changes only through Setup. Setup and the in-app updater keep two journals and two scheduled-task guards. The 0.1.x–0.3.0 migration paths and `INSTALLER_UPDATES_PLAN.md` (a 0.1.3-era plan) are out of date. macOS activation has never run natively.
 
@@ -48,7 +50,7 @@ Latest public release: [0.9.4](https://github.com/cloudboy-jh/compi/releases/tag
 ## CI and release
 
 - **Windows portable smoke is flaky.** 0.7.1 and 0.7.3 both failed it on the first attempt and passed on a rerun; 0.7.3's failed job then hung for 25 minutes in "Remove imported publisher certificate" and kept no logs. Make the step keep its diagnostics and time out instead of hanging.
-- **Installed in-app update check** builds and installs since `0519b8e`, then times out on "test GUI attached to the original running shell" (dry run [42879581522](https://github.com/cloudboy-jh/compi/actions/runs/42879581522)), before any update. Next: evidence on timeout (`COMPI_PERF_LOG`, client startup log, screenshot), and a `workflow_dispatch` that reruns only `smoke-windows-installed-update.ps1`.
+- **Installed in-app update check** timed out on "test GUI attached to the original running shell" in an earlier [dry run](https://github.com/cloudboy-jh/compi/actions/runs/42879581522), before any update. The 0.9.4 release's installed Setup migration and in-app update check passed. Investigate if the timeout recurs: collect `COMPI_PERF_LOG`, the client startup log and a screenshot; add a `workflow_dispatch` that reruns only `smoke-windows-installed-update.ps1`.
 - **Daemon handle-count test** (`repeated_surface_cycles_release_daemon_process_handles`) fails on some Windows runs, about +15 handles each time (225→241). Find the leak before changing the limit.
 - The protocol is still pinned by hand in five release scripts (listed in the [release flow](RELEASE-FLOW.md)); a missed bump previously cost 0.5.0 a rebuild.
 
