@@ -1,44 +1,18 @@
 # Compi next steps
 
-Open work only. Product scope and order live in the vault's `feat and bugs.md`; shipped work and its checks are in [Completed work](COMPLETED.md) (the 0.7.3 updater and the 0.7.4 build notes are under [0.7.3 updater and 0.7.4 work](COMPLETED.md#073-updater-and-074-work-moved-from-next-steps-2026-11-10)). Release steps: [Release flow](RELEASE-FLOW.md).
+Open work only. Product scope and order live in the vault's `feat and bugs.md`; shipped work and its checks are in [Completed work](COMPLETED.md) and [release notes](../user/release-notes.md). Release steps: [Release flow](RELEASE-FLOW.md).
 
-## Release state
+Latest public release: [0.9.4](https://github.com/cloudboy-jh/compi/releases/tag/v0.9.4), daemon protocol 44, workspace format 11.
 
-- [**0.9.4**](https://github.com/cloudboy-jh/compi/releases/tag/v0.9.4) is the latest public release (2026-11-23 19:01 UTC, tag at `889e2b5`, [release run](https://github.com/cloudboy-jh/compi/actions/runs/45239861636)). One install per agent with the Ubuntu | Windows switch, thread renames that stick, sidebar pane counts with a hover list, the narrow message box fix. Daemon protocol 44, workspace format 11. Both native jobs passed, the Windows installed Setup migration and in-app update check included; 12 downloads, signed update metadata for Windows and macOS with version 0.9.4, protocol 44 and the 0.9.4 notes, the Windows update package hash matching `SHA256SUMS.txt`. The installed 0.9.3 CLI's `compi update --check` reports 0.9.4 with its headline. Before tagging: Windows `cargo test --workspace` and clippy `-D warnings`. Core CI on the tag and on `main` each lost one macOS job to "not acquired by Runner"; every job that ran passed.
-- [**0.9.3**](https://github.com/cloudboy-jh/compi/releases/tag/v0.9.3) was published 2026-11-23 06:25 UTC (tag at `6f5e8f0`, [release run](https://github.com/cloudboy-jh/compi/actions/runs/45118175702)). Fixes 0.9.2's model picker. Daemon protocol 43, workspace format 11. Core CI on the tag failed once on Windows (`closing_a_chat_pane_ends_its_terminal_like_any_other`); the same commit passed on `main`.
-- [**0.9.2**](https://github.com/cloudboy-jh/compi/releases/tag/v0.9.2) was published (2026-11-23 02:05 UTC, tag at `80ce2ea`, [release run](https://github.com/cloudboy-jh/compi/actions/runs/45096824353), [Core CI](https://github.com/cloudboy-jh/compi/actions/runs/45096821732)). Daemon protocol 43, workspace format 11. Both native jobs passed, the Windows installed Setup migration and in-app update check included. Verified all 12 downloads; signed update metadata for Windows and macOS and Setup metadata with version 0.9.2, protocol 43 and the 0.9.2 notes; the Windows update package hash matches `SHA256SUMS.txt`. The installed 0.9.1 CLI's `compi update --check` reports 0.9.2 with its headline. Before tagging: Windows `cargo test --workspace` and clippy `-D warnings`, Linux daemon and protocol tests.
-- [**0.9.1**](https://github.com/cloudboy-jh/compi/releases/tag/v0.9.1) was published 2026-11-22 19:57 UTC (tag at `da61ba0`, [release run](https://github.com/cloudboy-jh/compi/actions/runs/45050713719)). Daemon protocol 42, workspace format 11.
-- [**0.9.0**](https://github.com/cloudboy-jh/compi/releases/tag/v0.9.0) was published 2026-11-21 23:04 UTC (tag at `cd2b7e8`, [release run](https://github.com/cloudboy-jh/compi/actions/runs/44958925248)). Daemon protocol 41, workspace format 11. The daily Windows install is on 0.9.0.
-- [**0.8.2**](https://github.com/cloudboy-jh/compi/releases/tag/v0.8.2) was published 2026-11-19 (`382509d`, [release run](https://github.com/cloudboy-jh/compi/actions/runs/44435599983)). Daemon protocol 40, workspace format 10. Windows installs on 0.8.0 or 0.8.1 should use Setup because their in-app updater can hang.
-- **0.8.1**: published 2026-11-11 21:20 UTC, tagged `v0.8.1` at `d5fb6e3`, release run [43099782821](https://github.com/cloudboy-jh/compi/actions/runs/43099782821), 12 assets. Its in-app update from 0.8.0 rolled back on the working instance (the window hang, fixed in 0.8.2); Setup installed it.
-- **0.8.0**: published 2026-11-11 16:10 UTC, tagged `v0.8.0` at `7c12262`, release run [43053398818](https://github.com/cloudboy-jh/compi/actions/runs/43053398818), 12 assets.
-
-## v0.9.4 follow-through
-
-This release runs new chats on one install of each agent (WSL first on Windows, with an **Ubuntu | Windows** switch in Settings → Agents), makes thread renames stick everywhere (`RenameThread`), counts a tab's panes on its sidebar card with a hover list, and keeps the narrow message box's Send visible. Protocol 43 → 44. See [Completed work](COMPLETED.md#one-install-per-agent-and-thread-names-v094).
+## Release follow-through
 
 - Flaky Windows/Linux daemon tests seen on Core CI: `closing_a_chat_pane_ends_its_terminal_like_any_other` and `lost_shell_restarts_in_its_last_reported_directory` (its 10 s save wait).
 - Not seen natively: the macOS app, the Agents card's **Installed …** line off Windows.
-
-## v0.9.2 follow-through
-
-This release adds providers, sign-in and sign-out from the chat for all four agents (`/providers`, `/login`, `/logout`), `/update` and Settings → Agents updates, dragged project order with Home pinned by default, the linked-WSL new-tab fix, the model picker lined up with the message box, and a new thread's box growing with its pane. Protocol 42 → 43. See [Completed work](COMPLETED.md#providers-and-agent-updates-v092).
-
 - Not run yet: Claude Code's and Codex's browser sign-ins and sign-outs from the chat, and the expired-sign-in card live.
 - Run the in-app upgrade from 0.9.1 on the daily Windows install when convenient; protocol 42 → 43 restarts the local daemon, ending open shells and chats.
 - Not seen natively: the macOS app, providers and project dragging on macOS.
-
-## v0.9.1 follow-through
-
-This release adds tabs finding their project (WSL and linked folders included), Home in place of Loose tabs, sidebar card dragging (`SetTabProject`, protocol 42), new tabs and threads in the selected tab's project with a draft's project switch, one-line indented sidebar cards, and the theme grid's own scroll. See [Completed work](COMPLETED.md#chat-first-v090).
-
 - Run the in-app upgrade from 0.9.0 on the daily Windows install when convenient; protocol 41 → 42 restarts the local daemon, ending open shells and chats.
 - Not seen natively: the macOS app, sidebar dragging on macOS.
-
-## v0.9.0 follow-through
-
-This release includes chat-first setup and new tabs, four native agents (OMP, Claude Code, Codex, OpenCode), faster first tabs with WSL already running, reorganized Settings, and one saved project list shared by the sidebar and Settings. See [Completed work](COMPLETED.md#chat-first-v090) and [T3 Code research](../research/t3-code/README.md). Pi is next, not part of v0.9.0.
-
 - Check an actual in-app upgrade from installed Windows 0.8.2 on an isolated machine. Protocol 40 → 41 and workspace format 10 → 11 require restarting the local daemon, which ends open shells and chats. Leave the daily install alone.
 - Try the physical Ctrl/Cmd+T chord in both new-tab modes. Check the project picker on a native Mac and clone a private repo over SSH; the Windows dev check used public HTTPS.
 
@@ -53,16 +27,8 @@ This release includes chat-first setup and new tabs, four native agents (OMP, Cl
 
 ## 0.8.0: checks left
 
-Commands from the other shell, dev-server cards and in-place browsing, Catppuccin language icons, clickable sub-agent task/step lists, completion recovery and ending-card corrections shipped in 0.8.0. Details and observed checks: [Completed work](COMPLETED.md).
-
-Smoke test 2026-11-11 (installed 0.8.0, OMP chat in WSL, `compi-landingpage` repo):
-
-- **Passed:** the Open card on a `python3 -m http.server` pane opened the page in place, Toggle view returned to the terminal and the server kept serving. In WSL Bash, PowerShell commands ran in PowerShell, `$compiDemo` survived between commands and `Set-Location C:\Windows` moved the Bash prompt to `/mnt/c/Windows`.
-- **Failed:** PowerShell → WSL routing, chat code colours, finding a sub-agent to open (see Fixed after 0.8.0).
-- **Not confirmed:** added/removed markers in chat diffs; a finished sub-agent no longer looking busy.
-
+- Added/removed markers in chat diffs; a finished sub-agent no longer looking busy.
 - macOS browser views and icon rendering: the only known Mac, `bruisedpear`, was offline on 2026-11-11, with no Mac SSH host configured. Native checks could not run. Physical Ctrl/Cmd-click on a local link and the view-toggle chord while the web page has the keyboard also remain unobserved.
-- Alternative line editors are not intercepted; custom executable/argument profiles keep their existing behavior. The other-shell setting applies to new shells. Tab completion stays with the current shell.
 
 ## Planned, later
 
@@ -84,8 +50,7 @@ Smoke test 2026-11-11 (installed 0.8.0, OMP chat in WSL, `compi-landingpage` rep
 - **Windows portable smoke is flaky.** 0.7.1 and 0.7.3 both failed it on the first attempt and passed on a rerun; 0.7.3's failed job then hung for 25 minutes in "Remove imported publisher certificate" and kept no logs. Make the step keep its diagnostics and time out instead of hanging.
 - **Installed in-app update check** builds and installs since `0519b8e`, then times out on "test GUI attached to the original running shell" (dry run [42879581522](https://github.com/cloudboy-jh/compi/actions/runs/42879581522)), before any update. Next: evidence on timeout (`COMPI_PERF_LOG`, client startup log, screenshot), and a `workflow_dispatch` that reruns only `smoke-windows-installed-update.ps1`.
 - **Daemon handle-count test** (`repeated_surface_cycles_release_daemon_process_handles`) fails on some Windows runs, about +15 handles each time (225→241). Find the leak before changing the limit.
-- **Cargo 1.100 build layout** (fixed 2026-11-18, `cc8ada5`): stable Rust 1.100 moved test executables out of `target/<profile>/deps` into a folder per build unit, so the ConPTY test no longer found `OpenConsole.exe` and Core CI failed on Windows from 2026-11-14. `compi-daemon/build.rs` now finds the profile folder in both layouts, and the test copies the runtime beside itself. Run 44408665049 passed every Windows step. Under full-suite load on the OneDrive checkout, `lost_shell_restarts_in_its_last_reported_directory` once hit its 10 s save deadline; it passes alone.
-- The protocol is still pinned by hand in five release scripts (listed in the [release flow](RELEASE-FLOW.md)). All five currently match 41; a missed bump previously cost 0.5.0 a rebuild.
+- The protocol is still pinned by hand in five release scripts (listed in the [release flow](RELEASE-FLOW.md)); a missed bump previously cost 0.5.0 a rebuild.
 
 ## Not yet checked
 
