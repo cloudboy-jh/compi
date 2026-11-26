@@ -4,7 +4,7 @@
 //! (written beside it first, then renamed over it). Saves go to a writer thread, the
 //! latest per chat winning, so no chat waits on the disk. What the threads list shows of
 //! each is read from the folder once, then kept current as threads are saved.
-use compi_protocol::chat::{ChatContent, ChatEntry};
+use compi_protocol::chat::{ChatChoice, ChatContent, ChatEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -26,6 +26,8 @@ pub(super) struct ThreadRecord {
     pub chat: ChatContent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ChatChoice>,
     /// The user named it: the agent's own titles no longer replace `title`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub named: bool,
@@ -47,6 +49,7 @@ impl ThreadRecord {
             format: FORMAT,
             chat,
             title,
+            model: None,
             named: false,
             created_ms,
             updated_ms,
@@ -61,6 +64,7 @@ pub(super) struct ThreadSummary {
     pub chat: ChatContent,
     /// The session's title, else its first prompt's first line.
     pub title: Option<String>,
+    pub model: Option<ChatChoice>,
     pub created_ms: u64,
     pub updated_ms: u64,
 }
@@ -70,6 +74,7 @@ impl ThreadSummary {
         Self {
             chat: record.chat.clone(),
             title: thread_title(record.title.as_deref(), &record.entries),
+            model: record.model.clone(),
             created_ms: record.created_ms,
             updated_ms: record.updated_ms,
         }

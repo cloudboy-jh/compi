@@ -1064,6 +1064,9 @@ pub struct ThreadInfo {
     /// The session's title, else its first prompt's first line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The selected model, when the harness has reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ChatChoice>,
     pub created_ms: u64,
     /// When its transcript last changed.
     pub updated_ms: u64,

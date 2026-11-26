@@ -7,10 +7,10 @@
 use super::*;
 use crate::chat::{age_label, now_ms, thread_title};
 use crate::gui::controls::{IconName, MenuEntry, menu_item};
-use compi_protocol::chat::{ChatContent, ChatHarness, ThreadInfo};
+use compi_protocol::chat::{ChatChoice, ChatContent, ChatHarness, ThreadInfo};
 use compi_protocol::program_status::ProgramState;
 use compi_protocol::{MutationReceipt, PaneContent, Project, TabPlacement, WorkspaceSession};
-use gpui::{Entity, img};
+use gpui::{Entity, img, svg};
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputEvent, InputState};
 use std::collections::HashMap;
@@ -125,6 +125,8 @@ struct SidebarCard {
     project: Project,
     /// The agent of the chat in it, rather than a terminal.
     chat: Option<ChatHarness>,
+    /// The selected model, for a single chat pane.
+    model: Option<ChatChoice>,
     /// Its chat is a draft: nothing sent yet, so no thread is kept.
     draft: bool,
     /// What its programs most need the user for; nothing while idle.
@@ -542,6 +544,9 @@ impl CompiApp {
             .map(|headline| headline.state)
             .filter(|state| *state != ProgramState::Idle);
         let panes = self.tab_pane_lines(tab);
+        let model = (panes.len() == 1)
+            .then(|| chat.and_then(|chat| self.sidebar_chat_model(&chat.id)))
+            .flatten();
         SidebarCard {
             tab: tab.id.clone(),
             session: session.clone(),
@@ -549,6 +554,7 @@ impl CompiApp {
             folder,
             project,
             chat: chat.map(|chat| chat.harness),
+            model,
             draft,
             state,
             changed_ms: self
@@ -560,6 +566,17 @@ impl CompiApp {
             count: pane_count(&panes.iter().map(|(kind, _)| *kind).collect::<Vec<_>>()),
             panes: panes.into_iter().map(|(_, line)| line).collect(),
         }
+    }
+
+    /// Prefer the live choice while this window watches the chat, then the daemon's list.
+    fn sidebar_chat_model(&self, chat: &str) -> Option<ChatChoice> {
+        self.watched_chat_model(chat).or_else(|| {
+            self.sidebar
+                .threads
+                .iter()
+                .find(|thread| thread.chat.id == chat)
+                .and_then(|thread| thread.model.clone())
+        })
     }
 
     /// Each of the tab's panes, in layout order: its kind, and a line naming it and what
@@ -579,10 +596,12 @@ impl CompiApp {
                         let title = self
                             .thread_name(&chat.id)
                             .unwrap_or_else(|| "New thread".to_owned());
-                        (
-                            PaneKind::Thread,
-                            format!("{} · {title}", chat.harness.name()),
-                        )
+                        let mut line = format!("{} · {title}", chat.harness.name());
+                        if let Some(model) = self.sidebar_chat_model(&chat.id) {
+                            line.push_str(" · ");
+                            line.push_str(&model.name);
+                        }
+                        (PaneKind::Thread, line)
                     }
                     Some(content) => {
                         let label = content.label();
@@ -2092,21 +2111,54 @@ impl CompiApp {
             )
             .child(
                 div()
-                    .id(("sidebar-card-title", index))
                     .flex_1()
                     .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_size(px(UI_SMALL_TEXT_SIZE))
-                    .child(card.title.clone())
-                    // A double click on the title renames the tab.
-                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        if event.click_count() >= 2 {
-                            this.rename_tab(&rename);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id(("sidebar-card-title", index))
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(UI_SMALL_TEXT_SIZE))
+                            .child(card.title.clone())
+                            // A double click on the title renames the tab.
+                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                if event.click_count() >= 2 {
+                                    this.rename_tab(&rename);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .children(card.model.as_ref().map(|model| {
+                        let provider = model.group.as_deref().or_else(|| {
+                            model.value.split_once('/').map(|(provider, _)| provider)
+                        });
+                        let mark = crate::gui::model_icons::for_model(&model.value, &model.name)
+                            .or_else(|| match provider {
+                                Some(provider) => crate::gui::model_icons::for_provider(provider),
+                                None => card.chat.filter(|harness| harness.entry().own_models)
+                                    .and_then(crate::gui::model_icons::for_harness),
+                            });
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .min_w_0()
+                            .text_size(px(UI_MICRO_TEXT_SIZE))
+                            .text_color(muted)
+                            .children(mark.map(|path| svg().path(path).flex_none().size(px(11.0))))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(model.name.clone()),
+                            )
                     })),
             )
             .children(card.count.clone().map(|count| {
@@ -2170,6 +2222,7 @@ mod tests {
             folder: None,
             project: project.clone(),
             chat: None,
+            model: None,
             draft: false,
             state: None,
             changed_ms: None,

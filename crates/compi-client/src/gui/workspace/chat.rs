@@ -905,6 +905,27 @@ impl CompiApp {
         Some(self.chat.chats.get(&chat.id)?.draft(chat))
     }
 
+    /// The model last reported by this window's watcher, including unlisted choices.
+    pub(super) fn watched_chat_model(&self, chat: &str) -> Option<compi_protocol::chat::ChatChoice> {
+        let option = self.chat.chats.get(chat)?.state.as_ref()?.option("model")?;
+        if option.current.is_empty() {
+            return None;
+        }
+        Some(
+            option
+                .choices
+                .iter()
+                .find(|choice| choice.value == option.current)
+                .cloned()
+                .unwrap_or_else(|| compi_protocol::chat::ChatChoice {
+                    value: option.current.clone(),
+                    name: option.current.clone(),
+                    description: None,
+                    group: None,
+                }),
+        )
+    }
+
     /// The client state of the chat `pane_id` holds, shown or not.
     fn pane_chat(&self, pane_id: &PaneId) -> Option<&ChatModel> {
         self.chat.chats.get(&self.pane_chat_content(pane_id)?.id)

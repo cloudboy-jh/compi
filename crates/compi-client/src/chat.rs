@@ -152,6 +152,7 @@ mod tests {
                 None,
             ),
             title: Some("  ".into()),
+            model: None,
             created_ms: 0,
             updated_ms: 0,
             activity: ThreadActivity::Idle,

@@ -77,6 +77,7 @@ mod tests {
         let threads = [ThreadInfo {
             chat,
             title: Some("Fix the build".into()),
+            model: None,
             created_ms: 0,
             updated_ms: now - 3 * 3_600_000,
             activity: ThreadActivity::Idle,

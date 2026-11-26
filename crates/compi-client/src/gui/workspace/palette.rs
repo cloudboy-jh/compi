@@ -1526,6 +1526,7 @@ mod tests {
         ThreadInfo {
             chat,
             title: title.map(str::to_owned),
+            model: None,
             created_ms: 0,
             updated_ms,
             activity,

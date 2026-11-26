@@ -14,7 +14,7 @@
 //! and the transcript Compi saved stands in for the harness's replay.
 use crate::program_status::ChatStatusHub;
 use compi_protocol::chat::{
-    ChatAgent, ChatAgentsFinished, ChatAnswers, ChatApproval, ChatChange, ChatContent,
+    ChatAgent, ChatAgentsFinished, ChatAnswers, ChatApproval, ChatChange, ChatChoice, ChatContent,
     ChatDelivery, ChatEntry, ChatEvent, ChatHarness, ChatImage, ChatLogin, ChatLoginStep,
     ChatPicks, ChatQueued, ChatSessionInfo, ChatState, ChatStatus, ChatTool, ChatToolStatus,
     MAX_CHAT_ATTACHMENTS, MAX_CHAT_IMAGE_BYTES, MAX_CHAT_IMAGES, MAX_CHAT_PROMPT_BYTES,
@@ -391,6 +391,7 @@ impl ChatHub {
                     stored.chat.session = inner.state.session.clone();
                     stored.title =
                         threads::thread_title(inner.state.title.as_deref(), &inner.state.entries);
+                    stored.model.clone_from(&inner.model);
                     if let Some(times) = inner.thread {
                         stored.updated_ms = times.updated_ms;
                     }
@@ -404,6 +405,7 @@ impl ChatHub {
                     open: held.contains_key(&id),
                     chat: stored.chat,
                     title: stored.title,
+                    model: stored.model,
                     created_ms: stored.created_ms,
                     updated_ms: stored.updated_ms,
                     activity,
@@ -840,6 +842,8 @@ struct Inner {
     /// The chat's thread, once it has one: when it began and when its transcript last
     /// changed.
     thread: Option<ThreadTimes>,
+    /// Last selected model, including the saved selection while a session starts.
+    model: Option<ChatChoice>,
     /// The thread changed since it was last saved.
     save_due: bool,
     /// The transcript is Compi's own, so the session's replay while it loads is left out.
@@ -1726,6 +1730,7 @@ impl Inner {
         self.state.entries = entries;
         self.state.title = thread.title;
         self.named = thread.named;
+        self.model = thread.model;
         if thread.chat.session.is_some() {
             self.state.session = thread.chat.session;
         }
@@ -1779,6 +1784,7 @@ impl Inner {
             self.state.entries.clone(),
         );
         record.named = self.named;
+        record.model.clone_from(&self.model);
         Some(record)
     }
 
@@ -1832,9 +1838,37 @@ impl Inner {
             } => self.providers_due = true,
             _ => {}
         }
+        let options_changed = matches!(&event, ChatEvent::Options { .. } | ChatEvent::Reset { .. });
         self.watchers
             .retain(|watcher| watcher.send(event.clone()).is_ok());
         self.state.apply(event);
+        if options_changed {
+            let model = self
+                .state
+                .option("model")
+                .and_then(|option| {
+                    if option.current.is_empty() {
+                        return None;
+                    }
+                    Some(
+                        option
+                            .choices
+                            .iter()
+                            .find(|choice| choice.value == option.current)
+                            .cloned()
+                            .unwrap_or_else(|| ChatChoice {
+                                value: option.current.clone(),
+                                name: option.current.clone(),
+                                description: None,
+                                group: None,
+                            }),
+                    )
+                });
+            if self.model != model {
+                self.model = model;
+                self.save_thread(false);
+            }
+        }
     }
 
     /// What the chat's program status shows (state, blocked kind, message): what waits
@@ -3810,7 +3844,7 @@ mod tests {
         let folder = std::env::temp_dir().join(format!("compi-threads-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&folder);
         let store = Arc::new(ThreadStore::at(folder.clone()));
-        let record = ThreadRecord::new(
+        let mut record = ThreadRecord::new(
             thread_chat("chat-1"),
             None,
             10,
@@ -3828,6 +3862,15 @@ mod tests {
                 },
             ],
         );
+        record.model = Some(ChatChoice {
+            value: "provider/model".into(),
+            name: "Model".into(),
+            description: None,
+            group: Some("Provider".into()),
+        });
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("model");
+        assert_eq!(serde_json::from_value::<ThreadRecord>(legacy).unwrap().model, None);
         store.save(record.clone());
         store.flush();
         assert!(folder.join("chat-1.json").is_file());
@@ -3840,13 +3883,16 @@ mod tests {
         assert_eq!(listed[0].title.as_deref(), Some("Fix the build"));
         assert_eq!((listed[0].created_ms, listed[0].updated_ms), (10, 20));
         assert_eq!(listed[0].chat.session.as_deref(), Some("s1"));
+        assert_eq!(listed[0].model, record.model);
 
         // The latest save wins, and the index follows it before the disk does.
         let mut renamed = record.clone();
         renamed.title = Some("Build fix".into());
         renamed.updated_ms = 30;
+        renamed.model = None;
         reopened.save(renamed.clone());
         assert_eq!(reopened.list()[0].title.as_deref(), Some("Build fix"));
+        assert_eq!(reopened.list()[0].model, None);
         reopened.flush();
         assert_eq!(
             ThreadStore::at(folder.clone()).load("chat-1"),
@@ -3861,6 +3907,31 @@ mod tests {
         // A name that is not a chat ID never becomes a path.
         assert_eq!(reopened.load("../chat-1"), None);
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn selected_model_changes_are_saved_without_changing_transcript_time() {
+        let chat = thread_chat("chat-model");
+        let mut inner = Inner::default();
+        inner.seed(ThreadRecord::new(chat.clone(), None, 10, 20, Vec::new()));
+        inner.options(&config_options("sonnet", "low"));
+        let first = inner.thread_to_save(&chat).unwrap();
+        assert_eq!(first.model.as_ref().unwrap().name, "Claude Sonnet 5");
+        assert_eq!(first.updated_ms, 20);
+
+        inner.options(&config_options("opus", "high"));
+        let second = inner.thread_to_save(&chat).unwrap();
+        assert_eq!(second.model.as_ref().unwrap().value, "opus");
+        assert_eq!(second.updated_ms, 20);
+        let mut resumed = Inner::default();
+        resumed.seed(second);
+        assert_eq!(resumed.model, inner.model);
+
+        inner.options(&config_options("unknown", "high"));
+        assert_eq!(
+            inner.thread_to_save(&chat).unwrap().model.unwrap().name,
+            "unknown"
+        );
     }
 
     #[test]
