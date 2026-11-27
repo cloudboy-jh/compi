@@ -16,6 +16,7 @@ Latest public release: [0.9.4](https://github.com/cloudboy-jh/compi/releases/tag
 - Recheck the 0.8.1 and 0.8.2 fixes on an installed Windows build: PowerShell → WSL routing, chat code colours, sub-agents, question cards, `compi` in agent shells, one-line tool cards, File text size, Background service, the WSL chat note and `compi screenshot`.
 - Not seen natively: the macOS app, providers and project dragging on macOS.
 - Not seen natively: the macOS app, sidebar dragging on macOS.
+- 0.9.5, not seen yet: the `/login` and `/logout` provider lists in a live chat; the return arrow on Windows; returning from Changes and Browser picks (Files, Terminal and Monitor were checked through a hook on macOS).
 
 ## 0.7.4: not seen yet
 

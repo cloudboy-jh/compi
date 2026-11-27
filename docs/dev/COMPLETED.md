@@ -2,7 +2,7 @@
 
 This is an implementation history with dated verification evidence, not a claim of current cross-platform qualification. The latest recorded Windows handoff is summarized first; unfinished work is tracked in [Next steps](NEXT_STEPS.md).
 
-## After 0.9.4 (unreleased)
+## Provider lists and a way back from Open here (v0.9.5)
 
 - **A new thread's message box shows its cursor** (2026-11-27, no protocol change). A draft's composer is made in the frame that shows it (`prepare_chats`), and `reconcile_keyboard_focus` focused it in that same frame; GPUI activates a new focus listener only after the frame, so the field never heard it had focus, its blink never started, and the cursor stayed hidden until the window was deactivated and activated again (a click did not help: the field was already focused). The reconcile now focuses after the frame (`Window::defer`). macOS `cargo dev`, `compi chat` on a new tab, composer's `InputEvent::Focus` logged: none before, one after.
 
