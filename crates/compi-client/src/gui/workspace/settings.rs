@@ -7447,6 +7447,7 @@ mod tests {
             ungrouped,
             [
                 "new-tab",
+                "tab-bar-visibility",
                 "chat-agent",
                 "shell",
                 "confirm-close",
