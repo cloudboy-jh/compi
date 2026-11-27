@@ -3554,6 +3554,7 @@ impl CompiApp {
                     cx.notify();
                 }),
             )
+            .children(self.render_draft_return(&pane_id, false, cx))
             .when(
                 self.file_tree
                     .as_ref()

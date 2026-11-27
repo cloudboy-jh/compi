@@ -22,6 +22,9 @@ const UNDO_LIFETIME: Duration = Duration::from_secs(5);
 const DRAFT_SHARE: f32 = 0.6;
 const DRAFT_MIN_WIDTH: f32 = 544.0;
 const DRAFT_MAX_WIDTH: f32 = 760.0;
+/// The corner of a terminal whose hover shows its arrow back to a new thread.
+const RETURN_CORNER_WIDTH: f32 = 72.0;
+const RETURN_CORNER_HEIGHT: f32 = 48.0;
 
 /// The draft column's width in a pane `area` wide (less its padding).
 fn draft_width(area: Pixels, least: Pixels, most: Pixels) -> Pixels {
@@ -99,6 +102,32 @@ enum DraftPlace {
     View { pane: PaneId },
     /// A tab of its own in workspace `session`.
     Tab { session: SessionId },
+}
+
+/// What a pane an "Open here" pick filled shows: a terminal's shell, or content of one
+/// kind (Files, a browser, Monitor). The arrow back stays while the pane shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Opened {
+    Shell,
+    Content(std::mem::Discriminant<PaneContent>),
+}
+
+impl Opened {
+    /// What `leaf` shows now; `None` for a split.
+    fn of(leaf: &LayoutNode) -> Option<Self> {
+        match leaf.shown_content() {
+            Some(content) => Some(Self::Content(std::mem::discriminant(content))),
+            None => leaf.surface_id().map(|_| Self::Shell),
+        }
+    }
+}
+
+/// A pane an "Open here" pick filled: the draft it replaced, whose folder and agent the
+/// arrow back starts a new thread with, and what the pick showed.
+#[derive(Clone, Debug)]
+pub(super) struct DraftReturn {
+    draft: ChatContent,
+    opened: Opened,
 }
 
 /// A draft with typed text that a close threw away.
@@ -411,7 +440,8 @@ impl CompiApp {
 
     /// Puts `choice` in the place of draft `chat`, in its folder; the draft goes. A draft
     /// in a pane of its own is replaced in place; one a terminal shows as its view gives
-    /// way to the terminal's shell, or becomes the terminal's view of `choice`.
+    /// way to the terminal's shell, or becomes the terminal's view of `choice`. The pane
+    /// keeps an arrow back to a new thread (`return_to_draft`).
     pub(super) fn open_instead(
         &mut self,
         chat: &str,
@@ -422,6 +452,7 @@ impl CompiApp {
         let Some((pane_id, content, view)) = self.draft_place(chat) else {
             return;
         };
+        let draft = content.clone();
         let ChatContent {
             environment,
             folder,
@@ -429,7 +460,13 @@ impl CompiApp {
         } = content;
         let replacement = match choice {
             OpenInstead::Terminal if view => {
-                self.mutate(WorkspaceMutation::CloseView { pane_id }, false);
+                self.mutate(
+                    WorkspaceMutation::CloseView {
+                        pane_id: pane_id.clone(),
+                    },
+                    false,
+                );
+                self.note_draft_return(pane_id, view, None, draft, Opened::Shell);
                 return;
             }
             OpenInstead::Terminal => {
@@ -437,9 +474,9 @@ impl CompiApp {
                     ContentEnvironment::Wsl { distribution } => Some(distribution),
                     ContentEnvironment::Host => None,
                 };
-                self.mutate_in(
+                let mutation = self.mutate_in(
                     WorkspaceMutation::ReplacePane {
-                        pane_id,
+                        pane_id: pane_id.clone(),
                         with: PaneReplacement::Terminal {
                             cols: self.terminal_cols,
                             rows: self.terminal_rows,
@@ -449,10 +486,11 @@ impl CompiApp {
                     true,
                     distribution,
                 );
+                self.note_draft_return(pane_id, view, mutation, draft, Opened::Shell);
                 return;
             }
             OpenInstead::Changes => {
-                self.open_changes_instead(pane_id, view, environment, folder, window, cx);
+                self.open_changes_instead(pane_id, view, draft, window, cx);
                 return;
             }
             OpenInstead::Files => PaneContent::Files(FolderContent {
@@ -466,22 +504,22 @@ impl CompiApp {
             }),
             OpenInstead::Monitor => PaneContent::Monitor(MonitorContent::default()),
         };
-        self.put_in_draft_place(&pane_id, view, replacement, window, cx);
+        self.open_pick(pane_id, view, replacement, draft, window, cx);
     }
 
-    /// Changes in the draft's place: Files at the repository holding `folder`, its
+    /// Changes in the place of `draft`: Files at the repository holding its folder, its
     /// sidebar on the Changes list, once the listing is read.
     fn open_changes_instead(
         &mut self,
         pane_id: PaneId,
         view: bool,
-        environment: ContentEnvironment,
-        folder: String,
+        draft: ChatContent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let target = self.target.clone();
         cx.spawn_in(window, async move |this, cx| {
+            let (environment, folder) = (draft.environment.clone(), draft.folder.clone());
             let read = {
                 let (environment, folder) = (environment.clone(), folder.clone());
                 cx.background_executor()
@@ -503,7 +541,7 @@ impl CompiApp {
                             active: None,
                         });
                         this.content.changes_seed = Some((environment, listing));
-                        this.put_in_draft_place(&pane_id, view, content, window, cx);
+                        this.open_pick(pane_id, view, content, draft, window, cx);
                     }
                     Ok(None) => this.global_error = Some(format!("Not a Git repository: {folder}")),
                     Err(error) => {
@@ -518,8 +556,42 @@ impl CompiApp {
         .detach();
     }
 
+    /// An "Open here" pick, `content`, in the place of `draft`, with the way back noted.
+    fn open_pick(
+        &mut self,
+        pane_id: PaneId,
+        view: bool,
+        content: PaneContent,
+        draft: ChatContent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let opened = Opened::Content(std::mem::discriminant(&content));
+        let mutation = self.put_in_draft_place(&pane_id, view, content, window, cx);
+        self.note_draft_return(pane_id, view, mutation, draft, opened);
+    }
+
+    /// Notes that `pane_id` (a terminal's own pane when `view`) is to show `opened` in
+    /// the place of `draft`: at once for a terminal, which keeps its pane; else once the
+    /// receipt of `mutation` names the pane that replaced the draft's.
+    fn note_draft_return(
+        &mut self,
+        pane_id: PaneId,
+        view: bool,
+        mutation: Option<MutationId>,
+        draft: ChatContent,
+        opened: Opened,
+    ) {
+        let back = DraftReturn { draft, opened };
+        if view {
+            self.chat.returns.insert(pane_id, back);
+        } else if let Some(mutation) = mutation {
+            self.chat.returning = Some((mutation, back));
+        }
+    }
+
     /// Shows `content` where the draft of `pane_id` is: as the terminal's view when
-    /// `view`, else in a pane replacing the draft's.
+    /// `view`, else in a pane replacing the draft's; the replacement's mutation.
     fn put_in_draft_place(
         &mut self,
         pane_id: &PaneId,
@@ -527,18 +599,141 @@ impl CompiApp {
         content: PaneContent,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<MutationId> {
         if view {
             self.show_view(pane_id, content, window, cx);
-            return;
+            return None;
         }
-        self.mutate(
+        self.mutate_in(
             WorkspaceMutation::ReplacePane {
                 pane_id: pane_id.clone(),
                 with: PaneReplacement::Content { content },
             },
             true,
-        );
+            None,
+        )
+    }
+
+    /// The way back `pane_id` offers while it shows what an "Open here" pick put there.
+    fn draft_return(&self, pane_id: &PaneId) -> Option<&DraftReturn> {
+        let back = self.chat.returns.get(pane_id)?;
+        let leaf = content::find_leaf(self.workspace.as_ref()?, pane_id)?;
+        (Opened::of(leaf) == Some(back.opened)).then_some(back)
+    }
+
+    /// The arrow back: `pane_id` becomes a new thread draft in the folder and with the
+    /// agent of the draft it replaced. A terminal shows it as its view, its shell running
+    /// on underneath; another pane is replaced, asking first about unsaved edits.
+    fn return_to_draft(&mut self, pane_id: &PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(back) = self.chat.returns.remove(pane_id) else {
+            return;
+        };
+        let DraftReturn { draft, .. } = back;
+        let draft = PaneContent::Chat(crate::chat::new_chat(
+            draft.harness,
+            draft.environment,
+            draft.folder,
+            draft.prefer,
+        ));
+        let terminal = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| content::find_leaf(workspace, pane_id))
+            .is_some_and(|leaf| leaf.surface_id().is_some());
+        if terminal {
+            self.show_view(pane_id, draft, window, cx);
+            return;
+        }
+        let replace = WorkspaceMutation::ReplacePane {
+            pane_id: pane_id.clone(),
+            with: PaneReplacement::Content { content: draft },
+        };
+        if self.has_unsaved(pane_id, window, cx) {
+            self.guard_unsaved(
+                unsaved::CloseScope::Panes(vec![pane_id.clone()]),
+                unsaved::AfterUnsaved::Mutate(replace),
+                window,
+                cx,
+            );
+        } else {
+            self.mutate(replace, true);
+        }
+    }
+
+    /// The arrow back to a new thread, for a pane an "Open here" pick filled: a bar
+    /// across the top of a content pane or view, always shown; for a terminal showing
+    /// its shell (`over_shell`), in its top right corner, where a shell's lines rarely
+    /// reach, and only while the pointer is in that corner, since it covers the text
+    /// there (a terminal often fills the window, so hovering the pane is no sign).
+    pub(in crate::gui::workspace) fn render_draft_return(
+        &self,
+        pane_id: &PaneId,
+        over_shell: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let back = self.draft_return(pane_id)?;
+        if over_shell != (back.opened == Opened::Shell) {
+            return None;
+        }
+        let colors = *self.colors();
+        let id = pane_id.clone();
+        let button = controls::icon_button(
+            SharedString::from(format!("draft-return-{pane_id}")),
+            IconName::CornerDownLeft,
+            "Back to a new thread",
+        )
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.focus_pane(id.clone());
+            this.return_to_draft(&id, window, cx);
+            cx.stop_propagation();
+            cx.notify();
+        }));
+        Some(if over_shell {
+            let corner = SharedString::from(format!("draft-return-corner-{pane_id}"));
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .w(px(RETURN_CORNER_WIDTH))
+                .h(px(RETURN_CORNER_HEIGHT))
+                .group(corner.clone())
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(4.0))
+                        .right(px(4.0))
+                        .invisible()
+                        .group_hover(corner, |style| style.visible())
+                        .rounded(ui_rems(6.0))
+                        .border_1()
+                        .border_color(color(colors.border))
+                        .bg(color(colors.surface))
+                        .shadow_sm()
+                        .child(button),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex_none()
+                .px_1()
+                .py_0p5()
+                .flex()
+                .items_center()
+                .border_b_1()
+                .border_color(color(colors.border))
+                .child(button)
+                .into_any_element()
+        })
+    }
+
+    /// Forgets the way back of panes that are gone.
+    pub(super) fn prune_draft_returns(&mut self) {
+        let Some(workspace) = &self.workspace else {
+            return;
+        };
+        self.chat
+            .returns
+            .retain(|pane_id, _| content::find_leaf(workspace, pane_id).is_some());
     }
 
     /// Draft `chat` starts again with `harness`, in its place and keeping what was
@@ -804,13 +999,21 @@ impl CompiApp {
         self.chat.discarding = mutation.zip(discarded);
     }
 
-    /// A workspace change finished (`None`: it failed): a close that threw a draft
+    /// A workspace change finished (`None`: it failed): an "Open here" pick notes the
+    /// pane that took the draft's place, for the arrow back; a close that threw a draft
     /// away shows "Draft discarded · Undo" for `UNDO_LIFETIME`.
     pub(in crate::gui) fn draft_mutation_finished(
         &mut self,
         receipt: Option<&MutationReceipt>,
         cx: &mut Context<Self>,
     ) {
+        if let Some((mutation, back)) = self.chat.returning.take()
+            && let Some(pane_id) = receipt
+                .filter(|receipt| receipt.mutation_id == mutation)
+                .and_then(|receipt| receipt.affected_panes.last())
+        {
+            self.chat.returns.insert(pane_id.clone(), back);
+        }
         let Some((mutation, draft)) = self.chat.discarding.take() else {
             return;
         };

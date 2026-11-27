@@ -54,7 +54,7 @@ use composer::{
     CompiCommand, Completion, DraftImage, QuestionForm, QueuedEdit, Recall, cost_label, fenced,
 };
 pub(in crate::gui) use draft::split_draft;
-use draft::{DiscardNotice, Discarded};
+use draft::{DiscardNotice, Discarded, DraftReturn};
 use models::{ModelPicker, PickerAnchor, PickerColumn};
 use rows::{ChatRow, RowFrame};
 use scroller::TranscriptScroll;
@@ -292,6 +292,11 @@ pub(in crate::gui) struct ChatUi {
     discarding: Option<(MutationId, Discarded)>,
     /// "Draft discarded · Undo", while it shows.
     discarded: Option<DiscardNotice>,
+    /// Panes an "Open here" pick put in a draft's place, each with that draft: an arrow
+    /// at the pane's top left goes back to a new thread while the pane shows the pick.
+    returns: HashMap<PaneId, DraftReturn>,
+    /// An "Open here" pick on its way to the daemon, whose receipt names its new pane.
+    returning: Option<(MutationId, DraftReturn)>,
     /// The agents installed in each environment, as a draft's model picker last asked;
     /// an empty list while the answer is on its way.
     agents: HashMap<ContentEnvironment, Vec<ChatHarness>>,
@@ -1001,6 +1006,7 @@ impl CompiApp {
     /// asked; each chat's session sent to the daemon once the harness has one; the
     /// threads listed for a draft's Continue; and a redraw each second while one works.
     pub(super) fn prepare_chats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prune_draft_returns();
         let Some(workspace) = &self.workspace else {
             return;
         };

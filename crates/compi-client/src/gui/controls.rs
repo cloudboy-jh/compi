@@ -125,6 +125,7 @@ gpui_kit_assets::icon_assets!(
         Archive,
         ArchiveRestore,
         Trash,
+        CornerDownLeft,
     ]
 );
 

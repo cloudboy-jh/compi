@@ -6497,6 +6497,9 @@ impl CompiApp {
                     self.pane_drag.is_none() && self.config.program_status.panes,
                     |pane| pane.children(self.render_pane_program_status(index, &geometry.pane_id)),
                 )
+                .when(self.pane_drag.is_none(), |pane| {
+                    pane.children(self.render_draft_return(&geometry.pane_id, true, cx))
+                })
                 .when_some(edge, |pane, edge| {
                     // Drawn last so the outline is never covered; it has no hitbox.
                     pane.child(

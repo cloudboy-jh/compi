@@ -535,6 +535,13 @@ impl CompiApp {
         false
     }
 
+    /// Whether pane `pane_id` has an editor with unsaved edits.
+    pub(super) fn has_unsaved(&self, pane_id: &PaneId, window: &Window, cx: &App) -> bool {
+        !self
+            .unsaved_in(&CloseScope::Panes(vec![pane_id.clone()]), window, cx)
+            .is_empty()
+    }
+
     /// Dirty editors `scope` covers: this window's, and with `App` every window's.
     fn unsaved_in(&self, scope: &CloseScope, window: &Window, cx: &App) -> Vec<PromptFile> {
         let here = Window::window_handle(window);
