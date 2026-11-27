@@ -2134,13 +2134,16 @@ impl CompiApp {
                             })),
                     )
                     .children(card.model.as_ref().map(|model| {
-                        let provider = model.group.as_deref().or_else(|| {
-                            model.value.split_once('/').map(|(provider, _)| provider)
-                        });
+                        let provider = model
+                            .group
+                            .as_deref()
+                            .or_else(|| model.value.split_once('/').map(|(provider, _)| provider));
                         let mark = crate::gui::model_icons::for_model(&model.value, &model.name)
                             .or_else(|| match provider {
                                 Some(provider) => crate::gui::model_icons::for_provider(provider),
-                                None => card.chat.filter(|harness| harness.entry().own_models)
+                                None => card
+                                    .chat
+                                    .filter(|harness| harness.entry().own_models)
                                     .and_then(crate::gui::model_icons::for_harness),
                             });
                         div()

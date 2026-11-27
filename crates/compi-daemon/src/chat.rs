@@ -1843,27 +1843,24 @@ impl Inner {
             .retain(|watcher| watcher.send(event.clone()).is_ok());
         self.state.apply(event);
         if options_changed {
-            let model = self
-                .state
-                .option("model")
-                .and_then(|option| {
-                    if option.current.is_empty() {
-                        return None;
-                    }
-                    Some(
-                        option
-                            .choices
-                            .iter()
-                            .find(|choice| choice.value == option.current)
-                            .cloned()
-                            .unwrap_or_else(|| ChatChoice {
-                                value: option.current.clone(),
-                                name: option.current.clone(),
-                                description: None,
-                                group: None,
-                            }),
-                    )
-                });
+            let model = self.state.option("model").and_then(|option| {
+                if option.current.is_empty() {
+                    return None;
+                }
+                Some(
+                    option
+                        .choices
+                        .iter()
+                        .find(|choice| choice.value == option.current)
+                        .cloned()
+                        .unwrap_or_else(|| ChatChoice {
+                            value: option.current.clone(),
+                            name: option.current.clone(),
+                            description: None,
+                            group: None,
+                        }),
+                )
+            });
             if self.model != model {
                 self.model = model;
                 self.save_thread(false);
@@ -3870,7 +3867,12 @@ mod tests {
         });
         let mut legacy = serde_json::to_value(&record).unwrap();
         legacy.as_object_mut().unwrap().remove("model");
-        assert_eq!(serde_json::from_value::<ThreadRecord>(legacy).unwrap().model, None);
+        assert_eq!(
+            serde_json::from_value::<ThreadRecord>(legacy)
+                .unwrap()
+                .model,
+            None
+        );
         store.save(record.clone());
         store.flush();
         assert!(folder.join("chat-1.json").is_file());

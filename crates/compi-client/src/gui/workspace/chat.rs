@@ -911,7 +911,10 @@ impl CompiApp {
     }
 
     /// The model last reported by this window's watcher, including unlisted choices.
-    pub(super) fn watched_chat_model(&self, chat: &str) -> Option<compi_protocol::chat::ChatChoice> {
+    pub(super) fn watched_chat_model(
+        &self,
+        chat: &str,
+    ) -> Option<compi_protocol::chat::ChatChoice> {
         let option = self.chat.chats.get(chat)?.state.as_ref()?.option("model")?;
         if option.current.is_empty() {
             return None;

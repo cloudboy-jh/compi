@@ -4459,21 +4459,25 @@ impl CompiApp {
         let current = self.config.tab_bar_visibility;
         let detail = match current {
             TabBarVisibility::Always => "The tab bar stays visible.",
-            TabBarVisibility::OnHover => "Move the pointer to the top of the workspace to reveal the tab bar.",
+            TabBarVisibility::OnHover => {
+                "Move the pointer to the top of the workspace to reveal the tab bar."
+            }
             TabBarVisibility::SidebarOnly => "The tab bar is hidden; tabs remain in the sidebar.",
         };
         self.render_choice_row(
             row,
             SettingsAction::TabBarVisibility,
-            TabBarVisibility::ALL.map(|visibility| (
-                visibility.label(),
-                match visibility {
-                    TabBarVisibility::Always => "Always show the tab bar",
-                    TabBarVisibility::OnHover => "Reveal at the top of the workspace",
-                    TabBarVisibility::SidebarOnly => "Use the sidebar for tabs",
-                },
-                visibility == current,
-            )),
+            TabBarVisibility::ALL.map(|visibility| {
+                (
+                    visibility.label(),
+                    match visibility {
+                        TabBarVisibility::Always => "Always show the tab bar",
+                        TabBarVisibility::OnHover => "Reveal at the top of the workspace",
+                        TabBarVisibility::SidebarOnly => "Use the sidebar for tabs",
+                    },
+                    visibility == current,
+                )
+            }),
             |app, index, cx| app.set_tab_bar_visibility(TabBarVisibility::ALL[index], cx),
             detail.into(),
             cx,
