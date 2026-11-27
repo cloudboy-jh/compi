@@ -175,6 +175,9 @@ const COMPLETION_MAX_WIDTH: f32 = 560.0;
 enum CompletionKind {
     /// `/` at the start: the harness's commands starting with `query`.
     Commands { query: String },
+    /// `/login ` or `/logout ` at the start: the chat's providers matching `query`
+    /// (`sign_in::provider_picks`).
+    Providers { sign_out: bool, query: String },
     /// `@` before the cursor: files of the chat's folder matching `query`, which starts
     /// after the `@` at byte `at`.
     Files {
@@ -212,15 +215,29 @@ struct FieldForm {
 #[derive(Debug, PartialEq, Eq)]
 enum Wanted<'a> {
     Command(&'a str),
+    Provider { sign_out: bool, query: &'a str },
     File { at: usize, query: &'a str },
 }
 
 fn wanted(text: &str, cursor: usize) -> Option<Wanted<'_>> {
     let before = text.get(..cursor)?;
-    if let Some(name) = before.strip_prefix('/')
-        && !name.contains(char::is_whitespace)
-    {
-        return Some(Wanted::Command(name));
+    if let Some(rest) = before.strip_prefix('/') {
+        match rest.split_once(char::is_whitespace) {
+            None => return Some(Wanted::Command(rest)),
+            Some((name, query)) if !before.contains('\n') => {
+                let sign_out = [CompiCommand::Login, CompiCommand::Logout]
+                    .into_iter()
+                    .find(|command| command.name().eq_ignore_ascii_case(name))
+                    .map(|command| command == CompiCommand::Logout);
+                if let Some(sign_out) = sign_out {
+                    return Some(Wanted::Provider {
+                        sign_out,
+                        query: query.trim_start(),
+                    });
+                }
+            }
+            Some(_) => {}
+        }
     }
     let at = before.rfind('@')?;
     let query = &before[at + 1..];
@@ -290,6 +307,15 @@ impl CompiCommand {
             Self::Logout => "Sign out of a model provider",
             Self::Update => "Update this agent to its newest version",
         }
+    }
+
+    /// Picking it in the `/` list runs it at once: it takes nothing more (`/model`,
+    /// `/providers`), or lists what it takes (`/login`, `/logout`).
+    fn runs_when_picked(self) -> bool {
+        matches!(
+            self,
+            Self::Model | Self::Providers | Self::Login | Self::Logout
+        )
     }
 
     /// Compi's own whatever the harness offers: what the harness's command of the same
@@ -442,6 +468,9 @@ impl Completion {
                 query,
             )
             .len(),
+            CompletionKind::Providers { sign_out, query } => state.map_or(0, |state| {
+                sign_in::provider_picks(state, query, *sign_out).len()
+            }),
             CompletionKind::Files {
                 found: Found::Listed(files),
                 ..
@@ -482,6 +511,27 @@ impl CompiApp {
                         highlight: 0,
                         scroll: ScrollHandle::new(),
                         kind: CompletionKind::Commands {
+                            query: query.to_owned(),
+                        },
+                    })
+                }
+            }
+            Some(Wanted::Provider { sign_out, query }) => {
+                let same = matches!(
+                    &model.completion,
+                    Some(Completion {
+                        kind: CompletionKind::Providers { sign_out: shown_out, query: shown },
+                        ..
+                    }) if *shown_out == sign_out && shown == query
+                );
+                if same {
+                    model.completion.take()
+                } else {
+                    Some(Completion {
+                        highlight: 0,
+                        scroll: ScrollHandle::new(),
+                        kind: CompletionKind::Providers {
+                            sign_out,
                             query: query.to_owned(),
                         },
                     })
@@ -642,8 +692,9 @@ impl CompiApp {
         }
     }
 
-    /// Completes the highlighted item: a command fills in `/name ` (`/model`, which takes
-    /// nothing more, runs at once), a file becomes an attachment and its `@` text goes.
+    /// Completes the highlighted item: a command fills in `/name ` (one that takes nothing
+    /// more or lists what it takes runs at once, `CompiCommand::runs_when_picked`), a
+    /// provider is signed in or out, a file becomes an attachment and its `@` text goes.
     /// Whether there was one.
     pub(super) fn accept_chat_completion(
         &mut self,
@@ -657,19 +708,43 @@ impl CompiApp {
         let Some(completion) = &model.completion else {
             return false;
         };
-        if let CompletionKind::Commands { query } = &completion.kind {
-            let harness = model
-                .state
-                .as_ref()
-                .map(|state| state.commands.as_slice())
-                .unwrap_or_default();
-            if matches!(
-                matching_commands(harness, query).get(completion.highlight),
-                Some(ListedCommand::Compi(CompiCommand::Model))
-            ) {
-                self.run_compi_command(chat, CompiCommand::Model, String::new(), window, cx);
+        match &completion.kind {
+            CompletionKind::Commands { query } => {
+                let harness = model
+                    .state
+                    .as_ref()
+                    .map(|state| state.commands.as_slice())
+                    .unwrap_or_default();
+                let picked = matching_commands(harness, query)
+                    .get(completion.highlight)
+                    .copied();
+                if let Some(ListedCommand::Compi(command)) = picked
+                    && command.runs_when_picked()
+                {
+                    let composer = model.composer.read(cx);
+                    let argument = composer
+                        .value()
+                        .get(composer.cursor()..)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_owned();
+                    self.run_compi_command(chat, command, argument, window, cx);
+                    return true;
+                }
+            }
+            CompletionKind::Providers { sign_out, query } => {
+                let sign_out = *sign_out;
+                let Some((provider, choice)) = model.state.as_ref().and_then(|state| {
+                    sign_in::provider_picks(state, query, sign_out)
+                        .get(completion.highlight)
+                        .map(|pick| (pick.provider.to_owned(), pick.choice.map(str::to_owned)))
+                }) else {
+                    return false;
+                };
+                self.pick_provider(chat, provider, choice, sign_out, window, cx);
                 return true;
             }
+            CompletionKind::Files { .. } => {}
         }
         let composer = model.composer.read(cx);
         let (value, cursor) = (composer.value(), composer.cursor());
@@ -706,7 +781,7 @@ impl CompiApp {
                 }
                 (format!("{}{rest}", &value[..*at]), *at)
             }
-            CompletionKind::Files { .. } => return false,
+            CompletionKind::Providers { .. } | CompletionKind::Files { .. } => return false,
         };
         model.completion = None;
         model.composer.update(cx, |composer, cx| {
@@ -1506,7 +1581,8 @@ impl CompiApp {
             .into_any_element()
     }
 
-    /// The `/` command list or the `@` file list.
+    /// The `/` command list, the `/login` and `/logout` provider list, or the `@` file
+    /// list.
     fn render_chat_completion(
         &self,
         chat: &ChatContent,
@@ -1614,6 +1690,76 @@ impl CompiApp {
                             .into_any_element()
                         })
                         .collect()
+                }
+            }
+            CompletionKind::Providers { sign_out, query } => {
+                let agent = chat.harness.name();
+                let picks = model.state.as_ref().map_or_else(Vec::new, |state| {
+                    sign_in::provider_picks(state, query, *sign_out)
+                });
+                let listed = model
+                    .state
+                    .as_ref()
+                    .is_some_and(|state| state.providers.is_some());
+                match model.state.as_ref() {
+                    Some(state) if !picks.is_empty() => picks
+                        .iter()
+                        .enumerate()
+                        .map(|(index, row)| {
+                            let (name, accounts) = sign_in::pick_text(state, row);
+                            let expired =
+                                row.accounts.iter().any(|account| account.expired.is_some());
+                            controls::menu_row(
+                                ("chat-provider", index),
+                                index == completion.highlight,
+                                false,
+                                cx,
+                            )
+                            .flex_none()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .py_0p5()
+                                    .child(div().min_w_0().truncate().child(name))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                                            .when(expired, |line| {
+                                                line.text_color(color(colors.error))
+                                            })
+                                            .when(!expired, |line| line.opacity(0.7))
+                                            .child(accounts),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(ui_rems(UI_MICRO_TEXT_SIZE))
+                                    .opacity(0.7)
+                                    .child(row.action.to_owned()),
+                            )
+                            .on_click(pick(index))
+                            .into_any_element()
+                        })
+                        .collect(),
+                    _ if !listed => vec![note(format!("Asking {agent} for its providers…"))],
+                    _ if *sign_out && query.is_empty() => vec![note(format!(
+                        "{agent} has no account it can sign out of from here"
+                    ))],
+                    _ if *sign_out => {
+                        vec![note(format!("No account to sign out of matches {query}"))]
+                    }
+                    _ if query.is_empty() => vec![note(format!(
+                        "{agent} lists no providers: type one's name after /login"
+                    ))],
+                    _ => vec![note(format!(
+                        "No provider matches {query}: Enter signs in to it as typed"
+                    ))],
                 }
             }
             CompletionKind::Files { query, found, .. } => match found {
@@ -2240,6 +2386,29 @@ mod tests {
         assert_eq!(wanted("me@example.com", 14), None);
         assert_eq!(wanted("@a b", 4), None);
         assert_eq!(wanted("plain", 5), None);
+        // `/login ` and `/logout ` list providers matching what follows.
+        assert_eq!(
+            wanted("/login ", 7),
+            Some(Wanted::Provider {
+                sign_out: false,
+                query: ""
+            })
+        );
+        assert_eq!(
+            wanted("/Logout  open", 13),
+            Some(Wanted::Provider {
+                sign_out: true,
+                query: "open"
+            })
+        );
+        assert_eq!(
+            wanted("/login GitHub Co", 16),
+            Some(Wanted::Provider {
+                sign_out: false,
+                query: "GitHub Co"
+            })
+        );
+        assert_eq!(wanted("/login a\nb", 10), None);
     }
 
     #[test]

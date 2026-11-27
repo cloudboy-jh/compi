@@ -245,9 +245,36 @@ fn choice_provider(choice: &ChatChoice) -> Option<&str> {
         .or_else(|| choice.value.split_once('/').map(|(provider, _)| provider))
 }
 
-/// A model's ID as its provider knows it: its value after the last `/`.
+/// A model's ID as its provider knows it: its value after the provider's `/`, so
+/// OpenRouter's `openrouter/anthropic/claude-opus-4` is `anthropic/claude-opus-4`.
 fn choice_id(choice: &ChatChoice) -> &str {
-    choice.value.rsplit('/').next().unwrap_or(&choice.value)
+    choice
+        .value
+        .split_once('/')
+        .map_or(choice.value.as_str(), |(_, id)| id)
+}
+
+/// What the model button calls the current model: its name, with its provider when
+/// another provider lists a model of that name (Claude Opus 5 from Anthropic and from
+/// OpenRouter).
+fn current_model_label(option: &ChatOption) -> String {
+    let name = option.current_name();
+    let Some(current) = option
+        .choices
+        .iter()
+        .find(|choice| choice.value == option.current)
+    else {
+        return name.to_owned();
+    };
+    let provider = choice_provider(current);
+    let shared = option
+        .choices
+        .iter()
+        .any(|choice| choice.name == current.name && choice_provider(choice) != provider);
+    match provider {
+        Some(provider) if shared => format!("{name} · {}", provider_name(provider)),
+        _ => name.to_owned(),
+    }
 }
 
 /// A provider as people know it: `openai-codex` is OpenAI Codex.
@@ -679,10 +706,12 @@ impl CompiApp {
             return shield.into_iter().collect();
         }
         let open = model.menu == Some(ChatMenu::Models);
-        let label = models
-            .or(thinking)
-            .map_or("", |option| option.current_name());
-        let mut button = text_button("chat-models", label.to_owned())
+        let label = match (models, thinking) {
+            (Some(models), _) => current_model_label(models),
+            (None, Some(thinking)) => thinking.current_name().to_owned(),
+            (None, None) => String::new(),
+        };
+        let mut button = text_button("chat-models", label)
             .ghost()
             .tooltip(format!("Model and thinking ({})", picker_key_label()))
             .menu_open(open);
@@ -2742,6 +2771,42 @@ mod tests {
             ]
         );
         assert_eq!(choice_id(&option.choices[5]), "opus-20250929");
+    }
+
+    #[test]
+    fn openrouter_models_keep_their_makers_in_ids_and_say_their_provider_when_shared() {
+        let mut option = option();
+        option.choices.extend([
+            choice("openrouter/anthropic/opus"),
+            choice("openrouter/~anthropic/opus"),
+        ]);
+        assert_eq!(choice_id(&option.choices[5]), "anthropic/opus");
+        assert_eq!(choice_id(&option.choices[6]), "~anthropic/opus");
+        assert_eq!(choice_id(&choice("opus")), "opus");
+        // Two OpenRouter models of one name tell apart by their IDs.
+        let layout = picker_layout(
+            &option,
+            "",
+            &[],
+            &ChatModels::default(),
+            &PickerTab::Provider(Some("openrouter".into())),
+            ChatHarness::Omp,
+        );
+        assert_eq!(
+            shown(&option, &layout),
+            [
+                "# OpenRouter (Pay per use)",
+                "openrouter/glm",
+                "openrouter/anthropic/opus [id]",
+                "openrouter/~anthropic/opus [id]",
+            ]
+        );
+        // The button names the provider when Anthropic lists a model of the same name.
+        assert_eq!(current_model_label(&option), "glm");
+        option.current = "openrouter/anthropic/opus".into();
+        assert_eq!(current_model_label(&option), "opus · OpenRouter");
+        option.current = "anthropic/sonnet".into();
+        assert_eq!(current_model_label(&option), "sonnet");
     }
 
     #[test]

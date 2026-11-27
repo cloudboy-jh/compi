@@ -1,11 +1,14 @@
 //! Model providers from the chat, for every agent. `/providers` lists the providers the
 //! chat's agent can sign in to, with the accounts it keeps and buttons to sign in, add
-//! an account or sign out; `/login` and `/logout` do it for the chat's provider or the
-//! one named. A card above the message box offers a sign-in when the chat's model
-//! belongs to a provider whose sign-in the agent can no longer use, or when the last
-//! turn failed for want of one; then it follows the sign-in the daemon runs where the
-//! chat runs (`SignInChat`): the page to open, a code or key to paste into the message
-//! box, and how it ended. `/update` updates the agent, and its card says how it went.
+//! an account or sign out. `/login` and `/logout` list them over the message box, in
+//! the `/` list's place (`provider_picks`): the chat's provider first, a row per way to
+//! sign in or per account to sign out; typing filters them, Enter runs the highlighted
+//! one, and a name no row matches (`/login moonshot`) is signed in as typed. A card
+//! above the message box offers a sign-in when the chat's model belongs to a provider
+//! whose sign-in the agent can no longer use, or when the last turn failed for want of
+//! one; then it follows the sign-in the daemon runs where the chat runs (`SignInChat`):
+//! the page to open, a code or key to paste into the message box, and how it ended.
+//! `/update` updates the agent, and its card says how it went.
 use super::models::provider_name;
 use super::*;
 use compi_protocol::chat::{
@@ -129,6 +132,134 @@ fn account_line(account: &ChatAccount) -> String {
     } else {
         line.join(" · ")
     }
+}
+
+/// A row of the provider list `/login` and `/logout` open over the message box.
+#[derive(Debug, PartialEq)]
+pub(super) struct ProviderPick<'a> {
+    pub(super) provider: &'a str,
+    /// The way to sign in (`ChatSignInMethod::id`), or the account to sign out
+    /// (`ChatAccount::id`); `None` for the agent's own way, or all its accounts.
+    pub(super) choice: Option<&'a str>,
+    /// What picking it does: `Sign in`, `Add account`, a way's name, `Sign out`.
+    pub(super) action: &'a str,
+    /// The accounts the row is about.
+    pub(super) accounts: &'a [ChatAccount],
+}
+
+/// The provider list's rows for `query` (part of a provider's ID or name, any case): the
+/// chat's provider first, then the others in the agent's order. Signing out lists only
+/// the accounts the agent can sign out from the chat. Before the agent says its
+/// providers, signing in lists the ones its models come from.
+pub(super) fn provider_picks<'a>(
+    state: &'a ChatState,
+    query: &str,
+    sign_out: bool,
+) -> Vec<ProviderPick<'a>> {
+    let query = query.trim().to_lowercase();
+    let matches = |id: &str| {
+        query.is_empty()
+            || id.to_lowercase().contains(&query)
+            || provider_label(state, id).to_lowercase().contains(&query)
+    };
+    let current = chat_provider(state);
+    let mut picks = Vec::new();
+    match &state.providers {
+        Some(providers) => {
+            let first = providers
+                .iter()
+                .filter(|known| Some(known.id.as_str()) == current);
+            let rest = providers
+                .iter()
+                .filter(|known| Some(known.id.as_str()) != current);
+            for provider in first.chain(rest).filter(|known| matches(&known.id)) {
+                push_picks(provider, sign_out, &mut picks);
+            }
+        }
+        None if sign_out => {}
+        None => {
+            let mut ids: Vec<&str> = current.into_iter().collect();
+            let listed = state
+                .option("model")
+                .into_iter()
+                .flat_map(|option| &option.choices)
+                .filter_map(|choice| model_provider(&choice.value));
+            for id in listed {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            picks.extend(
+                ids.into_iter()
+                    .filter(|id| matches(id))
+                    .map(|provider| ProviderPick {
+                        provider,
+                        choice: None,
+                        action: "Sign in",
+                        accounts: &[],
+                    }),
+            );
+        }
+    }
+    picks
+}
+
+/// `provider`'s rows: one per way to sign in (one for the agent's own way), or one per
+/// account to sign out (one for them all when the agent can't tell them apart).
+fn push_picks<'a>(provider: &'a ChatProvider, sign_out: bool, picks: &mut Vec<ProviderPick<'a>>) {
+    let accounts = provider.accounts.as_slice();
+    let pick =
+        |choice: Option<&'a str>, action: &'a str, accounts: &'a [ChatAccount]| ProviderPick {
+            provider: &provider.id,
+            choice,
+            action,
+            accounts,
+        };
+    if sign_out {
+        if !provider.sign_out || accounts.is_empty() {
+            return;
+        }
+        if accounts.iter().all(|account| account.id.is_some()) {
+            picks.extend(accounts.iter().map(|account| {
+                pick(
+                    account.id.as_deref(),
+                    "Sign out",
+                    std::slice::from_ref(account),
+                )
+            }));
+        } else {
+            picks.push(pick(None, "Sign out", accounts));
+        }
+    } else if provider.methods.is_empty() {
+        let action = match (accounts.is_empty(), provider.adds_accounts) {
+            (true, _) => "Sign in",
+            (false, true) => "Add account",
+            (false, false) => "Sign in again",
+        };
+        picks.push(pick(None, action, accounts));
+    } else {
+        picks.extend(
+            provider
+                .methods
+                .iter()
+                .map(|method| pick(Some(&method.id), &method.label, accounts)),
+        );
+    }
+}
+
+/// A provider list row's name and the line under it: its accounts, or that there are
+/// none.
+pub(super) fn pick_text(state: &ChatState, pick: &ProviderPick) -> (String, String) {
+    let accounts = if pick.accounts.is_empty() {
+        "Not signed in".to_owned()
+    } else {
+        pick.accounts
+            .iter()
+            .map(account_line)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    (provider_label(state, pick.provider), accounts)
 }
 
 impl CompiApp {
@@ -630,8 +761,8 @@ impl CompiApp {
         self.chat_action(chat, message, window, cx);
     }
 
-    /// `/login` and `/logout`: the provider `argument` names, else the chat's; the
-    /// providers list when there is neither.
+    /// `/login` and `/logout`: the provider `argument` names, by its ID or name; without
+    /// one, the list of the chat's providers to pick from.
     pub(super) fn login_command(
         &mut self,
         chat: &str,
@@ -640,6 +771,10 @@ impl CompiApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if argument.is_empty() {
+            self.open_provider_list(chat, sign_out, window, cx);
+            return;
+        }
         let Some(state) = self
             .chat
             .chats
@@ -648,15 +783,62 @@ impl CompiApp {
         else {
             return;
         };
-        let provider = if argument.is_empty() {
-            chat_provider(state).map(str::to_owned)
+        let provider = find_provider(state, argument);
+        if sign_out {
+            self.sign_out_chat(chat, provider, None, window, cx);
         } else {
-            Some(find_provider(state, argument))
+            self.sign_in_chat(chat, provider, None, window, cx);
+        }
+    }
+
+    /// Puts `/login ` (or `/logout `) in the message box, which lists the chat's
+    /// providers over it, and asks the agent for them again.
+    fn open_provider_list(
+        &mut self,
+        chat: &str,
+        sign_out: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return;
         };
-        match provider {
-            None => self.open_chat_providers(chat, window, cx),
-            Some(provider) if sign_out => self.sign_out_chat(chat, provider, None, window, cx),
-            Some(provider) => self.sign_in_chat(chat, provider, None, window, cx),
+        let text = if sign_out { "/logout " } else { "/login " };
+        model.dismissed = None;
+        model.composer.update(cx, |composer, cx| {
+            composer.set_value(text.to_owned(), window, cx);
+            let end = composer.text().offset_to_position(text.len());
+            composer.set_cursor_position(end, window, cx);
+        });
+        self.chat_composer_changed(chat, cx);
+        let message = ClientMessage::CheckChatProviders {
+            chat: chat.to_owned(),
+        };
+        self.chat_action(chat, message, window, cx);
+    }
+
+    /// Runs the provider list's row the user picked: signs its provider in, the way it
+    /// names, or signs its account (or all of them) out; the message box empties.
+    pub(super) fn pick_provider(
+        &mut self,
+        chat: &str,
+        provider: String,
+        choice: Option<String>,
+        sign_out: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(model) = self.chat.chats.get_mut(chat) else {
+            return;
+        };
+        model.completion = None;
+        model.composer.update(cx, |composer, cx| {
+            composer.set_value(String::new(), window, cx);
+        });
+        if sign_out {
+            self.sign_out_chat(chat, provider, choice, window, cx);
+        } else {
+            self.sign_in_chat(chat, provider, choice, window, cx);
         }
     }
 
@@ -699,7 +881,7 @@ impl CompiApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use compi_protocol::chat::{ChatChoice, ChatOption};
+    use compi_protocol::chat::{ChatChoice, ChatOption, ChatSignInMethod};
 
     fn state(model: &str) -> ChatState {
         ChatState {
@@ -796,5 +978,117 @@ mod tests {
         assert_eq!(find_provider(&chat, "GitHub Copilot"), "github-copilot");
         assert_eq!(find_provider(&chat, "github-copilot"), "github-copilot");
         assert_eq!(find_provider(&chat, "Moonshot"), "moonshot");
+    }
+
+    fn rows<'a>(picks: &[ProviderPick<'a>]) -> Vec<(&'a str, Option<&'a str>, &'a str)> {
+        picks
+            .iter()
+            .map(|pick| (pick.provider, pick.choice, pick.action))
+            .collect()
+    }
+
+    #[test]
+    fn login_lists_the_chats_provider_first_then_the_others_matching_what_is_typed() {
+        let mut chat = state("openrouter/anthropic/claude-opus-4");
+        let me = ChatAccount {
+            label: Some("me@example.com".into()),
+            ..ChatAccount::default()
+        };
+        chat.providers = Some(vec![
+            provider("anthropic", vec![me]),
+            ChatProvider {
+                name: Some("GitHub Copilot".into()),
+                ..provider("github-copilot", Vec::new())
+            },
+            provider("openrouter", Vec::new()),
+            ChatProvider {
+                methods: vec![
+                    ChatSignInMethod {
+                        id: "chatgpt".into(),
+                        label: "ChatGPT account".into(),
+                    },
+                    ChatSignInMethod {
+                        id: "api-key".into(),
+                        label: "API key".into(),
+                    },
+                ],
+                ..provider("openai", Vec::new())
+            },
+        ]);
+        assert_eq!(
+            rows(&provider_picks(&chat, "", false)),
+            [
+                ("openrouter", None, "Sign in"),
+                ("anthropic", None, "Add account"),
+                ("github-copilot", None, "Sign in"),
+                ("openai", Some("chatgpt"), "ChatGPT account"),
+                ("openai", Some("api-key"), "API key"),
+            ]
+        );
+        assert_eq!(
+            rows(&provider_picks(&chat, " Router", false)),
+            [("openrouter", None, "Sign in")]
+        );
+        assert_eq!(
+            rows(&provider_picks(&chat, "copilot", false)),
+            [("github-copilot", None, "Sign in")]
+        );
+        let anthropic = &provider_picks(&chat, "anthropic", false)[0];
+        assert_eq!(
+            pick_text(&chat, anthropic),
+            ("Anthropic".to_owned(), "me@example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn logout_lists_the_accounts_the_agent_signs_out_from_the_chat() {
+        let mut chat = state("anthropic/claude-opus-5-5");
+        let account = |id: &str| ChatAccount {
+            id: Some(id.into()),
+            ..ChatAccount::default()
+        };
+        chat.providers = Some(vec![
+            provider("anthropic", vec![account("a"), account("b")]),
+            provider("openrouter", Vec::new()),
+        ]);
+        // The agent signs none out here.
+        assert!(provider_picks(&chat, "", true).is_empty());
+        chat.providers.as_mut().unwrap()[0].sign_out = true;
+        chat.providers.as_mut().unwrap()[1].sign_out = true;
+        assert_eq!(
+            rows(&provider_picks(&chat, "", true)),
+            [
+                ("anthropic", Some("a"), "Sign out"),
+                ("anthropic", Some("b"), "Sign out"),
+            ]
+        );
+        // Accounts it can't tell apart sign out together.
+        chat.providers.as_mut().unwrap()[0].accounts = vec![ChatAccount::default()];
+        assert_eq!(
+            rows(&provider_picks(&chat, "", true)),
+            [("anthropic", None, "Sign out")]
+        );
+    }
+
+    #[test]
+    fn before_the_agent_lists_providers_login_offers_its_models_ones() {
+        let mut chat = state("openrouter/z-ai/glm-5");
+        chat.options[0].choices = ["anthropic/claude-opus-5-5", "openrouter/z-ai/glm-5"]
+            .into_iter()
+            .map(|value| ChatChoice {
+                value: value.into(),
+                name: value.into(),
+                description: None,
+                group: None,
+            })
+            .collect();
+        assert_eq!(
+            rows(&provider_picks(&chat, "", false)),
+            [
+                ("openrouter", None, "Sign in"),
+                ("anthropic", None, "Sign in"),
+            ]
+        );
+        assert!(provider_picks(&chat, "", true).is_empty());
     }
 }
