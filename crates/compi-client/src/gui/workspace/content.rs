@@ -1814,7 +1814,10 @@ impl CompiApp {
             None => self.focus_handle.clone(),
         };
         if !wanted.is_focused(window) {
-            window.focus(&wanted, cx);
+            // After this frame: a field made in it (a new thread's message box) only
+            // starts listening for focus once the frame ends. Focused now, it never
+            // hears that it has the keyboard and never shows its cursor.
+            window.defer(cx, move |window, cx| window.focus(&wanted, cx));
         }
     }
 
